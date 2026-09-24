@@ -1,0 +1,21 @@
+# dataset 子应用配置模板（入库；凭证留空，真实凭证写入 tianqin.local.yaml）
+#
+# 复制为 dataset/config/tianqin.local.yaml 后填入凭证：
+#   cp dataset/config/tianqin.example.yaml dataset/config/tianqin.local.yaml
+# 该本地文件已被 .gitignore 排除，禁止提交。
+#
+# 环境变量覆盖（优先级高于本文件）：
+#   MARKETSENSE_TQ_ACCOUNT / MARKETSENSE_TQ_PASSWORD
+#   MARKETSENSE_DATASET_CONFIG（配置文件路径） / MARKETSENSE_DATA_DIR（output_dir）
+
+dataset:
+  type: tianqin
+  output_dir: data           # 落在已被 .gitignore 忽略的目录
+  output_format: csv
+  include_oi: false
+  period: 1m
+  initial_direction: auto
+
+tianqin:
+  account: ""
+  password: ""

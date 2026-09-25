@@ -1,35 +1,38 @@
 """转折点提取与落盘。
 
-规则**逐条照搬** ``reference/perception/scripts/turning_points.py``（D-06），不做任何
-增删或阈值调整：
+检测规则（触发条件与状态机，与 ``reference/perception/scripts/turning_points.py``
+一致，不做任何增删或阈值调整）：
 
 ```text
-上涨状态（跟踪当前上涨段最高价 High）:
+上涨状态:
     只要当前 K 线 Low >= 前一根 K 线 Low，就继续保持上涨；
     一旦当前 K 线 Low < 前一根 K 线 Low:
-        记录此前上涨段的最高价及其时间，状态切换为下跌。
-下跌状态（跟踪当前下跌段最低价 Low）:
+        在该根 K 线确认一个 ``up`` 点（上涨段终结），状态切换为下跌。
+下跌状态:
     只要当前 K 线 High <= 前一根 K 线 High，就继续保持下跌；
     一旦当前 K 线 High > 前一根 K 线 High:
-        记录此前下跌段的最低价及其时间，状态切换为上涨。
+        在该根 K 线确认一个 ``down`` 点（下跌段终结），状态切换为上涨。
 ```
 
-细则（与参考实现一致）：比较运算符**严格**（``==`` 不转向）；极值时间取该极值所在
-K 线起始 ``timestamp``；**转向那根 K 线也参与本段极值搜索**；极值并列保留**最早**
-一根；末尾补最后一根 K 线收盘价（进行中的极值尚未确认，不输出）。
+细则：比较运算符**严格**（``==`` 不转向）；每个状态每根 K 线只做**一次**比较
+（触发转向的那根 K 线切换后不按新状态重判——同根同时创新高与创新低只发射一个
+点，不级联）；末尾补最后一根 K 线收盘价（进行中的段尚未确认，不输出）。
 
 移植自 ``reference/perception/scripts/turning_points.py``（新增落盘/读取
-``save_turning_points`` / ``load_turning_points``，算法部分保持等价）。
+``save_turning_points`` / ``load_turning_points``）：**检测（触发序列）与参考实现
+一致；发射字段按 2026-09-26 甲口径偏离**（见下文）。
 
 点信息增补（2026-09-24 需求）
 ----------------------------
 
-每个转折点除时间与价格外，还携带其 ``bar_index`` 所指那根 K 线（锚点；``up``/``down``
-点为极值前一根，见下文 2026-09-25 变更）的：
+每个转折点除时间与价格外，还携带其**值根** K 线的：
 
-* ``volume``：该 K 线时间范围内的成交量合计；
-* ``oi``：该 K 线**结束时刻**的持仓量（天勤 ``close_oi`` 口径；与主流行情软件的
+* ``volume``：值根 K 线时间范围内的成交量合计；
+* ``oi``：值根 K 线**结束时刻**的持仓量（天勤 ``close_oi`` 口径；与主流行情软件的
   「K 线持仓量」一致。``open_oi`` 口径可由 ``bar_index`` 关联 K 线 CSV 离线补算）。
+
+值根由 kind 推导：``start`` / ``close`` 点为自身那根 K 线；``up`` / ``down`` 点为
+确认根的前一根（``bar_index − 1``，可推导）。
 
 并派生相邻点之间的**相对值**（由点序列确定性推导，无墙钟时间）：
 
@@ -39,22 +42,21 @@ K 线起始 ``timestamp``；**转向那根 K 线也参与本段极值搜索**；
 * ``oi_ratio``：当前点持仓量 / 前一点持仓量。
 
 首个点无前一点 → 四个相对值均为空；前一点值为 0 时比值无定义（真实存在无成交
-分钟），同样留空，不产生 ``inf``。检测算法（哪些 K 线是转折点）与参考实现逐条等价，
-不受增补影响。
+分钟），同样留空，不产生 ``inf``。检测（触发序列）不受增补影响。
 
-发射口径变更（2026-09-25 用户决策 D1–D3）
------------------------------------------
+发射口径（2026-09-26 甲口径）
+-----------------------------
 
-* kind 更名（D3）：极值类转折点 ``high`` → ``up``（上涨段极值高确认）、
-  ``low`` → ``down``（下跌段极值低确认）；``start`` / ``close`` 不变。
-* 锚点前移（D1「逻辑统一」，整点各字段同源）：``up`` / ``down`` 点的 ``timestamp`` /
-  ``price`` / ``volume`` / ``oi`` 全部取**极值 K 线的前一根**（锚点
-  ``bar_index = 极值 bar − 1``），``price`` = 锚点 bar 的最高价（up）或最低价（down）。
-* bar 0 边界（D2）：极值落在 bar 0 时无前一根，整点留在 bar 0，``price`` 取 bar 0
-  自身极值价（跟踪初值即 bar 0 极值价，按上式自动一致，无需特判）。
-* 检测算法与参考实现仍逐条等价；仅发射的 kind 命名与字段锚定偏离参考实现。旧 kind
-  （``high``/``low``）落盘文件不再能被 :func:`load_turning_points` 读取（D5：无兼容
-  层，重新生成即可）。
+* ``kind`` 集合为 ``start`` / ``up`` / ``down`` / ``close``（2026-09-25 起反转类
+  kind 由旧名 ``high``/``low`` 更名为 ``up``/``down``）。
+* ``up`` / ``down`` 点在**触发根** ``t`` 确认：``timestamp`` / ``bar_index`` =
+  ``t``；``price`` / ``volume`` / ``oi`` 取**前一根**（值根 ``t − 1``）：``up`` 点
+  ``price`` = ``highs[t − 1]``，``down`` 点 ``price`` = ``lows[t − 1]``。
+* 检测循环 ``t`` 从 1 开始，值根 ``t − 1`` 恒存在，无任何边界特判。
+* ``start``（首根开盘）与 ``close``（末根收盘）口径不变。
+* 相对 2026-09-25 旧口径，``up``/``down`` 点的字段含义变化；新旧落盘文件列集合
+  相同，:func:`load_turning_points` 不会拒绝旧文件，但值含义不同，依赖方须以
+  ``python -m dataset turning-points`` / ``prepare`` 重新生成（无兼容层）。
 """
 
 from __future__ import annotations
@@ -110,14 +112,14 @@ class TurningPoint:
 
     :param kind: ``start`` | ``up`` | ``down`` | ``close``（2026-09-25 起
         ``up``/``down`` 取代旧名 ``high``/``low``）
-    :param timestamp: K 线开始时间（该点 ``bar_index`` 所指那根；``up``/``down`` 点
-        为极值 K 线的前一根，极值在 bar 0 时为 bar 0 自身）
-    :param price: 该点的价格（up = 锚点 bar 最高价、down = 锚点 bar 最低价、
-        起点开盘价、终点收盘价）
-    :param bar_index: 在传入窗口中的 0 基下标（``up``/``down`` = 极值 bar − 1，
-        极值在 bar 0 时为 0）
-    :param volume: 该点 ``bar_index`` 所指 K 线的成交量（K 线时间范围内的成交量合计）
-    :param oi: 该点 ``bar_index`` 所指 K 线结束时刻的持仓量（天勤 ``close_oi`` 口径）
+    :param timestamp: 确认根 K 线的开始时间（``up``/``down`` 点 = 触发根 ``t``；
+        ``start``/``close`` = 首根/末根）
+    :param price: 该点的价格（``up`` = 值根最高价、``down`` = 值根最低价、
+        起点开盘价、终点收盘价；``up``/``down`` 的值根 = ``bar_index − 1``，可推导）
+    :param bar_index: 在传入窗口中的 0 基下标（确认根；``up``/``down`` 点的值根
+        = ``bar_index − 1``，可推导）
+    :param volume: 值根 K 线的成交量（K 线时间范围内的成交量合计）
+    :param oi: 值根 K 线结束时刻的持仓量（天勤 ``close_oi`` 口径）
     """
 
     kind: str
@@ -223,14 +225,14 @@ def find_turning_points(
     *,
     initial_direction: str = "auto",
 ) -> list[TurningPoint]:
-    """按人工规则提取转折点路径（检测规则与参考实现逐条一致；发射口径见模块
-    docstring「发射口径变更（2026-09-25 用户决策 D1–D3）」）。
+    """按人工规则提取转折点路径（检测触发序列与参考实现一致；发射字段按 2026-09-26
+    甲口径，见模块 docstring「发射口径（2026-09-26 甲口径）」）。
 
     :param df: 标准 OHLCV（含 ``timestamp/open/high/low/close``，按时间升序，
         且全部为**已收盘** K 线）；增补信息需要 ``volume`` 与 ``close_oi`` 列
         （标准落盘契约固定包含）
     :param initial_direction: 见 :func:`resolve_initial_direction`
-    :return: 路径点序列（起点 → 已确认极值… → 终点收盘价）
+    :return: 路径点序列（起点 → 已确认反转点… → 终点收盘价）
     """
     required = (
         "timestamp",
@@ -267,47 +269,29 @@ def find_turning_points(
         )
         return points
 
-    # 当前段的极值（上涨跟踪 high，下跌跟踪 low）
-    if direction == "up":
-        extreme = highs[0]
-    else:
-        extreme = lows[0]
-    extreme_ts = timestamps[0]
-    extreme_idx = 0
-
+    # t 从 1 开始：up/down 点在触发根 t 确认，值根 t − 1 恒存在（无边界特判）
     for t in range(1, n):
         if direction == "up":
-            # 严格大于才更新 → 并列保留最早一根
-            if highs[t] > extreme:
-                extreme, extreme_ts, extreme_idx = highs[t], timestamps[t], t
-            # 转向那根 K 线已参与上面的极值搜索（人工确认细则 3）
+            # 严格小于才转向；触发根当根不按新状态重判（单比较，不级联）
             if lows[t] < lows[t - 1]:
-                # 发射锚点 = 极值前一根（D1）；极值在 bar 0 时整点留在 bar 0（D2）
-                anchor = extreme_idx - 1 if extreme_idx > 0 else 0
                 points.append(
                     TurningPoint(
-                        "up", timestamps[anchor], highs[anchor], anchor,
-                        volumes[anchor], ois[anchor],
+                        "up", timestamps[t], highs[t - 1], t,
+                        volumes[t - 1], ois[t - 1],
                     )
                 )
                 direction = "down"
-                extreme, extreme_ts, extreme_idx = lows[t], timestamps[t], t
         else:
-            if lows[t] < extreme:
-                extreme, extreme_ts, extreme_idx = lows[t], timestamps[t], t
             if highs[t] > highs[t - 1]:
-                # 发射锚点 = 极值前一根（D1）；极值在 bar 0 时整点留在 bar 0（D2）
-                anchor = extreme_idx - 1 if extreme_idx > 0 else 0
                 points.append(
                     TurningPoint(
-                        "down", timestamps[anchor], lows[anchor], anchor,
-                        volumes[anchor], ois[anchor],
+                        "down", timestamps[t], lows[t - 1], t,
+                        volumes[t - 1], ois[t - 1],
                     )
                 )
                 direction = "up"
-                extreme, extreme_ts, extreme_idx = highs[t], timestamps[t], t
 
-    # 路径收尾：进行中的极值不输出（尚未确认），只补最后一根收盘价
+    # 路径收尾：进行中的段不输出（尚未确认），只补最后一根收盘价
     points.append(
         TurningPoint(
             "close", timestamps[n - 1], closes[n - 1], n - 1,

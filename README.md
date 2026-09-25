@@ -8,10 +8,6 @@
 > 正文内容区分四级状态：**Implemented（已实现，当前仓库）**、
 > **Research Direction（研究方向）**、**Future Work（后续工作）**、
 > **Open Questions（未决问题）**。
->
-> 所有关于 `reference/` 的展开内容**一律集中在文末「附录 A · 参考资料」**，
-> 以编号条目（R1–R6）引用；正文只在需要处保留 `（见 R#）` 标记，
-> 不与核心功能混排。附录条目属于第五类状态：**Reference（参考资料，不代表当前能力）**。
 
 ---
 
@@ -72,7 +68,7 @@ MarketSense/
 ├── AGENTS.md            # Agent 工作规范
 ├── dataset/             # ▶ 已实现：数据准备子应用（天勤 K 线 + 转折点），用法见 §7.2
 ├── artifacts/           # DevFlow 流程产物（见 §8）
-└── reference/           # 参考内容，不入库（引用条目见附录 A）
+└── reference/           # 参考内容，不入库
 ```
 
 - **`dataset/` 是 MarketSense 自身的第一块已实现代码**：数据准备子应用
@@ -80,7 +76,7 @@ MarketSense/
   **详细用法见 §7.2**。其中部分模块移植自参考版本的数据层
   （模块出处对照见 `dataset/README.md`），**运行时不 import `reference/`**。
 - 除 `dataset/` 外，MarketSense 自身的模型 / 特征 / 状态 / 描述 / 决策等**尚未建立**。
-- `reference/` 是**参考内容**（已终止的早期版本 + 第三方项目），已加入 `.gitignore`，
+- `reference/` 是**参考内容**（第三方项目），已加入 `.gitignore`，
   **不纳入版本管理**；阅读它得到的是参考信息，不等于 MarketSense 的既定设计。
   定位、资产盘点与验证基线见**附录 A**（凭证安全提醒见 R6）。
 - 上一版 bootstrap 的根级脚手架（`AGENT.md`、`PROJECT_STATUS.md`、
@@ -328,112 +324,3 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 | 流程产物（数据子应用） | `artifacts/training-data-app/` | `dataset/` 子应用的需求 / 设计 / 审查 / 测试报告 |
 | 流程产物（转折点契约变更） | `artifacts/turning-point-updown-price/` | 2026-09-25 转折点契约变更的 DevFlow 产物 |
 
-`reference/` 下的文档索引见**附录 A.2**。
-
----
-
-## 附录 A · 参考资料（reference/）
-
-> 本附录是正文对 `reference/` 内容的**唯一展开处**。
-> `reference/` 是参考内容而非源码：已加入 `.gitignore`、不纳入版本管理；
-> 其中的状态、缺陷与内部文档**不需要维护或修复**。以下条目均为
-> **Reference（参考资料）**——阅读得到的是参考信息，不等于 MarketSense 的既定设计。
-
-### A.1 引用条目
-
-**R1 · `reference/perception/` — 已终止的早期版本（package `marksense`）**
-
-- 本项目**之前做过、现已终止的一个版本**，整体移入 `reference/` 保留作参考与资产来源；
-  它自己的 `README.md` 标题也叫 "MarketSense"，阅读时须区分**仓库根（本项目）**与该参考版本。
-- 定位（已确认）：**仅作参考**——只会复用其中**一部分逻辑**，复用范围**待需求讨论完成后再定**（§6）。
-  因此它的实现不等于 MarketSense 的既定设计。
-- 该版本自述的完整系统（`OHLCV → MarketState → Canonical Description → NanoJev →
-  EvidenceVector → Decision`）中，**仅 Phase 1–5 已实现**（见 R2）；
-  `NanoJev`（Phase 6）/ `Evidence`（Phase 7）/ `Decision`（Phase 8）/ Full Pipeline · Replay
-  （Phase 9）**未实现**（`src/marksense/` 下无对应目录）——**它没有任何概率输出能力**。
-- 总览文档：`reference/perception/README.md`。
-
-**R2 · 参考版本已实现的 Phase 1–5（可复用资产盘点）**
-
-已实现链路（仅存在于参考版本，**不是 MarketSense 当前能力**）：
-
-```text
-OHLCV
-  ↓  Phase 1  数据层：TianQinProvider / MarketDataLoader / DataValidator
-  ↓  Phase 2  特征：ATR / Range / Rolling High-Low / Volume Ratio / Volatility
-  ↓  Phase 3  市场状态：Range / Breakout / Pullback / Re-entry / Follow-through /
-              Time-Context / Location / Structure → MarketState（结构化数据类）
-  ↓  Phase 4  标准化描述：Canonical Description = Market Observation Language v3
-  ↓  Phase 5  训练数据：Question Dataset（Q001~Q005）/ FutureOutcome / Leakage 检查
-```
-
-对应源码目录（`reference/perception/src/marksense/`）：
-
-| 模块 | 目录 | 实现的职责 |
-|---|---|---|
-| 数据层 | `data/` | 天勤取数（tqsdk）、标准化、落盘、加载、校验、周期/时间工具 |
-| 特征 | `features/` | `atr.py`、`range.py`、`rolling.py`、`volume.py`、`volatility.py` |
-| 状态 | `state/` | 各类 detector + `time_context` / `location` / `structure` → `market_state.py` |
-| 描述 | `description/` | `canonical.py`（固定七行模板，v3） |
-| 数据集 | `dataset/` | `question_dataset.py`、`future_outcome.py`、`leakage.py`、`validator.py` |
-
-关键性质（详情见源码与 `docs/market-observation.md`，索引见 A.2）：
-`MarketState` 同时包含事件语义字段与归一化数值字段（完整字段清单见
-`state/market_state.py`）；观察语言 v3 输出**固定七行模板**，用 ATR 倍数、区间相对位置、
-量比、波动比表达（**归一化 / 尺度不变**），绝对价格不进入观察语言，
-由跨品种等价 + 平移不变性测试强制。
-
-**R3 · 参考版本的验证基线与运行方式**
-
-- **2026-09-25 复测**：`cd reference/perception && /opt/anaconda3/envs/marketsense/bin/python -m pytest -q`
-  → 437 项全部通过（exit 0；pytest 汇总行被环境插件吞没，计数由进度点与
-  `--collect-only` 汇总 437 双重确认）。
-- 历史记录：2026-09-24 实测同为 `437 passed`。
-- ⚠️ 其内部状态文件 `PROJECT_STATUS.md` **滞后于实际代码**：记 `429 passed`（与实测不符），
-  且其 §2 阶段表把 Phase 3/4 标 `NOT_STARTED` 而实际已完成——该文件是**历史快照**，
-  不应作为唯一事实源，以代码与实测为准。
-- 依赖（`reference/perception/pyproject.toml`）：`pandas`、`numpy`、`pyyaml`、`tqsdk`、`pyarrow`。
-- 人工验证脚本（`reference/perception/scripts/`，验证/分析用工具，不属于核心链路）：
-  `describe_ohlcv.py`（离线回放，产物见 `docs/verification/`）、
-  `realtime_describe.py`（实时流逐根打印描述）、`turning_points.py`（见 R4）。
-
-**R4 · `reference/perception/scripts/turning_points.py` 现状**
-
-- 按人工给定的「相邻 K 线破位」规则，把一段 OHLCV 压缩成一条转折点路径
-  （`开盘价 → 转折极值… → 收盘价`）。
-- 文件头自述为**人工分析工具，「不属于核心业务链路」**；经核实 `src/` 中无任何引用，
-  未接入 MarketState 或 Canonical Description；拥有独立测试
-  `tests/test_turning_points.py`（8 passed）。
-- 与 MarketSense 的关系：MarketSense 侧的转折点能力已由 `dataset/` 子应用实现（§7.2，
-  部分逻辑移植自该脚本，输出对照测试见 `dataset/README.md`）；
-  把转折点接入状态理解是**后续研究方向**（§5），不是已完成事实。
-
-**R5 · `reference/minimind/` — 第三方开源小语言模型项目**
-
-- 上游为开源项目 [jingyaogong/minimind](https://github.com/jingyaogong/minimind)
-  （Apache 2.0，自带独立 `.git`，原样放置）。
-- 内容：超小语言模型的**极简实现与完整训练链路**——预训练、SFT、LoRA、DPO、
-  PPO/GRPO、工具调用、蒸馏等（`model/`、`trainer/`、`dataset/`、`scripts/`）。
-- 与 MarketSense 的关系：**外部参考**，用于研究"小模型 + 可复现训练链路"这条路是否适用；
-  **不含任何行情/市场逻辑**。
-
-**R6 · 凭证安全提醒（不处理，仅提醒）**
-
-- `reference/perception/config/market.yaml` 内含明文快期账号与密码。
-- 该文件**不需要处理**（`reference/` 已被 `.gitignore` 排除、未进入版本库），
-  但**绝不**把其中的凭证复制到其他文件、文档、日志或 git（同 `AGENTS.md` 的约定）。
-
-### A.2 参考文档索引
-
-| 文档 | 位置 | 说明 |
-|---|---|---|
-| 参考版本总览 | `reference/perception/README.md` | 已终止早期版本的完整说明（自述系统含未实现部分，见 R1） |
-| 需求/设计文档 | `reference/perception/docs/01`~`08` | 需求、概要、详细设计、MarketState 数据字典、NanoJev 接口设计、训练数据生成、任务书、验收 |
-| 观察语言词表 | `reference/perception/docs/market-observation.md` | 现行 v3 词表（`market-observation-history.md` 为历史版本） |
-| 数据源设计 | `reference/perception/docs/10_天勤量化数据源设计.md` | 天勤接入设计（另有 `天勤量化接入参考手册.md`） |
-| 端到端验证样例 | `reference/perception/docs/verification/*.md` | 逐根描述的真实产物 |
-| 状态/纪律文件 | `reference/perception/AGENTS.md`、`PROJECT_STATUS.md`、`TASKS.md`、`CHANGELOG.md` | **历史快照，已知滞后**（见 R3），不作唯一事实源 |
-| 小模型项目 | `reference/minimind/README.md` | 第三方项目总览（见 R5） |
-
-> 截至 2026-09-25，`reference/` 顶层只有 `perception/` 与 `minimind/` 两个目录，
-> 未发现独立存放的论文、算法库等其他类别材料。

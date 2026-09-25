@@ -100,7 +100,8 @@ def build_ohlcv(
 
     ``volume``/``open_oi``/``close_oi`` 可传单个值（逐根相同）或逐根列表；
     缺省持仓量逐根递增且满足 ``close_oi[i] == open_oi[i+1]``（与真实口径一致），
-    便于测试断言转折点携带的是其 ``bar_index`` 所指（锚点）K 线的值。
+    便于测试断言转折点携带的是其值根 K 线（``up``/``down`` 点 = ``bar_index − 1``，
+    ``start``/``close`` 点 = 自身根）的值。
     """
     count = len(rows)
 
@@ -131,19 +132,19 @@ def build_ohlcv(
     )
 
 
-#: 转折点规则固定向量（由 ``reference/perception/tests/test_turning_points.py`` 的 8 条
-#: 用例整理而来，作为移植后的固定期望值，同时供 parity 测试对比参考实现）。
+#: 转折点规则固定向量（场景源自 ``reference/perception/tests/test_turning_points.py``
+#: 的 8 条用例，期望值按 2026-09-26 甲口径重算，同时供 parity 测试对比参考实现）。
 #: 每条向量：``rows`` = (open, high, low, close) 序列；``initial_direction`` 为输入模式；
 #: ``expect_*`` 为预期输出（kind / price / bar_index 序列）。
 #:
-#: 2026-09-25 起按「锚点 = 极值 bar − 1（极值在 bar 0 时取 0）」发射（D1–D3）：
-#: ``expect_kinds`` 用新 kind（旧 ``high``→``up``、``low``→``down``）；``expect_prices``
-#: 为锚点 bar 的 high（up）/ low（down）；``expect_bar_index`` 为锚点 bar；
-#: ``start``/``close`` 不变。bar 0 边界实例：``extreme_tie_keeps_earliest_bar`` 与
-#: ``close_always_appended_even_if_equal_to_last_extreme``（极值留在 bar 0，整点不前移）。
+#: 2026-09-26 起按甲口径发射：``up``/``down`` 点在触发根 ``t`` 确认
+#: （``timestamp``/``bar_index`` = ``t``），``price``/``volume``/``oi`` 取前一根
+#: （值根 = ``bar_index − 1``）：``up`` 点 price = 前一根 high，``down`` 点 price =
+#: 前一根 low；``start``/``close`` 不变。触发条件与状态机不变（up 态
+#: ``low < 前一根 low``、down 态 ``high > 前一根 high``，严格比较，转向根当根不重判）。
 TURNING_POINT_VECTORS: list[dict[str, Any]] = [
     {
-        "name": "up_then_down_extreme_includes_turning_bar",
+        "name": "up_then_down_turning_bar_new_high_new_low",
         "rows": [
             (100, 101, 99, 100),
             (100, 110, 100, 109),
@@ -155,31 +156,31 @@ TURNING_POINT_VECTORS: list[dict[str, Any]] = [
         "initial_direction": "up",
         "expect_kinds": ["start", "up", "down", "close"],
         "expect_prices": [100, 120, 100, 112],
-        "expect_bar_index": [0, 2, 4, 5],
+        "expect_bar_index": [0, 3, 5, 5],
     },
     {
         "name": "equal_low_does_not_break_uptrend",
         "rows": [(60, 100, 50, 60), (60, 105, 50, 70), (70, 110, 50, 80), (80, 110, 49, 70)],
         "initial_direction": "up",
         "expect_kinds": ["start", "up", "close"],
-        "expect_prices": [60, 105, 70],
-        "expect_bar_index": [0, 1, 3],
+        "expect_prices": [60, 110, 70],
+        "expect_bar_index": [0, 3, 3],
     },
     {
         "name": "equal_high_does_not_break_downtrend",
         "rows": [(80, 100, 50, 60), (60, 100, 45, 50), (50, 99, 40, 45), (45, 101, 42, 95)],
         "initial_direction": "down",
         "expect_kinds": ["start", "down", "close"],
-        "expect_prices": [80, 45, 95],
-        "expect_bar_index": [0, 1, 3],
+        "expect_prices": [80, 40, 95],
+        "expect_bar_index": [0, 3, 3],
     },
     {
-        "name": "extreme_tie_keeps_earliest_bar",
+        "name": "flat_run_then_break_turns_at_trigger_bar",
         "rows": [(100, 100, 90, 95), (95, 100, 91, 96), (96, 100, 92, 97), (97, 100, 89, 90)],
         "initial_direction": "up",
         "expect_kinds": ["start", "up", "close"],
         "expect_prices": [100, 100, 90],
-        "expect_bar_index": [0, 0, 3],
+        "expect_bar_index": [0, 3, 3],
     },
     {
         "name": "single_bar_returns_start_and_close",
@@ -190,12 +191,12 @@ TURNING_POINT_VECTORS: list[dict[str, Any]] = [
         "expect_bar_index": [0, 0],
     },
     {
-        "name": "close_always_appended_even_if_equal_to_last_extreme",
+        "name": "last_bar_trigger_shares_bar_index_with_close",
         "rows": [(100, 100, 90, 95), (95, 100, 91, 100), (100, 100, 89, 100)],
         "initial_direction": "up",
         "expect_kinds": ["start", "up", "close"],
         "expect_prices": [100, 100, 100],
-        "expect_bar_index": [0, 0, 2],
+        "expect_bar_index": [0, 2, 2],
     },
 ]
 

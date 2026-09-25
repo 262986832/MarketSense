@@ -1,4 +1,4 @@
-"""转折点规则（含 reference 8 条向量）、落盘与读回复现（AC-6、AC-7）。"""
+"""转折点规则（甲口径发射：触发根确认、值根取前一根）、落盘与读回复现。"""
 
 from __future__ import annotations
 
@@ -40,14 +40,33 @@ def test_turning_point_vectors_match_fixed_expectations(vector: dict) -> None:
     assert _kinds(points) == vector["expect_kinds"]
     assert [p.price for p in points] == vector["expect_prices"]
     assert [p.bar_index for p in points] == vector["expect_bar_index"]
-    # 时间戳必须落在 bar_index（锚点）所指 K 线上
+    # 时间戳落在确认根（bar_index 所指 K 线）
     for point in points:
         assert point.timestamp == df["timestamp"].iloc[point.bar_index]
-    # 增补信息：volume/oi 取自该点 bar_index 所指（锚点）K 线（默认夹具逐根递增）
-    assert [p.volume for p in points] == [100] * len(points)
-    assert [p.oi for p in points] == [
-        5000 + 10 * (i + 1) for i in vector["expect_bar_index"]
+    # 值根：start/close 取自身根，up/down 取前一根（夹具 close_oi 逐根递增可判别）
+    for point in points:
+        value_root = point.bar_index - 1 if point.kind in ("up", "down") else point.bar_index
+        assert point.volume == df["volume"].iloc[value_root]
+        assert point.oi == df["close_oi"].iloc[value_root]
+
+
+def test_up_down_value_root_takes_previous_bar_volume() -> None:
+    """值根逐根判别：up 点 volume/oi 取 bar_index − 1 那根（夹具传逐根 volume）。"""
+    rows = [
+        (100, 101, 99, 100),
+        (100, 110, 100, 109),
+        (109, 120, 105, 119),
+        (119, 121, 104, 110),  # low 104 < 105 触发 → up 点在 bar 3 确认，值根 = bar 2
     ]
+    df = build_ohlcv(rows, volume=[11, 22, 33, 44])
+    points = find_turning_points(df, initial_direction="up")
+
+    assert _kinds(points) == ["start", "up", "close"]
+    up = points[1]
+    assert up.bar_index == 3
+    assert up.price == df["high"].iloc[2] == 120.0
+    assert up.volume == 33 == df["volume"].iloc[2]
+    assert up.oi == df["close_oi"].iloc[2]
 
 
 def test_turning_point_kinds_contract() -> None:
@@ -55,58 +74,94 @@ def test_turning_point_kinds_contract() -> None:
     assert TURNING_POINT_KINDS == ("start", "up", "down", "close")
 
 
-def test_up_then_down_extreme_includes_turning_bar() -> None:
+def test_turning_bar_new_high_new_low_does_not_shift_emission() -> None:
     rows = [
         (100, 101, 99, 100),
         (100, 110, 100, 109),
         (109, 120, 105, 119),
-        (119, 121, 104, 110),  # low 104 < 105 转向；同根 high 121 创新高 → 极值在转向根
+        (119, 121, 104, 110),  # low 104 < 105 转向；同根 high 121 创新高，不影响发射
         (110, 112, 100, 101),
-        (101, 113, 99, 112),  # high 113 > 112 转向；同根 low 99 创新低 → 极值在转向根
+        (101, 113, 99, 112),   # high 113 > 112 转向；同根 low 99 创新低，不影响发射
     ]
     df = build_ohlcv(rows)
     points = find_turning_points(df, initial_direction="up")
 
-    # up 点：极值高在 bar 3（转向根参与极值搜索）→ 锚定其前一根 bar 2（D1）
+    # up 点：在触发根 bar 3 确认，price 取前一根 bar 2 的 high（而非转向根的 121）
     assert points[1].kind == "up"
-    assert points[1].bar_index == 2
-    assert points[1].timestamp == df["timestamp"].iloc[2]
-    assert points[1].price == df["high"].iloc[2]
-    # down 点：极值低在 bar 5 → 锚定 bar 4
+    assert points[1].bar_index == 3
+    assert points[1].timestamp == df["timestamp"].iloc[3]
+    assert points[1].price == df["high"].iloc[2] == 120.0
+    # down 点：在触发根 bar 5 确认，price 取前一根 bar 4 的 low（而非转向根的 99）
     assert points[2].kind == "down"
-    assert points[2].bar_index == 4
-    assert points[2].timestamp == df["timestamp"].iloc[4]
-    assert points[2].price == df["low"].iloc[4]
+    assert points[2].bar_index == 5
+    assert points[2].timestamp == df["timestamp"].iloc[5]
+    assert points[2].price == df["low"].iloc[4] == 100.0
 
 
-def test_bar0_extreme_down_point_stays_at_bar0() -> None:
-    """AC-3 bar 0 边界（D2）：初始 down、第 1 根向上突破（high[1] > high[0]）→
-    极值低在 bar 0（low[1] 未创新低），down 点整点留在 bar 0，price 取 bar 0 自身极值价。"""
+def test_down_point_at_first_bar_uses_bar0_as_value_root() -> None:
+    """t = 1 边界：初始 down、第 1 根向上突破（high[1] > high[0]）→
+    down 点在触发根 bar 1 确认，price = bar 0 的 low，volume/oi 取 bar 0。"""
     df = build_ohlcv([(100, 100, 90, 95), (95, 105, 90, 100)])
     points = find_turning_points(df, initial_direction="down")
 
     assert _kinds(points) == ["start", "down", "close"]
     down = points[1]
-    assert down.bar_index == 0
+    assert down.bar_index == 1
+    assert down.timestamp == df["timestamp"].iloc[1]
     assert down.price == df["low"].iloc[0] == 90.0
-    assert down.timestamp == df["timestamp"].iloc[0]
     assert down.volume == df["volume"].iloc[0]
     assert down.oi == df["close_oi"].iloc[0]
 
 
-def test_bar0_extreme_up_point_stays_at_bar0() -> None:
-    """AC-3 bar 0 边界（D2）：初始 up、第 1 根向下跌破（low[1] < low[0]）→
-    极值高在 bar 0（high[1] 未创新高，并列保留最早），up 点整点留在 bar 0。"""
+def test_up_point_at_first_bar_uses_bar0_as_value_root() -> None:
+    """t = 1 边界：初始 up、第 1 根向下跌破（low[1] < low[0]）→
+    up 点在触发根 bar 1 确认，price = bar 0 的 high，volume/oi 取 bar 0。"""
     df = build_ohlcv([(100, 100, 90, 95), (95, 100, 85, 90)])
     points = find_turning_points(df, initial_direction="up")
 
     assert _kinds(points) == ["start", "up", "close"]
     up = points[1]
-    assert up.bar_index == 0
+    assert up.bar_index == 1
+    assert up.timestamp == df["timestamp"].iloc[1]
     assert up.price == df["high"].iloc[0] == 100.0
-    assert up.timestamp == df["timestamp"].iloc[0]
     assert up.volume == df["volume"].iloc[0]
     assert up.oi == df["close_oi"].iloc[0]
+
+
+def test_down_state_same_bar_new_high_and_low_emits_single_point() -> None:
+    """同根双条件不级联：down 态某根同时创新高（触发转向）与创新低，只发射一个
+    down 点；切换后的 up 态当根不重判，下一根正常触发。"""
+    rows = [
+        (100, 100, 90, 95),
+        (95, 101, 89, 100),   # high 101 > 100 触发 down 点；同根 low 89 创新低不再判 up
+        (100, 102, 85, 99),   # 下一根：up 态 low 85 < 89 正常触发 up 点
+    ]
+    df = build_ohlcv(rows)
+    points = find_turning_points(df, initial_direction="down")
+
+    assert _kinds(points) == ["start", "down", "up", "close"]
+    assert len([p for p in points if p.kind in ("up", "down")]) == 2
+    down = points[1]
+    assert down.bar_index == 1
+    assert down.price == df["low"].iloc[0] == 90.0
+    up = points[2]
+    assert up.bar_index == 2
+    assert up.price == df["high"].iloc[1] == 101.0
+
+
+def test_last_bar_trigger_shares_bar_index_with_close() -> None:
+    """末根触发：反转点与 close 点同 bar_index 同 timestamp
+    （向量 last_bar_trigger_shares_bar_index_with_close 的显式断言）。"""
+    df = build_ohlcv([(100, 100, 90, 95), (95, 100, 91, 100), (100, 100, 89, 100)])
+    points = find_turning_points(df, initial_direction="up")
+
+    assert _kinds(points) == ["start", "up", "close"]
+    up, close = points[1], points[2]
+    assert up.bar_index == close.bar_index == 2
+    assert up.timestamp == close.timestamp == df["timestamp"].iloc[2]
+    # up 点 price 取前一根 bar 1 的 high；close 点取末根收盘价
+    assert up.price == df["high"].iloc[1] == 100.0
+    assert close.price == df["close"].iloc[2] == 100.0
 
 
 def test_resolve_initial_direction_auto_rules() -> None:

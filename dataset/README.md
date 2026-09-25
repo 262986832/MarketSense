@@ -40,9 +40,9 @@ cd /Users/jiangdianjing/agentspace/MarketSense
 | `dataset/storage.py` | `src/marksense/data/storage.py` + `src/marksense/data/loader.py`（合并，固定 CSV） |
 | `dataset/provider.py` | `src/marksense/data/provider.py`（不移植 `subscribe`/实时订阅） |
 | `dataset/config.py` | `src/marksense/data/config.py`（改为 `dataset` + `tianqin` 两段 + 环境变量覆盖） |
-| `dataset/turning_points.py` | `scripts/turning_points.py`（检测算法与参考实现等价；点信息锚定与 kind 命名按 2026-09-25 用户决策偏离参考实现；新增落盘/读取） |
+| `dataset/turning_points.py` | `scripts/turning_points.py`（检测触发序列与参考实现一致；发射字段按 2026-09-26 甲口径偏离参考实现；新增落盘/读取） |
 | `dataset/tests/conftest.py` | `tests/data/conftest.py`（`FakeTqApi`/`build_raw_klines`/`build_serial_klines`） |
-| `dataset/tests/test_turning_points.py` | `tests/test_turning_points.py`（8 条向量作为固定期望值） |
+| `dataset/tests/test_turning_points.py` | `tests/test_turning_points.py`（6 条向量，期望值按 2026-09-26 甲口径重算） |
 | `dataset/tests/test_parity_turning_points.py` | 新增：与参考脚本直接对比（参考缺失时 skip） |
 
 参考目录 `reference/` 已被 `.gitignore` 排除，本包**不 import** 它、不复制其中的明文凭证。
@@ -106,13 +106,14 @@ first_timestamp, last_timestamp, file_sha256, source_data_version
 point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volume_ratio,oi_ratio
 ```
 
-`kind ∈ {start, up, down, close}`（2026-09-25 起：极值类 kind 由 `high`/`low` 更名为
-`up`/`down`）；`bar_index` 为窗口内 0 基下标（可回溯关联 K 线 CSV）。`up`/`down` 点的
-`timestamp/price/volume/oi` 取**极值 K 线的前一根**（锚点 `bar_index = 极值 bar − 1`；
-`price` = 前一根 high/low）；极值落在 bar 0 时整点留在 bar 0，`price` 取 bar 0 自身
-极值价。每个点携带其 `bar_index` 所指（锚点）那根 K 线的：`volume`（该 K 线成交量合计）、
-`oi`（该 K 线**结束时刻**持仓量，天勤 `close_oi` 口径；`open_oi` 口径可由 `bar_index`
-关联 K 线 CSV 补算）。
+`kind ∈ {start, up, down, close}`（2026-09-25 起反转类 kind 由 `high`/`low` 更名为
+`up`/`down`）；`bar_index` 为窗口内 0 基下标（可回溯关联 K 线 CSV）。`up`/`down` 点在
+**触发根**确认（up 态命中 `low[t] < low[t-1]`、down 态命中 `high[t] > high[t-1]` 的
+那根）：`timestamp`/`bar_index` = 触发根 `t`；`price` = 前一根 high（up）或 low（down）；
+`volume`/`oi` = 前一根，值根 = `bar_index − 1`（可推导，无需额外列）。`start`（首根
+开盘）与 `close`（末根收盘）取自身根。每个点携带其值根 K 线的：`volume`（该 K 线
+成交量合计）、`oi`（该 K 线**结束时刻**持仓量，天勤 `close_oi` 口径；`open_oi` 口径
+可由 `bar_index` 关联 K 线 CSV 补算）。
 后四列为相邻点**相对值**，由点序列确定性派生：`dt_minutes` = 当前点与前一点
 `timestamp` 之差（单位分钟）；`price_ratio`/`volume_ratio`/`oi_ratio` = 当前点值 /
 前一点值（比值，减 1 即变化幅度）。首点无前一点 → 四列均为空单元格；前一点值为 0
@@ -183,3 +184,7 @@ from dataset import (
 - 本包不做实时订阅、不做模型/特征/状态/决策，也不定义最终模型输入格式（非目标）。
 - K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
   新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。
+- 转折点发射语义于 2026-09-26 变更（甲口径：`up`/`down` 点 `timestamp`/`bar_index` =
+  触发根，`price`/`volume`/`oi` 取前一根）。旧落盘文件与新文件同 schema（列集合相同），
+  `load_turning_points` 不会拒绝旧文件，但值含义不同；须重新 `turning-points` /
+  `prepare` 再生成（无兼容层）。

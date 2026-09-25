@@ -42,10 +42,15 @@ def test_standardize_klines_sorts_ascending() -> None:
     assert str(df["timestamp"].iloc[0]) == RAW_ROWS_ASC[0][0] + "+08:00"
 
 
-def test_standardize_klines_include_oi_keeps_extension_columns() -> None:
-    df = standardize_klines(build_raw_klines(), include_oi=True)
-    assert tuple(df.columns) == OHLCV_COLUMNS + ("open_oi", "close_oi")
+def test_standardize_klines_always_keeps_open_interest_columns() -> None:
+    """持仓量是标准契约固定列：无条件保留且收敛为 int64。"""
+    df = standardize_klines(build_raw_klines())
+    assert OHLCV_COLUMNS[-2:] == ("open_oi", "close_oi")
+    assert tuple(df.columns) == OHLCV_COLUMNS
     assert str(df["open_oi"].dtype) == "int64"
+    assert str(df["close_oi"].dtype) == "int64"
+    assert df["open_oi"].tolist() == [r[6] for r in RAW_ROWS_ASC]
+    assert df["close_oi"].tolist() == [r[7] for r in RAW_ROWS_ASC]
 
 
 def test_standardize_klines_rejects_empty_and_missing_columns() -> None:
@@ -53,6 +58,13 @@ def test_standardize_klines_rejects_empty_and_missing_columns() -> None:
         standardize_klines(pd.DataFrame())
     with pytest.raises(DatasetError, match="缺少必需字段"):
         standardize_klines(build_raw_klines().drop(columns=["volume"]))
+    # 持仓量是必需字段：缺失（含任一列）或含 NaN 均报错
+    with pytest.raises(DatasetError, match="缺少必需字段"):
+        standardize_klines(build_raw_klines().drop(columns=["close_oi"]))
+    with_nan = build_raw_klines()
+    with_nan.loc[0, "open_oi"] = float("nan")
+    with pytest.raises(DatasetError, match="open_oi 存在缺失或非数值"):
+        standardize_klines(with_nan)
 
 
 def test_standardize_klines_rejects_non_integer_datetime() -> None:

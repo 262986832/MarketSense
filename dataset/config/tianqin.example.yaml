@@ -12,7 +12,6 @@ dataset:
   type: tianqin
   output_dir: data           # 落在已被 .gitignore 忽略的目录
   output_format: csv
-  include_oi: false
   period: 1m
   initial_direction: auto
 

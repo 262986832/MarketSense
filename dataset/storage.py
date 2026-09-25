@@ -24,7 +24,7 @@ from typing import Callable, Final, Mapping
 import pandas as pd
 
 from dataset.errors import DatasetError, DataLoadError
-from dataset.ohlcv import OHLCV_COLUMNS, TIMEZONE
+from dataset.ohlcv import OHLCV_COLUMNS, OI_COLUMNS, TIMEZONE
 
 #: 落盘格式（D-02：本次仅 CSV）
 OUTPUT_FORMAT: Final[str] = "csv"
@@ -185,9 +185,11 @@ def read_csv_table(path: Path) -> pd.DataFrame:
     与参考实现 ``reference/perception/src/marksense/data/loader.py::_read_raw`` 对齐：
     空文件（``pandas.errors.EmptyDataError``）、异编码（``UnicodeDecodeError``）、
     权限/缺失（``OSError``）等均包成 ``DataLoadError``，不让底层异常类型外泄。
+    ``float_precision="round_trip"``：pandas 默认快速浮点解析可差 1 ulp，开启后
+    写入的 float64 文本可无损读回（转折点相对值等需逐字节一致比较的场景依赖此保证）。
     """
     try:
-        return pd.read_csv(path)
+        return pd.read_csv(path, float_precision="round_trip")
     except Exception as exc:  # noqa: BLE001 — 读取失败一律收敛为 DataLoadError
         raise DataLoadError(f"文件读取失败: {path} ({type(exc).__name__}: {exc})") from None
 
@@ -283,9 +285,17 @@ def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
         raise DataLoadError("volume 必须为整数，存在小数值")
     data["volume"] = volume.astype("int64")
 
+    for col in OI_COLUMNS:  # 持仓量固定列，与 volume 同规整
+        oi = pd.to_numeric(df[col], errors="coerce")
+        if bool(oi.isna().any()):
+            raise DataLoadError(f"{col} 存在缺失或非数值")
+        if bool((oi % 1 != 0).any()):
+            raise DataLoadError(f"{col} 必须为整数，存在小数值")
+        data[col] = oi.astype("int64")
+
     extra = [c for c in df.columns if c not in OHLCV_COLUMNS]
     converted = pd.DataFrame(data)
-    for col in extra:  # 扩展列（如 open_oi/close_oi）原样保留
+    for col in extra:  # 未识别的额外列原样保留
         converted[col] = df[col].reset_index(drop=True)
     return converted
 

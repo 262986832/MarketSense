@@ -40,7 +40,6 @@ def _config(tmp_path: Path, **overrides) -> DatasetConfig:
         "password": "pass",
         "output_dir": tmp_path / "data",
         "output_format": "csv",
-        "include_oi": False,
         "period": "1m",
         "initial_direction": "auto",
         "config_path": None,
@@ -125,7 +124,9 @@ def test_fetch_history_standardizes_and_passes_datetime_bounds(tmp_path: Path) -
     assert call["duration_seconds"] == 300
     assert call["start_dt"].isoformat() == "2024-01-01T00:00:00"
     assert call["end_dt"].isoformat() == "2024-01-02T00:00:00"
-    assert list(df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert list(df.columns) == [
+        "timestamp", "open", "high", "low", "close", "volume", "open_oi", "close_oi",
+    ]
     assert str(df["timestamp"].dt.tz) == TIMEZONE
     assert len(df) == len(RAW_ROWS_ASC)
 
@@ -254,9 +255,10 @@ def test_fetch_recent_without_wait_support_reports_no_valid_rows(tmp_path: Path)
         provider.fetch_recent("DCE.v2701", "1m", 3)
 
 
-def test_include_oi_propagates_to_both_paths(tmp_path: Path) -> None:
+def test_open_interest_always_included_in_both_paths(tmp_path: Path) -> None:
+    """持仓量为固定契约列：两条取数路径均无条件携带。"""
     api = FakeTqApi(serial=build_serial_klines(_SERIAL_ROWS, width=8))
-    provider = _provider(tmp_path, api, include_oi=True)
+    provider = _provider(tmp_path, api)
     provider.connect()
 
     history = provider.fetch_history("DCE.v2701", "1m", "2024-01-01", "2024-01-02")
@@ -264,8 +266,10 @@ def test_include_oi_propagates_to_both_paths(tmp_path: Path) -> None:
         "DCE.v2701", "1m", 3, as_of=pd.Timestamp("2024-01-02 09:10:00", tz=TIMEZONE)
     )
 
-    assert "open_oi" in history.columns and "close_oi" in history.columns
-    assert "open_oi" in recent.columns and "close_oi" in recent.columns
+    assert str(history["open_oi"].dtype) == "int64"
+    assert str(history["close_oi"].dtype) == "int64"
+    assert str(recent["open_oi"].dtype) == "int64"
+    assert str(recent["close_oi"].dtype) == "int64"
 
 
 def test_fetch_and_save_writes_csv_and_sidecar(tmp_path: Path) -> None:

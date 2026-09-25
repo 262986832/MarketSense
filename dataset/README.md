@@ -7,6 +7,19 @@
 /opt/anaconda3/envs/marketsense/bin/python -m pytest dataset/tests -q
 ```
 
+## 运行前提
+
+**必须在仓库根目录运行**（用 `python -m dataset` 调用；`python -m` 会把当前目录加入
+`sys.path`，无需安装、无打包元数据）。**conda 在本机需手动初始化**：
+
+```bash
+source /opt/anaconda3/etc/profile.d/conda.sh
+conda activate marketsense
+cd /Users/jiangdianjing/agentspace/MarketSense
+```
+
+不要用系统自带的 `/usr/local/bin/python3`（其 `numpy` 已损坏）。
+
 用途：把「天勤 K 线取数 → 标准化落盘（CSV + 来源指纹）→ 转折点提取 → 转折点落盘」
 做成自持、可复现、可测试的能力，并提供参数化命令行入口。
 
@@ -27,7 +40,7 @@
 | `dataset/storage.py` | `src/marksense/data/storage.py` + `src/marksense/data/loader.py`（合并，固定 CSV） |
 | `dataset/provider.py` | `src/marksense/data/provider.py`（不移植 `subscribe`/实时订阅） |
 | `dataset/config.py` | `src/marksense/data/config.py`（改为 `dataset` + `tianqin` 两段 + 环境变量覆盖） |
-| `dataset/turning_points.py` | `scripts/turning_points.py`（算法逐条照搬；新增落盘/读取） |
+| `dataset/turning_points.py` | `scripts/turning_points.py`（检测算法与参考实现等价；点信息锚定与 kind 命名按 2026-09-25 用户决策偏离参考实现；新增落盘/读取） |
 | `dataset/tests/conftest.py` | `tests/data/conftest.py`（`FakeTqApi`/`build_raw_klines`/`build_serial_klines`） |
 | `dataset/tests/test_turning_points.py` | `tests/test_turning_points.py`（8 条向量作为固定期望值） |
 | `dataset/tests/test_parity_turning_points.py` | 新增：与参考脚本直接对比（参考缺失时 skip） |
@@ -71,11 +84,13 @@ python -m dataset prepare --symbol DCE.v2701 --period 1d --bars 200
 **K 线 CSV**（`data/ohlcv/{symbol}_{period}.csv`，列顺序固定）：
 
 ```text
-timestamp,open,high,low,close,volume
+timestamp,open,high,low,close,volume,open_oi,close_oi
 ```
 
 `timestamp` 为 ISO8601 带 `+08:00`、唯一、严格升序（`Asia/Shanghai`）；OHLC `float64`；
-`volume int64`。同名 `.json` sidecar 记录：
+`volume int64`；持仓量为固定列：`open_oi`/`close_oi` 分别是天勤该根 K 线**起始时刻** / **结束时刻**的持仓量
+（`int64`，两条取数路径均返回，无需配置开关）。
+同名 `.json` sidecar 记录：
 
 ```text
 provider, symbol, period, output_format, start_dt, end_dt, row_count,
@@ -88,10 +103,21 @@ first_timestamp, last_timestamp, file_sha256, source_data_version
 **转折点 CSV**（`data/turning_points/{symbol}_{period}.csv`）：
 
 ```text
-point_index,kind,timestamp,price,bar_index
+point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volume_ratio,oi_ratio
 ```
 
-`kind ∈ {start, high, low, close}`；`bar_index` 为窗口内 0 基下标。同名 sidecar 记录
+`kind ∈ {start, up, down, close}`（2026-09-25 起：极值类 kind 由 `high`/`low` 更名为
+`up`/`down`）；`bar_index` 为窗口内 0 基下标（可回溯关联 K 线 CSV）。`up`/`down` 点的
+`timestamp/price/volume/oi` 取**极值 K 线的前一根**（锚点 `bar_index = 极值 bar − 1`；
+`price` = 前一根 high/low）；极值落在 bar 0 时整点留在 bar 0，`price` 取 bar 0 自身
+极值价。每个点携带其 `bar_index` 所指（锚点）那根 K 线的：`volume`（该 K 线成交量合计）、
+`oi`（该 K 线**结束时刻**持仓量，天勤 `close_oi` 口径；`open_oi` 口径可由 `bar_index`
+关联 K 线 CSV 补算）。
+后四列为相邻点**相对值**，由点序列确定性派生：`dt_minutes` = 当前点与前一点
+`timestamp` 之差（单位分钟）；`price_ratio`/`volume_ratio`/`oi_ratio` = 当前点值 /
+前一点值（比值，减 1 即变化幅度）。首点无前一点 → 四列均为空单元格；前一点值为 0
+（真实存在无成交分钟）时比值无定义，同样留空，不产生 `inf`。
+同名 sidecar 记录
 `symbol/period/row_count/window_first_timestamp/window_last_timestamp/`
 `initial_direction_requested/initial_direction_resolved/input_source_data_version/file_sha256`。
 
@@ -135,6 +161,7 @@ from dataset import (
     TianQinProvider, DataProvider,
     TurningPoint, find_turning_points, resolve_initial_direction,
     save_turning_points, load_turning_points, WindowMeta,
+    RelativeMetrics, relative_metrics,
 )
 ```
 
@@ -154,3 +181,5 @@ from dataset import (
 - 历史区间模式（`--start/--end`）依赖 `get_kline_data_series`，需天勤专业版权限；
   本机权限**未验证**（`U-1`）。无权限时应改用 `--bars`。
 - 本包不做实时订阅、不做模型/特征/状态/决策，也不定义最终模型输入格式（非目标）。
+- K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
+  新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。

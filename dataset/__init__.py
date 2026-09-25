@@ -31,13 +31,16 @@ from dataset.provider import DataProvider, TianQinProvider, validate_data_length
 from dataset.storage import LoadedOHLCV, load_ohlcv, save_ohlcv
 from dataset.turning_points import (
     INITIAL_DIRECTION_MODES,
+    RELATIVE_COLUMNS,
     TURNING_POINT_COLUMNS,
     LoadedTurningPoints,
+    RelativeMetrics,
     TurningPoint,
     WindowMeta,
     build_window_meta,
     find_turning_points,
     load_turning_points,
+    relative_metrics,
     resolve_initial_direction,
     save_turning_points,
 )
@@ -78,12 +81,15 @@ __all__ = [
     # 转折点
     "INITIAL_DIRECTION_MODES",
     "TURNING_POINT_COLUMNS",
+    "RELATIVE_COLUMNS",
     "TurningPoint",
+    "RelativeMetrics",
     "WindowMeta",
     "LoadedTurningPoints",
     "build_window_meta",
     "resolve_initial_direction",
     "find_turning_points",
+    "relative_metrics",
     "save_turning_points",
     "load_turning_points",
     # Provider

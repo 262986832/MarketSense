@@ -131,10 +131,14 @@ def test_load_ohlcv_round_trips_values_and_version(tmp_path: Path) -> None:
     assert loaded.path == saved
     assert loaded.source_data_version == meta["source_data_version"]
     assert loaded.row_count_declared == len(_ROWS)
-    assert list(loaded.df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert list(loaded.df.columns) == [
+        "timestamp", "open", "high", "low", "close", "volume", "open_oi", "close_oi",
+    ]
     assert str(loaded.df["timestamp"].iloc[0]) == str(_df()["timestamp"].iloc[0])
     assert loaded.df["close"].tolist() == pytest.approx([r[3] for r in _ROWS])
     assert loaded.df["volume"].tolist() == [100, 100, 100]
+    assert loaded.df["open_oi"].tolist() == [5000, 5010, 5020]
+    assert loaded.df["close_oi"].tolist() == [5010, 5020, 5030]
 
 
 def test_load_ohlcv_preserves_file_order(tmp_path: Path) -> None:

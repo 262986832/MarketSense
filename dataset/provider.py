@@ -123,7 +123,7 @@ class TianQinProvider(DataProvider):
             start_dt=start_dt,
             end_dt=end_dt,
         )
-        return standardize_klines(raw, include_oi=self._config.include_oi)
+        return standardize_klines(raw)
 
     def fetch_and_save(
         self, symbol: str, period: str, start: str, end: str
@@ -178,7 +178,6 @@ class TianQinProvider(DataProvider):
             raw,
             duration_seconds=duration_seconds,
             as_of=as_of,
-            include_oi=self._config.include_oi,
         )
         if len(df) > data_length:
             df = df.tail(data_length)

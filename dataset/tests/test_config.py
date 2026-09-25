@@ -42,7 +42,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_load_from_file(tmp_path: Path) -> None:
     path = _write_config(
         tmp_path,
-        dataset={"output_dir": str(tmp_path / "out"), "period": "5m", "include_oi": True},
+        dataset={"output_dir": str(tmp_path / "out"), "period": "5m"},
         tianqin={"account": "file-user", "password": "file-pass"},
     )
 
@@ -53,7 +53,6 @@ def test_load_from_file(tmp_path: Path) -> None:
     assert cfg.password == "file-pass"
     assert cfg.output_dir == tmp_path / "out"
     assert cfg.output_format == "csv"
-    assert cfg.include_oi is True
     assert cfg.period == "5m"
     assert cfg.initial_direction == "auto"
     assert cfg.config_path == path
@@ -384,9 +383,6 @@ def test_invalid_values_reported(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="未知 output_format"):
         load_dataset_config(_write_config(tmp_path, dataset={"output_format": "parquet"}))
 
-    with pytest.raises(ConfigError, match="include_oi 必须为布尔值"):
-        load_dataset_config(_write_config(tmp_path, dataset={"include_oi": "yes"}))
-
     with pytest.raises(UnknownPeriodError, match="1m, 5m, 15m, 1h, 1d"):
         load_dataset_config(_write_config(tmp_path, dataset={"period": "7m"}))
 
@@ -434,7 +430,6 @@ def test_require_credentials_passes_when_both_present() -> None:
         password="p",
         output_dir=Path("data"),
         output_format="csv",
-        include_oi=False,
         period="1m",
         initial_direction="auto",
     )

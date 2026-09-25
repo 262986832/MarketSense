@@ -92,17 +92,41 @@ def build_ohlcv(
     *,
     start: str = "2026-09-23 09:00:00",
     minutes: int = 1,
+    volume: int | list[int] | None = None,
+    open_oi: int | list[int] | None = None,
+    close_oi: int | list[int] | None = None,
 ) -> pd.DataFrame:
-    """``(open, high, low, close)`` 列表 → 标准 OHLCV（升序、tz-aware）。"""
+    """``(open, high, low, close)`` 列表 → 标准 OHLCV（升序、tz-aware，含持仓量）。
+
+    ``volume``/``open_oi``/``close_oi`` 可传单个值（逐根相同）或逐根列表；
+    缺省持仓量逐根递增且满足 ``close_oi[i] == open_oi[i+1]``（与真实口径一致），
+    便于测试断言转折点携带的是其 ``bar_index`` 所指（锚点）K 线的值。
+    """
+    count = len(rows)
+
+    def _per_bar(value: int | list[int] | None, default) -> list[int]:
+        if value is None:
+            return [default(i) for i in range(count)]
+        if isinstance(value, list):
+            if len(value) != count:
+                raise ValueError("逐根列表长度必须与 rows 一致")
+            return list(value)
+        return [value] * count
+
+    volumes = _per_bar(volume, lambda _i: 100)
+    open_ois = _per_bar(open_oi, lambda i: 5000 + 10 * i)
+    close_ois = _per_bar(close_oi, lambda i: 5000 + 10 * (i + 1))
     base = pd.Timestamp(start, tz="Asia/Shanghai")
     return pd.DataFrame(
         {
-            "timestamp": [base + pd.Timedelta(minutes=minutes * i) for i in range(len(rows))],
+            "timestamp": [base + pd.Timedelta(minutes=minutes * i) for i in range(count)],
             "open": [float(r[0]) for r in rows],
             "high": [float(r[1]) for r in rows],
             "low": [float(r[2]) for r in rows],
             "close": [float(r[3]) for r in rows],
-            "volume": [100 for _ in rows],
+            "volume": volumes,
+            "open_oi": open_ois,
+            "close_oi": close_ois,
         }
     )
 
@@ -111,9 +135,15 @@ def build_ohlcv(
 #: 用例整理而来，作为移植后的固定期望值，同时供 parity 测试对比参考实现）。
 #: 每条向量：``rows`` = (open, high, low, close) 序列；``initial_direction`` 为输入模式；
 #: ``expect_*`` 为预期输出（kind / price / bar_index 序列）。
+#:
+#: 2026-09-25 起按「锚点 = 极值 bar − 1（极值在 bar 0 时取 0）」发射（D1–D3）：
+#: ``expect_kinds`` 用新 kind（旧 ``high``→``up``、``low``→``down``）；``expect_prices``
+#: 为锚点 bar 的 high（up）/ low（down）；``expect_bar_index`` 为锚点 bar；
+#: ``start``/``close`` 不变。bar 0 边界实例：``extreme_tie_keeps_earliest_bar`` 与
+#: ``close_always_appended_even_if_equal_to_last_extreme``（极值留在 bar 0，整点不前移）。
 TURNING_POINT_VECTORS: list[dict[str, Any]] = [
     {
-        "name": "up_then_down_records_high_including_turning_bar",
+        "name": "up_then_down_extreme_includes_turning_bar",
         "rows": [
             (100, 101, 99, 100),
             (100, 110, 100, 109),
@@ -123,31 +153,31 @@ TURNING_POINT_VECTORS: list[dict[str, Any]] = [
             (101, 113, 99, 112),
         ],
         "initial_direction": "up",
-        "expect_kinds": ["start", "high", "low", "close"],
-        "expect_prices": [100, 121, 99, 112],
-        "expect_bar_index": [0, 3, 5, 5],
+        "expect_kinds": ["start", "up", "down", "close"],
+        "expect_prices": [100, 120, 100, 112],
+        "expect_bar_index": [0, 2, 4, 5],
     },
     {
         "name": "equal_low_does_not_break_uptrend",
         "rows": [(60, 100, 50, 60), (60, 105, 50, 70), (70, 110, 50, 80), (80, 110, 49, 70)],
         "initial_direction": "up",
-        "expect_kinds": ["start", "high", "close"],
-        "expect_prices": [60, 110, 70],
-        "expect_bar_index": [0, 2, 3],
+        "expect_kinds": ["start", "up", "close"],
+        "expect_prices": [60, 105, 70],
+        "expect_bar_index": [0, 1, 3],
     },
     {
         "name": "equal_high_does_not_break_downtrend",
         "rows": [(80, 100, 50, 60), (60, 100, 45, 50), (50, 99, 40, 45), (45, 101, 42, 95)],
         "initial_direction": "down",
-        "expect_kinds": ["start", "low", "close"],
-        "expect_prices": [80, 40, 95],
-        "expect_bar_index": [0, 2, 3],
+        "expect_kinds": ["start", "down", "close"],
+        "expect_prices": [80, 45, 95],
+        "expect_bar_index": [0, 1, 3],
     },
     {
         "name": "extreme_tie_keeps_earliest_bar",
         "rows": [(100, 100, 90, 95), (95, 100, 91, 96), (96, 100, 92, 97), (97, 100, 89, 90)],
         "initial_direction": "up",
-        "expect_kinds": ["start", "high", "close"],
+        "expect_kinds": ["start", "up", "close"],
         "expect_prices": [100, 100, 90],
         "expect_bar_index": [0, 0, 3],
     },
@@ -163,7 +193,7 @@ TURNING_POINT_VECTORS: list[dict[str, Any]] = [
         "name": "close_always_appended_even_if_equal_to_last_extreme",
         "rows": [(100, 100, 90, 95), (95, 100, 91, 100), (100, 100, 89, 100)],
         "initial_direction": "up",
-        "expect_kinds": ["start", "high", "close"],
+        "expect_kinds": ["start", "up", "close"],
         "expect_prices": [100, 100, 100],
         "expect_bar_index": [0, 0, 2],
     },
@@ -235,7 +265,6 @@ def build_config_payload(**overrides: Any) -> dict[str, Any]:
         "type": "tianqin",
         "output_dir": "data",
         "output_format": "csv",
-        "include_oi": False,
         "period": "1m",
         "initial_direction": "auto",
     }

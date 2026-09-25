@@ -3,6 +3,9 @@
 职责边界（沿用参考实现）：
 
 * 标准化 = 字段映射 + 时间归一化（Asia/Shanghai）+ 数值类型收敛 + 稳定升序；
+* 持仓量（``open_oi``/``close_oi``）是标准契约的**固定列**：天勤每根 K 线自带
+  「K 线起始/结束时刻的持仓量」，两条取数路径（``get_kline_data_series`` /
+  ``get_kline_serial``）均返回，无需开关；
 * 合法性校验（唯一、非空、OHLC 关系）属于 :mod:`dataset.validator`，本模块只对
   「无法收敛到标准类型」的脏数据报错；
 * 防未来数据泄漏：``clean_serial_klines`` 剔除填充行与**未收盘** K 线。
@@ -23,7 +26,10 @@ from dataset.errors import DatasetError
 #: 交易所时区（时间归一化目标；保证可排序、无歧义）
 TIMEZONE: Final[str] = "Asia/Shanghai"
 
-#: 标准 OHLCV 字段（顺序即落盘列顺序，数据契约固定不变）
+#: 持仓量字段（天勤每根 K 线自带：K 线起始时刻 / 结束时刻的持仓量）
+OI_COLUMNS: Final[tuple[str, ...]] = ("open_oi", "close_oi")
+
+#: 标准 OHLCV 字段（顺序即落盘列顺序，数据契约固定不变；持仓量为固定列）
 OHLCV_COLUMNS: Final[tuple[str, ...]] = (
     "timestamp",
     "open",
@@ -31,12 +37,10 @@ OHLCV_COLUMNS: Final[tuple[str, ...]] = (
     "low",
     "close",
     "volume",
-)
+) + OI_COLUMNS
 
-#: 可选扩展字段（默认不保存，``include_oi=True`` 时保留）
-OI_COLUMNS: Final[tuple[str, ...]] = ("open_oi", "close_oi")
-
-#: 天勤 ``get_kline_data_series`` 必需字段
+#: 天勤 ``get_kline_data_series`` / ``get_kline_serial`` 必需字段
+#: （两条路径均固定返回 ``open_oi``/``close_oi``）
 REQUIRED_SOURCE_COLUMNS: Final[tuple[str, ...]] = (
     "datetime",
     "open",
@@ -44,6 +48,8 @@ REQUIRED_SOURCE_COLUMNS: Final[tuple[str, ...]] = (
     "low",
     "close",
     "volume",
+    "open_oi",
+    "close_oi",
 )
 
 #: 天勤 ``get_kline_serial`` 必需列（``id`` 用于剔除填充行）
@@ -92,12 +98,12 @@ def _coerce_integer(series: pd.Series, name: str) -> pd.Series:
     return numeric.astype("int64")
 
 
-def standardize_klines(raw: pd.DataFrame, *, include_oi: bool = False) -> pd.DataFrame:
-    """把天勤原始 K 线 DataFrame 标准化为标准 OHLCV。
+def standardize_klines(raw: pd.DataFrame) -> pd.DataFrame:
+    """把天勤原始 K 线 DataFrame 标准化为标准 OHLCV（含持仓量固定列）。
 
     * 字段映射：``datetime → timestamp``；价格与成交量原名保留；
     * ``timestamp``：纳秒整数 → Asia/Shanghai tz-aware，按 timestamp 稳定升序；
-    * ``include_oi=True`` 时保留 ``open_oi``/``close_oi``；
+    * ``open_oi``/``close_oi``：持仓量固定保留，收敛为 ``int64``；
     * 唯一性与 OHLC 合法性由 :func:`dataset.validator.validate_ohlcv` 校验。
 
     :raises DatasetError: 结果为空 / 缺字段 / datetime 非整数 / 类型无法收敛
@@ -117,9 +123,8 @@ def standardize_klines(raw: pd.DataFrame, *, include_oi: bool = False) -> pd.Dat
     for col in _PRICE_COLUMNS:
         data[col] = _coerce_float(raw[col], col)
     data["volume"] = _coerce_integer(raw["volume"], "volume")
-    if include_oi:
-        for col in OI_COLUMNS:
-            data[col] = _coerce_integer(raw[col], col)
+    for col in OI_COLUMNS:
+        data[col] = _coerce_integer(raw[col], col)
 
     standardized = pd.DataFrame(data)
     return standardized.sort_values("timestamp", kind="stable").reset_index(drop=True)
@@ -130,7 +135,6 @@ def clean_serial_klines(
     *,
     duration_seconds: int,
     as_of: pd.Timestamp | datetime.datetime | None = None,
-    include_oi: bool = False,
 ) -> pd.DataFrame:
     """清洗 ``get_kline_serial`` 原始序列 → 标准 OHLCV（剔除未收盘 K 线）。
 
@@ -142,7 +146,6 @@ def clean_serial_klines(
     :param duration_seconds: K 线周期（秒），用于计算收盘时刻
     :param as_of: 判定已收盘的基准时间（``Timestamp``/``datetime``/ISO 字符串）；
         缺省取当前北京时间（naive 视为北京时间）
-    :param include_oi: 是否保留持仓量扩展字段
     """
     if raw is None or raw.empty:
         raise DatasetError("天勤返回的 K 线序列为空")
@@ -174,4 +177,4 @@ def clean_serial_klines(
 
     frame = raw.loc[ns.index].copy()
     frame["datetime"] = ns
-    return standardize_klines(frame, include_oi=include_oi)
+    return standardize_klines(frame)

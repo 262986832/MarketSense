@@ -82,7 +82,6 @@ class DatasetConfig:
     :param account/password: 凭证（允许为空，连接时强制校验）
     :param output_dir: 数据产物根目录（OHLCV 落 ``ohlcv/``、转折点落 ``turning_points/``）
     :param output_format: 落盘格式，当前仅 ``csv``（D-02）
-    :param include_oi: 是否保留 ``open_oi``/``close_oi`` 扩展字段
     :param period: 默认周期（五档之一）
     :param initial_direction: 默认初始方向模式（``auto``/``up``/``down``）
     :param config_path: 实际读取的配置文件路径（无文件时为 ``None``）
@@ -93,7 +92,6 @@ class DatasetConfig:
     password: str
     output_dir: Path
     output_format: str
-    include_oi: bool
     period: str
     initial_direction: str
     config_path: Path | None = None
@@ -303,7 +301,6 @@ def _load_from_file(path: Path) -> DatasetConfig:
         password=tianqin["password"],
         output_dir=Path(_optional_str(dataset, "output_dir", DEFAULT_OUTPUT_DIR, path=path)),
         output_format=_optional_str(dataset, "output_format", "csv", path=path),
-        include_oi=dataset.get("include_oi", False),
         period=_optional_str(dataset, "period", DEFAULT_PERIOD, path=path),
         initial_direction=_optional_str(
             dataset, "initial_direction", DEFAULT_INITIAL_DIRECTION, path=path
@@ -319,7 +316,6 @@ def _defaults() -> DatasetConfig:
         password="",
         output_dir=Path(DEFAULT_OUTPUT_DIR),
         output_format="csv",
-        include_oi=False,
         period=DEFAULT_PERIOD,
         initial_direction=DEFAULT_INITIAL_DIRECTION,
         config_path=None,
@@ -347,7 +343,6 @@ def _replace(config: DatasetConfig, **updates: Any) -> DatasetConfig:
         "password": config.password,
         "output_dir": config.output_dir,
         "output_format": config.output_format,
-        "include_oi": config.include_oi,
         "period": config.period,
         "initial_direction": config.initial_direction,
         "config_path": config.config_path,
@@ -365,8 +360,6 @@ def _validate(config: DatasetConfig) -> DatasetConfig:
         raise ConfigError(
             f"未知 output_format {config.output_format!r}，支持: {SUPPORTED_OUTPUT_FORMATS}"
         )
-    if not isinstance(config.include_oi, bool):
-        raise ConfigError(f"include_oi 必须为布尔值，实际: {type(config.include_oi).__name__}")
     if not str(config.output_dir).strip():
         raise ConfigError("output_dir 必须为非空路径")
     resolve_duration_seconds(config.period)  # 未知周期抛 UnknownPeriodError（含支持列表）

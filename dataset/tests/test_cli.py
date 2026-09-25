@@ -80,7 +80,9 @@ def test_fetch_bars_writes_ohlcv_csv_and_sidecar(tmp_path: Path, capsys) -> None
     assert path.is_file()
     sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
     frame = pd.read_csv(path)
-    assert list(frame.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+    assert list(frame.columns) == [
+        "timestamp", "open", "high", "low", "close", "volume", "open_oi", "close_oi",
+    ]
     assert len(frame) == 3
     assert sidecar["row_count"] == 3
     assert sidecar["symbol"] == "DCE.v2701"

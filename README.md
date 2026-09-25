@@ -67,6 +67,7 @@ MarketSense/
 ├── README.md            # 本文件
 ├── AGENTS.md            # Agent 工作规范
 ├── dataset/             # ▶ 已实现：数据准备子应用（天勤 K 线 + 转折点），用法见 §7.2
+├── scripts/             # ▶ 已实现：辅助脚本（转折点价格折线图），用法见 §7.3
 ├── artifacts/           # DevFlow 流程产物（见 §8）
 └── reference/           # 参考内容，不入库
 ```
@@ -312,6 +313,39 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
   `up`/`down` 点锚点前移至极值 K 线的前一根；旧 kind 落盘文件不再可读，需重新
   `turning-points` 再生成。
 
+### 7.3 `scripts/plot_price_line.py`：转折点价格折线图（快速可视化）
+
+`scripts/plot_price_line.py` 是一个独立小脚本：把转折点 CSV
+（`data/turning_points/{symbol}_{period}.csv`，即 §7.2 `turning-points` 的产物）中的
+`price` 画成折线图，用于直观查看价格走势。
+
+- 横坐标 = **逐行累加的 `dt_minutes`**（首点 start 为 0）：水平间距与原始数据的
+  时间比例一致（`dt_minutes` 为自然日分钟、含周末），不是按行号均匀排布；
+- 纵坐标 = 原始 `price`（不缩放、不归一化）；
+- 末行 `close` 的 `dt_minutes=0`，与前一转折点共用横坐标（忠实于数据）；
+- 最简呈现：单色折线 + 数据点标记，无 kind（up/down/start/close）着色与标注。
+
+#### 用法
+
+```bash
+# (a) 默认：读取 data/turning_points/DCE.v2701_1d.csv，
+#     输出到同目录 DCE.v2701_1d_price.png
+/opt/anaconda3/bin/python scripts/plot_price_line.py
+
+# (b) 指定其他转折点 CSV
+/opt/anaconda3/bin/python scripts/plot_price_line.py data/turning_points/DCE.v2701_1m.csv
+
+# (c) 指定输出路径
+/opt/anaconda3/bin/python scripts/plot_price_line.py -o /tmp/v2701_1d_price.png
+```
+
+> **环境注意**：脚本仅依赖标准库 + matplotlib。项目 `marketsense` 环境
+> **当前未安装 matplotlib**，上述示例使用 base conda 的 `/opt/anaconda3/bin/python`
+> （含 matplotlib 3.10.0，2026-09-25 实测）。若要在 `marketsense` 环境运行，
+> 需先向该环境安装 matplotlib（引入新依赖，由使用者自行决策）。
+
+输出：终端打印点数、x/y 范围与保存路径；PNG 为 12×5 英寸、150 dpi 的折线图。
+
 ---
 
 ## 8. 文档索引（核心）
@@ -323,4 +357,5 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 | 流程产物（认知建立） | `artifacts/project-bootstrap/` | 项目认知与 README/AGENTS 建立的 DevFlow 产物 |
 | 流程产物（数据子应用） | `artifacts/training-data-app/` | `dataset/` 子应用的需求 / 设计 / 审查 / 测试报告 |
 | 流程产物（转折点契约变更） | `artifacts/turning-point-updown-price/` | 2026-09-25 转折点契约变更的 DevFlow 产物 |
+| 流程产物（价格折线图脚本） | `artifacts/plot-turning-points-price/` | `scripts/plot_price_line.py` 的 DevFlow 产物（用法见 §7.3） |
 

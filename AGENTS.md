@@ -26,25 +26,6 @@ MarketSense 是一个**研究型**项目，研究问题：
 
 ---
 
-## 2. `reference/perception/` 是参考版本，不是当前源码
-
-`reference/perception/`（包名 `marksense`）是**本项目之前做过、现已终止的一个版本**，
-**仅作参考**：我们只会复用其中**一部分逻辑**，**具体复用范围待需求确定后再定**。
-
-它里面已实现（Phase 1–5）：数据层（天勤取数/落盘/校验）、特征、
-MarketState、Canonical Description（Market Observation Language v3）、Dataset。
-未实现（Phase 6–9）：`NanoJev`、`Evidence`、`Decision`、Replay。
-**它目前没有任何概率输出能力。**
-
-> **MarketSense 自身的源码尚未建立。** 在需求确定前，不要把它当作既定设计，
-> 也不要急着决定复用哪些部分（见 §10）。
-
-验证方式（实测基线，2026-09-24）：
-
-```bash
-cd reference/perception
-/opt/anaconda3/envs/marketsense/bin/python -m pytest   # 437 passed
-```
 
 ---
 
@@ -52,7 +33,6 @@ cd reference/perception
 
 - `reference/` = **参考内容，不是源码**；已加入 `.gitignore`，不纳入本仓库版本管理。
   从中学到的东西不等于 MarketSense 的设计决定。
-- `reference/perception/` = 本项目**已终止的早期版本**，保留作参考与资产来源。
 - `reference/minimind/` = **第三方开源小语言模型项目**（Apache 2.0，含独立 `.git`），
   只是模型/训练链路的参考，不含行情逻辑。
 
@@ -60,26 +40,8 @@ cd reference/perception
 
 ## 4. 不要修改 `reference/`
 
-- 默认**禁止修改** `reference/` 下的任何内容（含 `perception/` 的代码、文档、测试）。
-- 尤其**不要**重新设计 perception、修改 `turning_points.py`，
-  或改动其中的 `MarketState` / 观察语言字段与阈值。
-- `reference/perception/` 内部已知的滞后与缺陷（状态文件过时、明文凭证等）
-  **不需要处理**，因为它是参考内容、不是源码。
-- 如确需改动（例如为验证复用而打补丁），**先取得人工决策**，优先"派生副本"而非原地修改。
-- 动手前先读懂相关代码与该目录自带的 `AGENTS.md` / `docs/`。
-
 ---
 
-## 5. `turning_points.py` 的定位
-
-`reference/perception/scripts/turning_points.py` 提供的**转折点（Turning Points）**
-是 MarketSense 后续行情理解中**需要重点利用的一类市场特征**。
-
-但请注意其**现状**：它目前是一个**独立的人工分析脚本**，
-自述"不属于核心业务链路"，且**没有被 `src/` 引用**。
-把它接入状态理解是**后续研究任务**，不是已完成事实。
-
-现在不要修改它、不要重新定义它、不要提前固定其参数或输出格式。
 
 ---
 
@@ -102,10 +64,6 @@ cd reference/perception
 ## 7. 先理解上下文，再动代码
 
 - 开始工作前，先读相关**代码 + 文档 + 测试**；不要在不理解的情况下重写已有模块。
-- `reference/perception/` 有自己的设计文档体系（`docs/01`~`docs/10`、
-  `market-observation.md`）与状态文件（`PROJECT_STATUS.md` / `TASKS.md` / `CHANGELOG.md`）。
-  注意：这些状态文件**已知滞后于代码**，需要交叉验证，不能当唯一事实源。
-- 遇到文档之间、文档与代码之间的矛盾：**报告，不要自行选一个**。
 
 ---
 
@@ -121,7 +79,6 @@ cd reference/perception
 
 ## 9. 保持确定性、无未来数据泄漏（继承的硬约束）
 
-`reference/perception/` 已把这两条作为硬约束并用测试强制，新工作应继续保持：
 
 - **无未来数据泄漏**：`State(T)` 只能使用 `data <= T` 的数据；未来数据只用于生成标签，
   且特征窗口与标签窗口**严禁交叉**。
@@ -133,10 +90,6 @@ cd reference/perception
 ## 10. 不要过早设计
 
 当前处于"认知建立"阶段。除非明确进入相应研究任务，否则**不要**：
-
-- 重新设计 perception、修改 turning_points.py；
-- 开始训练模型、设计最终 Transformer、确定最终 Dataset / Label / Tokenizer / 参数；
-- 为"项目完整"而提前实现大量代码。
 
 ---
 
@@ -168,9 +121,6 @@ conda activate marketsense
 ## 12. 数据与凭证安全
 
 - **禁止**提交训练数据、模型 checkpoint、缓存、日志、密钥。
-- `reference/perception/config/market.yaml` 内含**明文快期账号/密码**。
-  该文件**不需要处理**（`reference/` 已在 `.gitignore` 中排除），但**绝不要**把其中的凭证
-  复制到其他文件、文档、日志或 git。
 - 需要凭证时，从本地环境/环境变量注入。
 
 ---
@@ -179,7 +129,6 @@ conda activate marketsense
 
 出现以下情况时**停止并请求人工决策**，不要自行推进：
 
-- 需要修改 `reference/` 中已有成果，或改动已确认的设计决策；
 - 发现文档与代码、或文档之间的实质性冲突；
 - 任务范围超出"已确认要做的事"，或需要引入新依赖/新架构；
 - 无法验证某个关键结论，而它会影响后续方向。

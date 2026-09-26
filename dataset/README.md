@@ -29,24 +29,6 @@ cd /Users/jiangdianjing/agentspace/MarketSense
 - **凭证不入库**：凭证仅在内存中传递，错误消息**永不**回显凭证值。
 - 转折点输出是**中间数据**，不是最终模型输入格式（D-07）。
 
-## 模块出处（移植自 `reference/perception/`，只读参考，不 import）
-
-| 本包模块 | 来源（`reference/perception/...`） |
-|---|---|
-| `dataset/errors.py` | `src/marksense/data/errors.py`（基类更名 `DatasetError`） |
-| `dataset/periods.py` | `src/marksense/data/periods.py` |
-| `dataset/ohlcv.py` | `src/marksense/data/ohlcv.py` + `src/marksense/data/timeutils.py`（合并） |
-| `dataset/validator.py` | `src/marksense/data/validator.py`（去掉 `DataValidator` 包装类） |
-| `dataset/storage.py` | `src/marksense/data/storage.py` + `src/marksense/data/loader.py`（合并，固定 CSV） |
-| `dataset/provider.py` | `src/marksense/data/provider.py`（不移植 `subscribe`/实时订阅） |
-| `dataset/config.py` | `src/marksense/data/config.py`（改为 `dataset` + `tianqin` 两段 + 环境变量覆盖） |
-| `dataset/turning_points.py` | `scripts/turning_points.py`（检测触发序列与参考实现一致；发射字段按 2026-09-26 甲口径偏离参考实现；新增落盘/读取） |
-| `dataset/tests/conftest.py` | `tests/data/conftest.py`（`FakeTqApi`/`build_raw_klines`/`build_serial_klines`） |
-| `dataset/tests/test_turning_points.py` | `tests/test_turning_points.py`（6 条向量，期望值按 2026-09-26 甲口径重算） |
-| `dataset/tests/test_parity_turning_points.py` | 新增：与参考脚本直接对比（参考缺失时 skip） |
-
-参考目录 `reference/` 已被 `.gitignore` 排除，本包**不 import** 它、不复制其中的明文凭证。
-
 ## CLI 用法
 
 ```text
@@ -147,7 +129,7 @@ MARKETSENSE_DATA_DIR       # output_dir 覆盖
   不拼接 PyYAML 的 `str(exc)`/`problem`/`context`，因为其中可能回显出错行原文、
   未定义别名/锚点名或标签名（均可能来自凭证行）；`ReaderError` 由字符偏移换算行列号。
 - 兜底脱敏（防凭证值被误填到其它字段）不会改写白名单文案（支持周期/格式列表）。
-- 不使用 `reference/perception/config/market.yaml`（含明文凭证）。
+- 不读取任何内置凭证文件；配置由 `--config` / 环境变量注入。
 - 默认 `output_dir: data`，已被根 `.gitignore` 忽略（`data/`、`*.csv` 双保险）。
 
 ## Python 接口（供导入复用）
@@ -170,12 +152,11 @@ from dataset import (
 
 ```bash
 /opt/anaconda3/envs/marketsense/bin/python -m pytest dataset/tests -q        # 全量离线测试
-/opt/anaconda3/envs/marketsense/bin/python -m pytest dataset/tests -v        # 含 parity 用例
+/opt/anaconda3/envs/marketsense/bin/python -m pytest dataset/tests -v        # 逐用例输出
 ```
 
 - 全部测试**不触网**：天勤通过 `api_factory` 注入 `FakeTqApi` 桩。
-- `dataset/tests/test_parity_turning_points.py` 以 `importlib` 加载
-  `reference/perception/scripts/turning_points.py` 直接对比输出；参考目录缺失时自动 skip。
+- 2026-09-26 实测：`168 passed`（两次运行 9.72s / 10.80s）。
 
 ## 已知边界（未验证项）
 

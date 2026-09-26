@@ -6,7 +6,7 @@
 * ``get_kline_serial`` 固定 width 行，数据不足时前端以「负 id + datetime=0」填充，
   所有列为 float64，形成中的 K 线拥有正 id。
 
-移植自 ``reference/perception/tests/data/conftest.py``（配置桩改为
+移植自本项目早期版本的数据层测试夹具（配置桩改为
 ``dataset`` / ``tianqin`` 两段式 ``build_config_payload``；新增 ``build_ohlcv``
 标准 OHLCV 构造器与 ``FakeSerialApi`` 保留）。
 """
@@ -132,8 +132,7 @@ def build_ohlcv(
     )
 
 
-#: 转折点规则固定向量（场景源自 ``reference/perception/tests/test_turning_points.py``
-#: 的 8 条用例，期望值按 2026-09-26 甲口径重算，同时供 parity 测试对比参考实现）。
+#: 转折点规则固定向量（8 条用例，期望值按 2026-09-26 甲口径重算）。
 #: 每条向量：``rows`` = (open, high, low, close) 序列；``initial_direction`` 为输入模式；
 #: ``expect_*`` 为预期输出（kind / price / bar_index 序列）。
 #:

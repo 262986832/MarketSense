@@ -15,7 +15,7 @@ low  <= min(open, close)
 tz-aware）作为前置；OHLC 关系只对四值齐全且有限的行判定，避免级联误报；
 ``volume = 0`` 合法（真实数据存在无成交分钟）。
 
-移植自 ``reference/perception/src/marksense/data/validator.py``（去掉
+移植自早期版本数据层的 validator 模块（去掉
 ``DataValidator`` 包装类，保留 ``Violation`` / ``ValidationReport`` /
 ``validate_ohlcv`` 三个公开对象）。
 """

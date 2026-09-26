@@ -9,8 +9,8 @@
 
 实时订阅（``subscribe``）不移植（本次非目标）。
 
-移植自 ``reference/perception/src/marksense/data/provider.py``（去掉 ``subscribe``
-与心跳相关逻辑；「多取 1 根以凑满 N 根已收盘」由参考脚本 ``turning_points.py``
+移植自早期版本数据层的 provider 模块（去掉 ``subscribe``
+与心跳相关逻辑；「多取 1 根以凑满 N 根已收盘」由早期版本的转折点脚本
 移入 Provider，见 ``fetch_recent``）。
 """
 

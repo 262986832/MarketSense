@@ -6,9 +6,8 @@
 * ``load_ohlcv`` 忠实读取：不排序、不去重、不修值（合法性校验归
   :mod:`dataset.validator`），仅做结构收敛。
 
-移植自 ``reference/perception/src/marksense/data/storage.py`` 与
-``reference/perception/src/marksense/data/loader.py``（两者合并到本文件；
-输出格式固定 CSV，D-02）。
+移植自早期版本数据层的 storage 与 loader 模块
+（两者合并到本文件；输出格式固定 CSV，D-02）。
 """
 
 from __future__ import annotations
@@ -182,7 +181,7 @@ def commit_data_with_sidecar(
 def read_csv_table(path: Path) -> pd.DataFrame:
     """读取 CSV 表格；**任何**读取失败统一收敛为 :class:`DataLoadError`。
 
-    与参考实现 ``reference/perception/src/marksense/data/loader.py::_read_raw`` 对齐：
+    与早期版本数据层的 loader ``_read_raw`` 语义对齐：
     空文件（``pandas.errors.EmptyDataError``）、异编码（``UnicodeDecodeError``）、
     权限/缺失（``OSError``）等均包成 ``DataLoadError``，不让底层异常类型外泄。
     ``float_precision="round_trip"``：pandas 默认快速浮点解析可差 1 ulp，开启后

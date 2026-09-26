@@ -10,9 +10,9 @@
 * ``MARKETSENSE_DATA_DIR``：``output_dir`` 覆盖。
 
 凭证安全：错误消息只说明「缺少账户/密码」及其来源，**永不**回显凭证值；
-不使用 ``reference/perception/config/market.yaml``（其中含明文凭证）。
+不读取任何内置凭证文件。
 
-配置形状移植自 ``reference/perception/src/marksense/data/config.py``（由单段
+配置形状移植自早期版本数据层的 config 模块（由单段
 ``data_source`` 改为 ``dataset`` + ``tianqin`` 两段，并新增环境变量覆盖）。
 """
 

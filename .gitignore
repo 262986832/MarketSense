@@ -1,9 +1,6 @@
 # .gitignore — MarketSense
 # 原则：禁止提交训练数据、模型 checkpoint、缓存、日志、临时文件、本地环境文件、密钥。
 
-# --- reference: 参考内容（早期已终止版本 + 第三方资料），不入库；仅作参考，不作为源码 ---
-reference/
-
 # --- 训练/实验数据与模型产物（防泄漏防护网，后续 Spec 可细化） ---
 data/
 datasets/

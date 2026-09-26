@@ -2,7 +2,7 @@
 
 > **机器盘感与概率决策研究项目**
 >
-> 状态：**认知建立阶段（Bootstrap v2）** · 最后更新：2026-09-25
+> 状态：**训练数据准备阶段（为 NanoJev 准备训练数据）** · 最后更新：2026-09-26
 >
 > 本 README 是对当前仓库**实际内容**的说明，不是对未来的架构承诺。
 > 正文内容区分四级状态：**Implemented（已实现，当前仓库）**、
@@ -37,7 +37,7 @@ K 线
   ↓
 状态序列
   ↓
-模型
+模型（当前候选：NanoJev，见 §5）
   ↓
 未来结果概率
 ```
@@ -63,27 +63,27 @@ K 线
 MarketSense/
 ├── .devflow/            # DevFlow 安装状态
 ├── .pi/                 # pi Agent 技能（devflow 等）
-├── .gitignore           # 忽略 reference/、数据、模型产物、密钥等
+├── .gitignore           # 忽略数据、模型产物、密钥等
 ├── README.md            # 本文件
 ├── AGENTS.md            # Agent 工作规范
 ├── dataset/             # ▶ 已实现：数据准备子应用（天勤 K 线 + 转折点），用法见 §7.2
 ├── scripts/             # ▶ 已实现：辅助脚本（转折点价格折线图），用法见 §7.3
 ├── artifacts/           # DevFlow 流程产物（见 §8）
-└── reference/           # 参考内容，不入库
+└── NanoJev/             # 第三方决策模型项目（含独立 .git），性质见下
 ```
 
 - **`dataset/` 是 MarketSense 自身的第一块已实现代码**：数据准备子应用
-  （天勤 K 线取数 → 标准化落盘 → 转折点提取；179 个离线测试通过，2026-09-25 实测），
-  **详细用法见 §7.2**。其中部分模块移植自参考版本的数据层
-  （模块出处对照见 `dataset/README.md`），**运行时不 import `reference/`**。
-- 除 `dataset/` 外，MarketSense 自身的模型 / 特征 / 状态 / 描述 / 决策等**尚未建立**。
-- `reference/` 是**参考内容**（第三方项目），已加入 `.gitignore`，
-  **不纳入版本管理**；阅读它得到的是参考信息，不等于 MarketSense 的既定设计。
-  定位、资产盘点与验证基线见**附录 A**（凭证安全提醒见 R6）。
+  （天勤 K 线取数 → 标准化落盘 → 转折点提取；168 个离线测试通过，2026-09-26 实测），
+  **详细用法见 §7.2**。
+- 除 `dataset/` 与 `scripts/` 外，MarketSense 自身的特征 / 状态 / 描述 /
+  训练数据加工等**尚未建立**。
+- `NanoJev/` 是**第三方决策模型项目**（0.6B 并行决策模型，Qwen3-0.6B 主干 + 决策头，
+  输入 state/question/candidates、直接输出概率分布），**含独立 `.git`**，
+  **不属于本仓库源码**：不修改其内部内容、不提交其内容。
+  把它用作 MarketSense 的决策模型是**当前研究假设**（见 §5）。
 - 上一版 bootstrap 的根级脚手架（`AGENT.md`、`PROJECT_STATUS.md`、
   `docs/PROJECT_CONSTITUTION.md`、`docs/REFERENCE_POLICY.md`、`specs/`、`research/`、
-  `experiments/`、`tasks/`）已被**有意删除**（未提交，保持原样、不恢复）：
-  commit `50d89d8` 的 bootstrap 自述未深入阅读 `reference/`，本次 README/AGENTS 是对该缺口的修正。
+  `experiments/`、`tasks/`）已被**有意删除**（不要恢复）。
 
 ---
 
@@ -99,8 +99,8 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 转折点 · 结构关系 · 时间关系 · 其他客观市场事实
 ```
 
-> 现在**不要**把这些定义成最终 Schema。参考版本已有一版观察语言（v3），
-> 是**可用的起点与参考**而非不可改的终点（见 R2）。
+> 现在**不要**把这些定义成最终 Schema。早期版本曾有一版观察语言（v3），
+> 可作为起点参考而非既定终点。
 
 ### 4.2 概率
 
@@ -110,35 +110,53 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 当前状态  →  未来可能路径  →  概率分布
 ```
 
-具体**预测什么、如何定义 Label、用什么模型**——均未最终确定。
-注意：参考版本**没有任何概率输出能力**（见 R1），概率是 MarketSense 后续要做的事。
+具体**预测什么、如何定义 Label**——均未最终确定。
+注意：概率输出是 MarketSense 要自己解决的核心问题——候选模型 NanoJev 虽以
+概率分布为输出形态（见 §5），但**市场场景的概率目标如何定义**仍需自行研究。
 
 ---
 
-## 5. Future Work（后续大致方向）
+## 5. 当前阶段：为 NanoJev 准备训练数据
 
-1. **研究 Perception 输出的可用性**：参考版本的 `MarketState` + 观察语言（R2）
-   能否作为状态表示？需要补什么、砍什么？
-2. **让转折点进入状态理解**：转折点提取已在 `dataset/` 落地（§7.2），
-   但它尚未接入任何状态/描述表示（参考版本中同样未接入，见 R4）。
-3. **从状态到状态序列**：现有可用能力是"单点状态"，时间演化/序列建模是新的研究点。
-4. **概率目标与 Label 定义**：定义"未来结果"是什么、如何标注、如何避免数据泄漏。
-5. **模型选择**：Transformer 或小模型（`reference/minimind` 可作参考，见 R5），
-   以及模型如何消费结构化描述。
-6. **评估体系**：概率预测如何评估才算有统计意义。
+**决策模型候选已选定 NanoJev**（研究假设，非最终承诺）：一个 0.6B 的并行决策模型
+（Qwen3-0.6B 主干 + 决策头），输入**状态 + 问题 + 候选**，直接输出**概率分布**
+（Choice / Boolean / Score 三种问题类型，零输出 token 解码；详见 `NanoJev/README.md`）。
+它"输入状态与问题、输出概率"的形态与 MarketSense 的研究目标一致；
+**但它面向游戏任务（Maze / Snake / ViZDoom），能否迁移到行情场景是本研究阶段要回答的问题。**
+
+下一阶段的核心任务是**为 NanoJev 准备训练数据**。
+
+**已具备的基础材料（已实现，用法见 §7）**：
+
+| 材料 | 来源 | 状态 |
+|---|---|---|
+| K 线数据 | `dataset fetch`（天勤取数 → CSV + 来源指纹） | 已实现 |
+| 转折点数据 | `dataset turning-points`（离线提取 → CSV） | 已实现 |
+| 价格折线数据 | 转折点 `price` 序列（`data/turning_points/*.csv`）及其折线图（`scripts/plot_price_line.py` → PNG） | 已实现 |
+
+**后续任务（Future Work，均未设计、未实现）**：
+
+1. **补充其它材料与数据**：在价格折线之外，补充训练所需的其它输入材料
+   （如市场状态描述、候选构造、问题模板等——具体形式**未决**）。
+2. **定义标签**：什么样的"未来结果"构成标签、如何标注、如何避免特征/标签窗口交叉。
+3. **对接 NanoJev 输入契约**：把材料映射为 NanoJev 的 state/question/candidates 格式。
+4. **数据切分与防泄漏**：train/dev/calibration/test 切分与时间序列防泄漏。
+
+> ⚠️ 以上后续任务只是**方向列表**，不是设计承诺；进入具体任务前需另行讨论确认。
 
 ---
 
 ## 6. Open Questions（未决问题）
 
-- Perception 的最终表示形式是什么？现有观察语言（R2）是否需要重构？
+- **训练数据的形式**：哪些材料进入 NanoJev 的输入？question / candidates 如何构造？
+- **标签**：预测哪些未来结果？时间窗口多长？如何标注、如何避免特征/标签窗口交叉？
+- **对接契约**：市场状态如何映射为 NanoJev 的 state/question/candidates 格式？
+- Perception 的最终表示形式是什么？早期观察语言（v3）的思路是否沿用？
 - 原始 K 线是否仍需**作为并行输入**（与结构化描述并存）？
 - 转折点的价值有多大？如何整合？最佳参数是否重要？
-- 模型应消费什么：观察语言文本、状态数值、还是两者？
-- Transformer 是否为最佳方案？
-- 概率目标如何定义：预测哪些未来结果？时间窗口多长？
-- **复用范围**：参考版本中哪些逻辑值得复用、以什么形式复用
-  （迁移 / 派生 / 重写）——**待需求讨论完成后再定**（见 R1）。
+- 模型应消费什么：文本描述、数值状态、折线图像、还是组合？
+- NanoJev 面向游戏任务设计，**迁移到行情场景**需要什么改动？它是否为最佳方案？
+- **评估体系**：概率预测如何评估才算有统计意义？
 
 ---
 
@@ -146,7 +164,7 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 
 ### 7.1 Python 环境
 
-本项目使用独立 conda 环境（`dataset/` 与参考版本共用）：
+本项目使用独立 conda 环境：
 
 ```text
 /opt/anaconda3/envs/marketsense/bin/python      # Python 3.11.13
@@ -296,8 +314,8 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 /opt/anaconda3/envs/marketsense/bin/python -m pytest dataset/tests -q
 ```
 
-179 个测试全部**离线、不触网**（天勤以 `FakeTqApi` 桩注入），且不修改生产代码
-（2026-09-25 实测：`179 passed in 10.91s`）。
+168 个测试全部**离线、不触网**（天勤以 `FakeTqApi` 桩注入），且不修改生产代码
+（2026-09-26 实测：`168 passed`，两次运行 9.72s / 10.80s）。
 
 #### 6. 已知边界与注意事项
 
@@ -353,7 +371,8 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 | 文档 | 位置 | 说明 |
 |---|---|---|
 | Agent 工作规范 | `AGENTS.md` | 未来 Agent 必读 |
-| **`dataset/` 使用说明** | `dataset/README.md` | 已实现数据准备子应用的完整用法（本文 §7.2 为其摘要；含模块出处对照） |
+| 决策模型参考项目 | `NanoJev/README.md` | 第三方 NanoJev 自述：0.6B 并行决策模型的输入契约与用法（以该项目文档为准） |
+| **`dataset/` 使用说明** | `dataset/README.md` | 已实现数据准备子应用的完整用法（本文 §7.2 为其摘要） |
 | 流程产物（认知建立） | `artifacts/project-bootstrap/` | 项目认知与 README/AGENTS 建立的 DevFlow 产物 |
 | 流程产物（数据子应用） | `artifacts/training-data-app/` | `dataset/` 子应用的需求 / 设计 / 审查 / 测试报告 |
 | 流程产物（转折点契约变更） | `artifacts/turning-point-updown-price/` | 2026-09-25 转折点契约变更的 DevFlow 产物 |

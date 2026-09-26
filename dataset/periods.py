@@ -3,7 +3,7 @@
 周期名 → tqsdk ``duration_seconds``；首批支持五档。使用哪个周期由配置/CLI
 注入，不硬编码（参数配置化）。
 
-移植自 ``reference/perception/src/marksense/data/periods.py``。
+移植自早期版本数据层的 periods 模块。
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """标准 OHLCV 列约定、时间归一化与天勤 K 线标准化。
 
-职责边界（沿用参考实现）：
+职责边界（沿用早期版本）：
 
 * 标准化 = 字段映射 + 时间归一化（Asia/Shanghai）+ 数值类型收敛 + 稳定升序；
 * 持仓量（``open_oi``/``close_oi``）是标准契约的**固定列**：天勤每根 K 线自带
@@ -10,8 +10,8 @@
   「无法收敛到标准类型」的脏数据报错；
 * 防未来数据泄漏：``clean_serial_klines`` 剔除填充行与**未收盘** K 线。
 
-移植自 ``reference/perception/src/marksense/data/ohlcv.py`` 与
-``reference/perception/src/marksense/data/timeutils.py``（两个模块合并到本文件）。
+移植自早期版本数据层的 ohlcv 与时间工具模块
+（两个模块合并到本文件）。
 """
 
 from __future__ import annotations

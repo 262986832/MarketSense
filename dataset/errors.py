@@ -3,7 +3,7 @@
 所有数据准备相关错误继承 :class:`DatasetError`，便于 CLI 统一捕获与报告
 （AGENTS.md 要求明确异常、错误消息不得泄露凭证）。
 
-移植自 ``reference/perception/src/marksense/data/errors.py``（基类由
+移植自早期版本数据层的 errors 模块（基类由
 ``DataSourceError`` 更名为 ``DatasetError``，语义与子类划分保持一致）。
 """
 

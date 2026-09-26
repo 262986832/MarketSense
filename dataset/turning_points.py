@@ -1,7 +1,7 @@
 """转折点提取与落盘。
 
-检测规则（触发条件与状态机，与 ``reference/perception/scripts/turning_points.py``
-一致，不做任何增删或阈值调整）：
+检测规则（触发条件与状态机，沿用本项目早期版本的转折点脚本，
+不做任何增删或阈值调整）：
 
 ```text
 上涨状态:
@@ -18,8 +18,8 @@
 （触发转向的那根 K 线切换后不按新状态重判——同根同时创新高与创新低只发射一个
 点，不级联）；末尾补最后一根 K 线收盘价（进行中的段尚未确认，不输出）。
 
-移植自 ``reference/perception/scripts/turning_points.py``（新增落盘/读取
-``save_turning_points`` / ``load_turning_points``）：**检测（触发序列）与参考实现
+移植自本项目早期版本的转折点脚本（新增落盘/读取
+``save_turning_points`` / ``load_turning_points``）：**检测（触发序列）与早期版本
 一致；发射字段按 2026-09-26 甲口径偏离**（见下文）。
 
 点信息增补（2026-09-24 需求）
@@ -225,7 +225,7 @@ def find_turning_points(
     *,
     initial_direction: str = "auto",
 ) -> list[TurningPoint]:
-    """按人工规则提取转折点路径（检测触发序列与参考实现一致；发射字段按 2026-09-26
+    """按人工规则提取转折点路径（检测触发序列与早期版本一致；发射字段按 2026-09-26
     甲口径，见模块 docstring「发射口径（2026-09-26 甲口径）」）。
 
     :param df: 标准 OHLCV（含 ``timestamp/open/high/low/close``，按时间升序，

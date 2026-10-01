@@ -35,6 +35,7 @@ cd /Users/jiangdianjing/agentspace/MarketSense
 python -m dataset fetch          --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--output-dir DIR] [--config FILE]
 python -m dataset turning-points --symbol S [--symbol S2 ...] --period P [--initial-direction auto|up|down] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 python -m dataset prepare        --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--initial-direction ...] [--output-dir DIR] [--config FILE]
+python -m dataset episode-generate --segments FILE [--output-dir DIR] [--config FILE]
 ```
 
 - `--period` 必填，仅支持 `1m, 5m, 15m, 1h, 1d`；非法值 stderr 输出支持列表并非 0 退出。
@@ -59,6 +60,53 @@ python -m dataset turning-points --symbol DCE.v2701 --period 1m --initial-direct
 
 # 一步：fetch + 转折点
 python -m dataset prepare --symbol DCE.v2701 --period 1d --bars 200
+
+# episode 训练数据生成（离线；需片段清单 + symbols.local.yaml 的 tick_size）
+python -m dataset episode-generate --segments data/segments/my_segments.jsonl
+```
+
+### `episode-generate`：episode 训练数据生成
+
+输入用户指定的震荡片段清单（每片段 = 一个 episode，`dataset/config/segments.example.jsonl`
+为模板）与已落盘 1 分钟 K 线，确定性地输出对齐 NanoJev 训练契约的按 split JSONL + 审计文件。
+不联网、不取数、不训练模型、不修改 `NanoJev/`；模型可见价格一律用比值（分母 = 片段首根开盘价，
+6 位小数）。模块与语义分层：`dataset/market_episode/replay.py`（mechanics：决策 K 线成交
+模型、止损锚定、t-1 盯市回撤与死亡、片段末强平）与 `labels.py`（policy：盈亏比规则真值
+标签 + (b) 采样），另有 `segments.py`（清单/品种配置/参数）、`nanojev_records.py`
+（记录映射与落盘）、`audit.py`（确定性双跑、跨 split 隔离、泄漏抽查、计数汇总）。
+
+前置与用法：先 `dataset fetch --period 1m` 落盘 K 线，再把
+`dataset/config/symbols.example.yaml` 复制为 `symbols.local.yaml` 并填 `tick_size`，
+然后用 `--segments` 指向片段清单（详细步骤与配置项见 `README.md` §7.2 小节 7）：
+
+```bash
+python -m dataset episode-generate --segments data/segments/my_segments.jsonl
+```
+
+输出（默认取配置 `episode.output_dir`，否则 `data/nanojev_dataset`）：
+
+```text
+data/nanojev_dataset/<run_id>/{train,dev,...}.jsonl   # 按 split 的记录（5 个文件都会写出；空 split 为 0 字节）
+data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/生成参数
+```
+
+关键约束与已知限制（实测）：
+
+- 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
+  同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
+- 确定性：无墙钟/随机；同输入双跑输出 sha256 一致。
+- `run_id` = sha256(片段清单 + 品种配置 + 参数) 的前 12 位；**不含行情数据指纹**，
+  因此同清单/同参数下换数据重跑会**覆盖**同目录产物（README 及变更报告早期“不覆盖历史产物”的
+  表述仅在清单/参数变化时成立）。
+- **空 split 不报错**：某 split 为空时对应 `.jsonl` 为 0 字节且 CLI 仍以 0 退出；NanoJev trainer
+  要求 `train`/`dev`/`test` 非空（`NanoJev/scripts/train_pipeline_decisions.py:477-479`），
+  其 `--validate-only` 也不会拦空目录（`:423-424`）——生成后需自行确认非空。
+- 本流水线**尚未**在真实片段上端到端运行（等用户交付片段清单与 1 分钟数据）。
+
+契约硬门（只读执行第三方脚本）：
+
+```bash
+python3 NanoJev/scripts/train_pipeline_decisions.py --validate-only --input data/nanojev_dataset/<run_id>
 ```
 
 ## 数据契约
@@ -157,6 +205,7 @@ from dataset import (
 
 - 全部测试**不触网**：天勤通过 `api_factory` 注入 `FakeTqApi` 桩。
 - 2026-09-26 实测：`168 passed`（两次运行 9.72s / 10.80s）。
+- 2026-09-30 实测（含 episode 流水线测试）：`277 passed`（11.64s）。
 
 ## 已知边界（未验证项）
 

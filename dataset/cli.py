@@ -1,11 +1,12 @@
 """dataset 命令行入口（``python -m dataset``）。
 
-三个子命令：
+四个子命令：
 
 ```text
 fetch          在线取数 → 校验 → 落盘 K 线 CSV + 来源指纹 sidecar
 turning-points 离线读取已落盘 K 线 → 转折点 CSV + 窗口 sidecar（不联网）
 prepare        fetch 后接转折点提取
+episode-generate  片段清单 + 已落盘 1 分钟 K 线 → 按 split 的 NanoJev JSONL + 审计
 ```
 
 退出码：``0`` 成功；``1`` 运行期失败（配置/凭证/取数/校验/读取）；``2`` 用法错误
@@ -21,6 +22,14 @@ from typing import Any, Callable, Sequence
 
 from dataset.config import DatasetConfig, load_dataset_config
 from dataset.errors import DatasetError
+from dataset.market_episode import (
+    AUDIT_FILENAME,
+    SPLIT_ROLES,
+    generate_dataset,
+    load_episode_config,
+    load_segments,
+    load_symbols_config,
+)
 from dataset.ohlcv import parse_date_bound
 from dataset.periods import resolve_duration_seconds, supported_periods_text
 from dataset.provider import (
@@ -45,6 +54,12 @@ EXIT_USAGE = 2
 #: 产物子目录（相对 output_dir）
 OHLCV_SUBDIR = "ohlcv"
 TURNING_POINTS_SUBDIR = "turning_points"
+
+#: 子命令名（argparse ``dest=command`` 取值）
+COMMAND_FETCH = "fetch"
+COMMAND_TURNING_POINTS = "turning-points"
+COMMAND_PREPARE = "prepare"
+COMMAND_EPISODE_GENERATE = "episode-generate"
 
 
 class UsageError(Exception):
@@ -125,7 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="MarketSense 数据准备子应用：天勤 K 线落盘 + 转折点提取",
     )
     subparsers = parser.add_subparsers(
-        dest="command", required=True, metavar="{fetch,turning-points,prepare}"
+        dest="command",
+        required=True,
+        metavar="{fetch,turning-points,prepare,episode-generate}",
     )
 
     fetch = subparsers.add_parser(
@@ -140,6 +157,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare = subparsers.add_parser("prepare", help="fetch 后接转折点提取")
     _add_common_arguments(prepare, window=True, data_dir=False)
+
+    episode = subparsers.add_parser(
+        COMMAND_EPISODE_GENERATE,
+        help="片段清单 + 已落盘 1 分钟 K 线 → 按 split 的 NanoJev JSONL + 审计",
+    )
+    episode.add_argument(
+        "--segments",
+        dest="segments",
+        required=True,
+        metavar="FILE",
+        help="片段清单 JSONL（每行一个片段 = 一个 episode；模板见 dataset/config/segments.example.jsonl）",
+    )
+    episode.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        metavar="DIR",
+        help="产物根目录（默认取配置 episode.output_dir，产物落在 <DIR>/<run_id>/）",
+    )
+    episode.add_argument("--config", dest="config", metavar="FILE", help="配置文件（YAML）")
     return parser
 
 
@@ -235,12 +271,36 @@ def _extract_turning_points(
     )
 
 
+def _run_episode_generate(args: argparse.Namespace) -> int:
+    """``episode-generate``：离线生成 episode 训练数据（不联网、不触天勤凭证）。"""
+    config = load_episode_config(args.config)
+    segments = load_segments(Path(args.segments))
+    symbols = load_symbols_config(config.symbols_path)
+    output_dir = Path(args.output_dir) if args.output_dir else config.output_dir
+    result = generate_dataset(
+        segments,
+        symbols=symbols,
+        data_dir=config.data_dir,
+        params=config.params,
+        output_dir=output_dir,
+    )
+    counts = ", ".join(
+        f"{split}={result.record_counts[split]}" for split in SPLIT_ROLES
+    )
+    print(f"已生成 episode 训练数据：{result.run_dir}（记录数 {counts}）")
+    print(f"审计文件：{result.run_dir / AUDIT_FILENAME}")
+    return EXIT_OK
+
+
 def _run(
     args: argparse.Namespace, *, api_factory: Callable[[DatasetConfig], Any] | None
 ) -> int:
     """执行子命令（配置加载前先校验周期与窗口参数，保证错误信息可操作）。"""
+    if args.command == COMMAND_EPISODE_GENERATE:
+        # 该子命令不涉及天勤凭证与窗口参数，先于周期/窗口校验分发
+        return _run_episode_generate(args)
     resolve_duration_seconds(args.period)  # 未知周期 → UnknownPeriodError（含支持列表）
-    if args.command == "turning-points":  # 离线路径无窗口参数
+    if args.command == COMMAND_TURNING_POINTS:  # 离线路径无窗口参数
         bars: int | None = None
         start: str | None = None
         end: str | None = None
@@ -250,7 +310,7 @@ def _run(
     base_dir = Path(args.output_dir) if args.output_dir else config.output_dir
     requested_direction = args.initial_direction or config.initial_direction
 
-    if args.command == "turning-points":
+    if args.command == COMMAND_TURNING_POINTS:
         input_dir = (
             Path(args.data_dir) if getattr(args, "data_dir", None) else ohlcv_dir(base_dir)
         )
@@ -293,7 +353,7 @@ def _run(
     finally:
         provider.close()
 
-    if args.command == "prepare":
+    if args.command == COMMAND_PREPARE:
         for symbol in args.symbols:
             path = _extract_turning_points(
                 symbol=symbol,

@@ -66,17 +66,18 @@ MarketSense/
 ├── .gitignore           # 忽略数据、模型产物、密钥等
 ├── README.md            # 本文件
 ├── AGENTS.md            # Agent 工作规范
-├── dataset/             # ▶ 已实现：数据准备子应用（天勤 K 线 + 转折点），用法见 §7.2
+├── dataset/             # ▶ 已实现：数据准备子应用（天勤 K 线 + 转折点 + episode 训练数据），用法见 §7.2
 ├── scripts/             # ▶ 已实现：辅助脚本（转折点价格折线图），用法见 §7.3
 ├── artifacts/           # DevFlow 流程产物（见 §8）
 └── NanoJev/             # 第三方决策模型项目（含独立 .git），性质见下
 ```
 
 - **`dataset/` 是 MarketSense 自身的第一块已实现代码**：数据准备子应用
-  （天勤 K 线取数 → 标准化落盘 → 转折点提取；168 个离线测试通过，2026-09-26 实测），
-  **详细用法见 §7.2**。
-- 除 `dataset/` 与 `scripts/` 外，MarketSense 自身的特征 / 状态 / 描述 /
-  训练数据加工等**尚未建立**。
+  （天勤 K 线取数 → 标准化落盘 → 转折点提取 → episode 训练数据生成；
+  `dataset/market_episode/` 为 episode 流水线，含机制/标签分层）；
+  280 个离线测试通过 + 1 个 xfailed（已知缺陷最小复现），2026-09-30 实测，**详细用法见 §7.2**。
+- 除 `dataset/` 与 `scripts/` 外，MarketSense 自身的特征 / 状态 / 市场描述 /
+  模型训练与评估等**尚未建立**。
 - `NanoJev/` 是**第三方决策模型项目**（0.6B 并行决策模型，Qwen3-0.6B 主干 + 决策头，
   输入 state/question/candidates、直接输出概率分布），**含独立 `.git`**，
   **不属于本仓库源码**：不修改其内部内容、不提交其内容。
@@ -133,14 +134,33 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 | K 线数据 | `dataset fetch`（天勤取数 → CSV + 来源指纹） | 已实现 |
 | 转折点数据 | `dataset turning-points`（离线提取 → CSV） | 已实现 |
 | 价格折线数据 | 转折点 `price` 序列（`data/turning_points/*.csv`）及其折线图（`scripts/plot_price_line.py` → PNG） | 已实现 |
+| episode 训练数据（首轮） | `dataset episode-generate`（用户片段清单 → 确定性回放 → 盈亏比规则真值标签 → 按 split 的 NanoJev JSONL + 审计；用法见 §7.2） | 已实现，并已在真实片段上端到端生成通过契约校验（2026-10-01，见下方「首轮真实数据」） |
 
-**后续任务（Future Work，均未设计、未实现）**：
+首轮 episode 训练数据流水线的语义已在 `artifacts/nanojev-training-data/01-requirement/requirement-report.md`
+（需求）与 `artifacts/nanojev-training-data/02-design/tech-design.md`（设计）中冻结：
+每分钟一个决策、成交与止损锚定"刚收盘那根 K 线"、固定 1 手、无机械止盈止损、
+模型可见价格一律用比值表达、开仓/平仓/反手标签由盈亏比与反转 K 线规则给出。
 
-1. **补充其它材料与数据**：在价格折线之外，补充训练所需的其它输入材料
+**首轮真实数据（2026-10-01 已生成并通过契约校验）**：DCE.v2701（PVC）2026-09 全月
+21 个交易日片段（`data/segments/sep2026.jsonl`：train 9-1~9-18 / dev 9-21~9-24 /
+test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→ `data/nanojev_dataset/run-c1cb097177a3/`
+（**train 4188 / dev 886 / test 655**，7125 决策点，全部非空），NanoJev 原生
+`--validate-only` 契约硬门通过。`tick_size = 5` 为**用户确认值**（公开资料记载最小变动
+价位 1 元/吨，按用户确认执行，已记录于 `dataset/config/symbols.local.yaml` 注释）；
+切分设计（每交易所交易日一个 episode + 时间顺序三分割）为执行时确定性默认，
+调整只需编辑片段清单重跑（`run_id` 随清单/参数变化，旧产物保留）。
+
+**后续任务（Future Work）**：
+
+1. **补充其它材料与数据（未设计、未实现）**：在价格折线之外，补充训练所需的其它输入材料
    （如市场状态描述、候选构造、问题模板等——具体形式**未决**）。
-2. **定义标签**：什么样的"未来结果"构成标签、如何标注、如何避免特征/标签窗口交叉。
-3. **对接 NanoJev 输入契约**：把材料映射为 NanoJev 的 state/question/candidates 格式。
-4. **数据切分与防泄漏**：train/dev/calibration/test 切分与时间序列防泄漏。
+2. **在真实片段上端到端生成并校验（已完成，2026-10-01）**：首个真实数据集
+   `data/nanojev_dataset/run-c1cb097177a3/` 已生成并通过 NanoJev 原生
+   `--validate-only` 契约校验（见上方「首轮真实数据」）。
+3. **训练与评估（未设计）**：NanoJev 在行情场景的适用性仍未验证；训练、评估与
+   趋势行情的 OOD 安全评估均未设计。**训练/推理入口硬性要求 CUDA**（见 §7.4）。
+4. **推理期范围（未决）**：是否只允许在用户指定的震荡片段内决策、是否需识别非震荡
+   并停止/拒绝交易，尚未决定。
 
 > ⚠️ 以上后续任务只是**方向列表**，不是设计承诺；进入具体任务前需另行讨论确认。
 
@@ -229,6 +249,7 @@ cp dataset/config/tianqin.example.yaml dataset/config/tianqin.local.yaml
 python -m dataset fetch          --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--output-dir DIR] [--config FILE]
 python -m dataset turning-points --symbol S [--symbol S2 ...] --period P [--initial-direction auto|up|down] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 python -m dataset prepare        --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--initial-direction ...] [--output-dir DIR] [--config FILE]
+python -m dataset episode-generate --segments FILE [--output-dir DIR] [--config FILE]
 ```
 
 | 子命令 | 是否联网 | 作用 |
@@ -236,6 +257,7 @@ python -m dataset prepare        --symbol S [--symbol S2 ...] --period P (--bars
 | `fetch` | 是 | 取 K 线 → 校验 → 落盘 |
 | `turning-points` | 否 | 读取已落盘 K 线 → 提取并落盘转折点 |
 | `prepare` | 是 | `fetch` + 转折点，一步完成 |
+| `episode-generate` | 否 | 片段清单 + 已落盘 1 分钟 K 线 → 按 split 的 NanoJev JSONL + 审计 |
 
 参数要点：
 
@@ -314,13 +336,15 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 /opt/anaconda3/envs/marketsense/bin/python -m pytest dataset/tests -q
 ```
 
-168 个测试全部**离线、不触网**（天勤以 `FakeTqApi` 桩注入），且不修改生产代码
-（2026-09-26 实测：`168 passed`，两次运行 9.72s / 10.80s）。
+全部测试**离线、不触网**（天勤以 `FakeTqApi` 桩注入），且不修改生产代码。
+2026-09-26 实测：`168 passed`（9.72s / 10.80s）；2026-09-30 加入 episode 流水线测试后
+实测：`277 passed`（11.64s）。
 
 #### 6. 已知边界与注意事项
 
-- **历史区间模式**（`--start/--end`）依赖天勤 `get_kline_data_series`，**可能需专业版权限**；
-  本机权限**未验证**（`U-1`）。无权限时请改用 `--bars`。
+- **历史区间模式**（`--start/--end`）依赖天勤 `get_kline_data_series`，**需专业版权限**；
+  2026-10-01 实测本机为**免费版**，区间模式不可用（`U-1` 已解决）。任意历史区间取数
+  请改用 `--bars`（1..8964）。
 - `--bars 8964`（平台上限）时无法多取 1 根凑整，末根未收盘被剔除后实际至多返回
   `8963` 根；CLI 会给出告警（不静默）。
 - 凭证与数据**不要提交**：`data/`、`*.csv`、`dataset/config/*.local.yaml` 已被 `.gitignore` 覆盖。
@@ -330,6 +354,92 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 - 转折点契约于 2026-09-25 变更：极值类 kind 更名（`high`/`low` → `up`/`down`）且
   `up`/`down` 点锚点前移至极值 K 线的前一根；旧 kind 落盘文件不再可读，需重新
   `turning-points` 再生成。
+
+#### 7. `episode-generate`：episode 训练数据生成（首轮流水线）
+
+把用户指定的震荡片段清单与已落盘的 1 分钟 K 线，确定性生成对齐 NanoJev 训练契约的
+按 split JSONL 训练集与审计文件。**不联网**、不训练模型、不修改 `NanoJev/`。
+
+**前置（三步）**：
+
+```bash
+# 1) 1 分钟 K 线必须已落盘（流水线只读消费，不取数）
+python -m dataset fetch --symbol DCE.v2701 --period 1m --bars 800
+
+# 2) 品种配置：复制模板并填 tick_size（symbols.local.yaml 已被 .gitignore 覆盖）
+cp dataset/config/symbols.example.yaml dataset/config/symbols.local.yaml
+
+# 3) 片段清单：按 dataset/config/segments.example.jsonl 的格式写入 data/segments/ 下
+```
+
+**运行**：
+
+```bash
+python -m dataset episode-generate --segments data/segments/my_segments.jsonl
+# 若需改研究阈值/目录：自建一个 YAML（无内置模板）并用 --config 指定
+python -m dataset episode-generate --segments data/segments/my_segments.jsonl \
+  --output-dir data/nanojev_dataset --config /path/to/my_episode.yaml
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--segments FILE` | 必填。片段清单 JSONL（每行一个片段 = 一个 episode） |
+| `--output-dir DIR` | 产物根目录（默认取配置 `episode.output_dir`，否则 `data/nanojev_dataset`） |
+| `--config FILE` | 配置文件（YAML；未给时依次取 `MARKETSENSE_DATASET_CONFIG`、`dataset/config/tianqin.local.yaml`，再退回内置默认值） |
+
+片段清单字段（模板 `dataset/config/segments.example.jsonl`）：
+
+```text
+schema(marketsense.segment.v1), segment_id, symbol, period(必须 1m),
+start_ts, end_ts, split_role(train|dev|calibration|test|ood), notes(可选)
+```
+
+可配置项（配置文件 YAML，优先级：CLI 参数 > 环境变量 > 配置文件 > 内置默认值）：
+
+```yaml
+episode:
+  data_dir: data/ohlcv                # 1 分钟 K 线目录（默认取 dataset.output_dir 的 ohlcv/ 子目录）
+  output_dir: data/nanojev_dataset    # 产物根目录
+  symbols: dataset/config/symbols.local.yaml   # 品种 tick 配置（默认与配置文件同目录的 symbols.local.yaml）
+  reward_risk_threshold: 3            # 开仓/反手盈亏比阈值（严格大于；冻结默认 3）
+  drawdown_threshold: 0.05            # 账户回撤死亡阈值（冻结默认 5%）
+  price_precision: 6                  # 模型可见比值小数位（冻结默认 6）
+  flat_sample_band_minutes: 2         # (b) 采样“不做”带宽度（分钟）
+```
+
+环境变量：`MARKETSENSE_DATASET_CONFIG`（配置文件路径）、`MARKETSENSE_DATA_DIR`（覆盖产物根目录）。
+
+**校验规则**（不满足则报错退出）：字段完整且非空；`period` 必须 `1m`；symbol+period 已有落盘 K 线；
+时间段落在数据范围内；同一 symbol+period 的不同 split 时间不重叠；清单必须覆盖 `train`/`dev`/`test`；
+清单涉及的每个 symbol 都必须在品种配置里有正数 `tick_size`。
+
+**输出**：
+
+```text
+<output_dir>/<run_id>/{train,dev,calibration,test,ood}.jsonl   # 按 split 的记录（5 个文件都会写出；空 split 为 0 字节）
+<output_dir>/<run_id>/audit.json                              # 计数/指纹/冻结项/生成参数
+```
+
+- 模型可见价格一律为**比值**（分母 = 片段首根开盘价，6 位小数）；绝对 OHLC 只留在 `data/ohlcv/` 原始层。
+- `tick_size` 按品种配置：成交价 = 决策 K 线最高 + 1 tick / 最低 − 1 tick；止损距离 = 当根振幅 + 1 tick。
+- **确定性**：无墙钟/随机；同输入两次生成输出 sha256 一致（`audit.json` 记录各文件指纹与双跑比对依据）。
+- **`run_id` 组成**：`run-<12 位十六进制>` = sha256(片段清单 + 品种配置 + 参数)。因此
+  **行情数据本身变化不会改变 `run_id`**：同清单/同参数下换数据重跑会覆盖同目录产物
+  （若要保留旧产物，请改 `--output-dir` 或用不同清单）。
+- 生成后可用 NanoJev 原生校验器作契约硬门（只读执行第三方脚本）：
+  `python3 NanoJev/scripts/train_pipeline_decisions.py --validate-only --input <run_dir>`。
+
+**已知限制（实测）**：
+
+- **空 split 不报错**：若筛选结果使某个 split 为空，对应 `.jsonl` 为 0 字节，CLI 仍以 0 退出；
+  而 NanoJev trainer 要求 `train`/`dev`/`test` 非空（`NanoJev/scripts/train_pipeline_decisions.py:477-479`），
+  且其 `--validate-only` 对空目录也不会拦截（`:423-424`）。生成后请自行确认非空。
+- 2026-10-01 已在真实片段上端到端运行（DCE.v2701，2026-09 全月，`run-c1cb097177a3`，
+  train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only` 通过）；
+  「生成后自行确认非空」的提醒仍适用于任何新清单。
+
+> 语义细节（冻结的标签与执行规则、实现阶段冻结项及默认值）见
+> `artifacts/nanojev-training-data/02-design/tech-design.md`；完整契约见 `dataset/README.md`。
 
 ### 7.3 `scripts/plot_price_line.py`：转折点价格折线图（快速可视化）
 
@@ -364,6 +474,62 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 
 输出：终端打印点数、x/y 范围与保存路径；PNG 为 12×5 英寸、150 dpi 的折线图。
 
+### 7.4 NanoJev 训练/推理环境要求与 CPU 冒烟验证（2026-10-01 实测）
+
+`NanoJev/` 的训练与推理入口**硬性要求 CUDA**，与本机内存无关：
+
+```text
+NanoJev/scripts/train_pipeline_decisions.py（训练入口，约 455 行）：
+  if not torch.cuda.is_available(): raise RuntimeError("A usable CUDA device with the requested precision is required")
+NanoJev/scripts/predict_toy_decisions.py（推理入口）：
+  「此原型推理入口需要可用CUDA设备；本命令未启用CPU或远程回退」
+```
+
+**Mac Intel 16G（无 CUDA）上的三级 CPU 冒烟验证（全部通过，数据通路无问题）**：
+
+1. `--self-check`：真实训练器代码在 CPU 上跑 schema / complete-question 预算 /
+   数值梯度检查（装 torch 即可，不需要 CUDA、不下载模型）；
+2. tokenize 级：真实记录经训练器自身 `validate_training_row` + `prepare_examples`
+   （与训练入口同参调用）处理，候选路径全部合法（EOS 结尾、id 合法、≤ max_length）；
+3. 前向级：Qwen3-0.6B 底座 fp32 + `DecisionModel(backbone, "attention")`（与训练入口
+   同构造方式），CPU 前向 6 问题约 18s：logits 有限、概率归一
+   （近均匀 = 零初始化设计预期，argmax 未命中属预期）。
+
+CPU 冒烟环境（仓库外、可随时清理，**未污染任何现有环境**：marketsense 及其他 conda
+环境、`NanoJev/`、仓库代码零改动）：
+
+```bash
+/opt/anaconda3/envs/trader_test/bin/python -m venv ~/.venvs/nanojev-smoke
+# 注意：默认 PyPI 在本机下载 torch 会超时（>600s 实测），用清华镜像：
+~/.venvs/nanojev-smoke/bin/pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  torch==2.2.2 "transformers==4.51.3" safetensors "numpy<2"
+```
+
+**模型缓存（已下载，可复用）**：`Qwen/Qwen3-0.6B`（~1.2GB，snapshot `c1899de2`）位于
+`~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/`。再次运行 `--self-check`、
+tokenize/前向冒烟或未来训练（CUDA 机）时 `from_pretrained` 直接复用，无需重新下载；
+清理方式 = 删除该目录。
+
+**冒烟过程中记录的两个坑（均非数据问题；以后写 tokenizer/模型加载脚本前先读）**：
+
+1. **词表语义**：`tokenizer.vocab_size`（Qwen3 = 151643）**不含 added special tokens**；
+   Qwen3 的 `eos_token_id = 151645`（`<|im_end|>`）超出基础词表属正常。校验 token id
+   合法性必须用 `AutoConfig` 的 `config.vocab_size`（151936）；用 `tokenizer.vocab_size`
+   会误报「非法 token id」（2026-10-01 冒烟实际踩过并修正）。
+2. **transformers 版本 API 差异**：NanoJev 按其固定规格 transformers 5.17 编写，
+   `AutoModel.from_pretrained(..., dtype=torch.float32)` 的 `dtype=` 是 5.x 才有的别名；
+   transformers 4.51 会报
+   `Qwen3Model.__init__() got an unexpected keyword argument 'dtype'`，须改用
+   `torch_dtype=torch.float32`（2026-10-01 冒烟实际踩过并适配）。
+
+注意版本差异：冒烟环境（torch 2.2.2 / transformers 4.51.3）≠ `NanoJev/requirements-toy.txt`
+固定规格（torch==2.14.0 / transformers==5.17.0，来自其 A100 开发机）。
+**真实训练机（CUDA）应按 `requirements-toy.txt` 安装固定版本**；数据产物无需任何改动：
+
+```bash
+python3 NanoJev/scripts/train_pipeline_decisions.py --input data/nanojev_dataset/run-c1cb097177a3
+```
+
 ---
 
 ## 8. 文档索引（核心）
@@ -377,4 +543,7 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 | 流程产物（数据子应用） | `artifacts/training-data-app/` | `dataset/` 子应用的需求 / 设计 / 审查 / 测试报告 |
 | 流程产物（转折点契约变更） | `artifacts/turning-point-updown-price/` | 2026-09-25 转折点契约变更的 DevFlow 产物 |
 | 流程产物（价格折线图脚本） | `artifacts/plot-turning-points-price/` | `scripts/plot_price_line.py` 的 DevFlow 产物（用法见 §7.3） |
+| 流程产物（全量取数） | `artifacts/fetch-v2701-max-klines/` | DCE.v2701 全量 1m/1d 取数（2026-10-01；含区间模式需专业版的实测记录） |
+| 流程产物（episode 数据） | `artifacts/nanojev-episode-sep2026/` | 2026-09 真实片段 episode 数据生成与契约校验（run-c1cb097177a3） |
+| 流程产物（CPU 冒烟） | `artifacts/nanojev-smoke-intel-mac/` | Mac Intel 数据通路三级冒烟验证与 CUDA 硬约束结论 |
 

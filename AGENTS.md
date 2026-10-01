@@ -31,13 +31,48 @@ MarketSense 是一个**研究型**项目，研究问题：
 
 ## 2. 当前阶段：为 NanoJev 准备训练数据
 
-- **已实现的基础**：`dataset/` 数据准备子应用（天勤 K 线取数 → 标准化落盘 →
-  转折点提取）与 `scripts/plot_price_line.py`（转折点价格折线图）。
-  即当前已能生成 **K 线数据、转折点数据、价格折线数据**，
-  作为训练数据的基础材料（用法见 `README.md` §7）。
-- **下一阶段核心任务**：为 NanoJev 准备训练数据；价格折线之外，
-  **后续还要补充其它材料与数据**（具体形式**未决**，
-  进入具体任务前先讨论确认，见 §8）。
+- **已实现的基础**（用法见 `README.md` §7）：
+  1. `dataset/` 数据准备子应用：天勤 K 线取数 → 标准化落盘 → 转折点提取
+     —— 可生成 **K 线数据、转折点数据**；
+  2. `scripts/plot_price_line.py`：转折点 **价格折线数据**（PNG）；
+  3. `dataset episode-generate`：**首轮 episode 训练数据流水线**（已实现，并已在真实片段上端到端运行，见下方执行记录）
+     —— 输入用户指定的震荡片段清单 + 1 分钟 K 线 + 品种 `tick_size` 配置，
+     确定性输出对齐 NanoJev 训练契约的按 split JSONL + 审计文件。最小用法：
+
+     ```bash
+     # 前置：①1m K 线已落盘（dataset fetch --period 1m）②symbols.local.yaml 填 tick_size
+     #      ③片段清单写入 data/segments/（模板 dataset/config/segments.example.jsonl）
+     python -m dataset episode-generate --segments data/segments/my_segments.jsonl
+     # 契约硬门（只读执行第三方脚本；train/dev/test 必须非空）
+     python3 NanoJev/scripts/train_pipeline_decisions.py --validate-only --input data/nanojev_dataset/<run_id>
+     ```
+
+     完整参数、配置项与输出布局见 `README.md` §7.2 小节 7。
+- **上一轮（research-task: nanojev-training-data）已冻结的口径**：
+  每分钟一个决策；成交与止损锚定“刚收盘那根 K 线”（决策 K 线）高低点 ± 1 tick；
+  固定 1 手、无动态仓位、无机械止盈止损；开仓/平仓/反手标签由**盈亏比规则真值**给出
+  （严格大于阈值、多空取更优侧；反转 K 线两条件；反手 = 同根两个决策）；
+  模型可见价格一律用**比值**（分母 = 片段首根开盘价，6 位小数），绝对 OHLC 不得进模型输入。
+  完整语义与实现阶段冻结项见 `artifacts/nanojev-training-data/02-design/tech-design.md`。
+- **首轮真实数据（2026-10-01 已生成并通过契约校验）**：DCE.v2701（PVC）2026-09 全月
+  21 个交易日片段（`data/segments/sep2026.jsonl`：train 9-1~9-18 / dev 9-21~9-24 /
+  test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
+  `data/nanojev_dataset/run-c1cb097177a3/`（**train 4188 / dev 886 / test 655**，全部非空），
+  NanoJev 原生 `--validate-only` 契约硬门通过。`tick_size = 5` 为**用户确认值**
+  （公开资料记载最小变动价位 1 元/吨，按用户确认执行，见 `dataset/config/symbols.local.yaml`）。
+  Mac Intel 16G（无 CUDA）已完成数据通路三级 CPU 冒烟（`--self-check` / tokenize / 前向，
+  全部通过）；**训练与推理入口硬性要求 CUDA，本机不可训练**（详见 `README.md` §7.4）。
+- **下一阶段核心任务**：
+  1. 在真实片段上端到端生成并校验（**已完成，2026-10-01**，见上方「首轮真实数据」；
+     新片段清单仍按 `dataset/config/segments.example.jsonl` 格式提供）；
+  2. 价格折线/episode 数据之外，**后续还要补充其它材料与数据**（具体形式**未决**，
+     进入具体任务前先讨论确认，见 §8）；
+  3. 训练与评估、趋势行情的 OOD 安全评估（未设计）。
+
+> 已知未修复缺陷：空 split 静默通过（三个 `{split}.jsonl` 全 0 字节仍退出 0）——
+> 生成后必须自行确认 `train`/`dev`/`test` 非空，否则 NanoJev trainer 会拒绝
+> （2026-10-01 九月运行已自查非空：4188/886/655；该提醒仍适用于任何新清单）。
+> 详见 `artifacts/nanojev-training-data/04-test/test-report.md`。
 
 ---
 
@@ -52,6 +87,13 @@ MarketSense 是一个**研究型**项目，研究问题：
   从它身上学到的东西 ≠ MarketSense 的设计决定。
 - 其输入契约（state/question/candidates → Choice/Boolean/Score 概率）
   以 `NanoJev/README.md` 与 `NanoJev/docs/` 为准。
+- 其训练与推理入口**硬性要求 CUDA**（`train_pipeline_decisions.py` 约 455 行、
+  `predict_toy_decisions.py` 推理入口）。无 CUDA 机器（如本机 Mac Intel）可跑
+  `--validate-only`、`--self-check` 与 CPU 冒烟验证数据通路，不可真实训练
+  （详见 `README.md` §7.4）。
+- 写涉及 tokenizer / 模型加载的脚本前，先读 `README.md` §7.4 的两个已记录坑
+  （`tokenizer.vocab_size` 不含 added special tokens；transformers 4.51/5.x 的
+  `torch_dtype=`/`dtype=` API 差异）与冒烟环境、模型缓存位置。
 
 ---
 
@@ -96,16 +138,25 @@ MarketSense 是一个**研究型**项目，研究问题：
   且特征窗口与标签窗口**严禁交叉**。
 - **确定性**：相同输入产生相同输出；避免引入墙钟时间等不确定因素。
 - **参数配置化**：不硬编码研究阈值。
+- 首轮 episode 流水线（`dataset/market_episode/`）已按上述约束实现：可见状态只由
+  ≤ 决策 K 线的数据构造，而标签程序可见未来（仅用于 gold 判定）——这是有意分开的两件事，
+  改它时必须同时保持两者（状态不得引入未来信息，标签不得引入不可复现因素）。
 
 ---
 
 ## 8. 不要过早设计
 
-当前处于"为 NanoJev 准备训练数据"阶段的早期。除非明确进入相应研究任务，否则**不要**：
+除非明确进入相应研究任务，否则**不要**：
 
 - 提前冻结训练数据格式、Schema、Label 定义或数据切分方式；
 - 开始训练模型、设计最终模型结构或参数；
 - 为"项目完整"而提前实现大量代码。
+
+注意区分两个层次：
+
+- **首轮 episode 流水线的口径已由用户明确决策冻结**（见 §2 与 `02-design/tech-design.md`）——
+  这是上一次研究任务的已批准产物，**不要擅自改动**（改口径需先改需求/设计并获用户确认）；
+- 这**不等于**最终格式/标签/切分已冻结：后续补充材料时仍适用上面的"不要过早设计"约束。
 
 ---
 

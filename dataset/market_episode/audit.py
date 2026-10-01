@@ -1,0 +1,460 @@
+"""审计与自检：确定性（双跑 sha256）、跨 split 隔离、状态泄漏抽查、计数汇总。
+
+本模块只做**只读检查**与审计文件内容构造，不修改账户、不生成标签。
+
+* :func:`check_split_isolation` 镜像 NanoJev
+  ``train_pipeline_decisions.read_training_records`` 的 state/source_group 跨 split
+  检查口径（同一 ``state_id``／``metadata.source_group_id`` 只能属于一个 split）；
+* :func:`check_state_leakage` **独立重算**决策 K 线比值块并与记录内的状态文本比对
+  （不调用状态序列化实现，避免自证），同时拒绝状态里出现绝对价格/量；
+* :func:`verify_determinism` 同输入双跑并逐文件比对 sha256；
+* :func:`build_audit_payload` 汇总死亡/剔除/每 split 计数、输入指纹与生成参数。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import Any, Mapping
+
+from dataset.errors import DatasetError
+from dataset.storage import file_sha256
+
+from dataset.market_episode.labels import SegmentOutcome
+from dataset.market_episode.replay import Bar
+from dataset.market_episode.segments import SPLIT_ROLES, EpisodeParams, Segment
+
+#: 审计文件 schema 标记
+AUDIT_SCHEMA = "marketsense.episode_audit.v1"
+#: 记录必填字段（对齐 NanoJev ``validate_training_row``）
+RECORD_REQUIRED_FIELDS = ("id", "state_id", "family_id", "split", "state", "questions")
+#: NanoJev 允许的 gold_label_kind / gold_probs_kind（镜像其常量）
+GOLD_LABEL_KINDS = frozenset(
+    {
+        "observed_outcome",
+        "deterministic_truth",
+        "reference_argmax_compatibility",
+        "unspecified_compatibility_label",
+        "hard_gold_unspecified",
+        "unobserved",
+    }
+)
+
+#: 本轮实现的冻结口径（写入审计文件，便于复算时对照）
+FROZEN_DECISIONS: Mapping[str, str] = {
+    "reference_price": "segment_first_bar_open",
+    "state_template": "marketsense.episode_state.v1:decision_bar_only",
+    "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
+    "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
+    "accounting": "ratio_units:initial_equity=1.0,1_lot=1_notional,no_multiplier,no_fees",
+    "flat_sample_band": "configurable_minutes_around_opportunity_minutes",
+    "initial_state": "first_bar_is_first_decision_point,flat,peak=1.0",
+    "reversal_condition_2": "stop_reached_first_or_scan_end_without_exceeding_current_bar",
+}
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise DatasetError(message)
+
+
+def check_record_shape(record: Any, *, where: str) -> None:
+    """单条记录结构校验（镜像 NanoJev 契约的必要子集）。"""
+    _require(isinstance(record, dict), f"{where} 记录必须是 JSON 对象")
+    for key in RECORD_REQUIRED_FIELDS:
+        _require(key in record, f"{where} 缺少必需字段: {key}")
+    _require(record["split"] in SPLIT_ROLES, f"{where} split 非法: {record['split']!r}")
+    for key in ("id", "state_id", "family_id"):
+        value = record[key]
+        _require(
+            isinstance(value, str) and bool(value.strip()),
+            f"{where} {key} 必须为非空字符串",
+        )
+    state = record["state"]
+    _require(isinstance(state, str) and bool(state), f"{where} state 必须为非空字符串")
+    questions = record["questions"]
+    _require(isinstance(questions, dict) and questions, f"{where} questions 必须为非空对象")
+
+    known_qids = set(questions)
+    for key in ("gold", "gold_probs", "gold_label_kind", "gold_probs_kind"):
+        value = record.get(key)
+        _require(
+            value is None or (isinstance(value, dict) and not (set(value) - known_qids)),
+            f"{where} {key} 含未知 question ID",
+        )
+    for qid, question in questions.items():
+        _require(isinstance(qid, str) and bool(qid.strip()), f"{where} question ID 非法")
+        _require(isinstance(question, dict), f"{where}:{qid} 问题必须是对象")
+        _require(
+            not (set(question) - {"type", "instructions", "criteria"}),
+            f"{where}:{qid} 含不支持的 question 字段",
+        )
+        question_type = question.get("type")
+        instructions = question.get("instructions")
+        _require(
+            question_type in {"boolean", "choice", "score"}
+            and isinstance(instructions, str)
+            and bool(instructions.strip()),
+            f"{where}:{qid} 题型或 instructions 无效",
+        )
+        criteria = question.get("criteria")
+        if question_type == "choice":
+            _require(
+                isinstance(criteria, dict) and 2 <= len(criteria) <= 255,
+                f"{where}:{qid} choice criteria 必须是含 2–255 项的对象",
+            )
+            _require(
+                all(
+                    isinstance(key, str)
+                    and key.strip()
+                    and isinstance(value, str)
+                    and value.strip()
+                    for key, value in criteria.items()
+                ),
+                f"{where}:{qid} choice 候选 ID 与描述必须为非空字符串",
+            )
+        elif question_type == "boolean":
+            _require(
+                criteria is None
+                or (
+                    isinstance(criteria, dict)
+                    and not (set(criteria) - {"false", "true"})
+                ),
+                f"{where}:{qid} boolean criteria 非法",
+            )
+        gold = record.get("gold", {}).get(qid)
+        if gold is not None:
+            if question_type == "choice":
+                _require(
+                    isinstance(gold, str) and gold in (criteria or {}),
+                    f"{where}:{qid} choice gold 必须是已提供的候选 ID",
+                )
+            elif question_type == "boolean":
+                _require(type(gold) is bool, f"{where}:{qid} boolean gold 必须是布尔值")
+            else:
+                _require(
+                    type(gold) is int and 0 <= gold < len(criteria or []),
+                    f"{where}:{qid} score gold 必须是合法层级",
+                )
+    label_kind = record.get("gold_label_kind")
+    for qid, kind in (label_kind or {}).items():
+        _require(kind in GOLD_LABEL_KINDS, f"{where}:{qid} gold_label_kind 非法: {kind!r}")
+
+
+def check_records(records: list[dict[str, Any]]) -> None:
+    """全量记录检查：结构 + id 唯一 + state/source_group 跨 split 隔离。"""
+    for index, record in enumerate(records):
+        check_record_shape(record, where=f"记录 {index}")
+    check_record_ids_unique(records)
+    check_split_isolation(records)
+
+
+def check_record_ids_unique(records: list[dict[str, Any]]) -> None:
+    seen: set[str] = set()
+    for record in records:
+        record_id = record.get("id")
+        _require(record_id not in seen, f"记录 ID 重复: {record_id!r}")
+        seen.add(record_id)
+
+
+def check_split_isolation(records: list[dict[str, Any]]) -> None:
+    """镜像 NanoJev：同一 ``state_id``／``source_group_id`` 不得跨 split。"""
+    state_splits: dict[str, str] = {}
+    source_splits: dict[str, str] = {}
+    for record in records:
+        split = record.get("split")
+        registry_pairs = (
+            (record.get("state_id"), state_splits),
+            (record.get("metadata", {}).get("source_group_id")
+             if isinstance(record.get("metadata"), dict)
+             else None, source_splits),
+        )
+        for key, registry in registry_pairs:
+            if key is None:
+                continue
+            previous = registry.get(key)
+            if previous is not None and previous != split:
+                raise DatasetError(
+                    f"同一 state/source group 跨 split: {key!r}（{previous} vs {split}）"
+                )
+            registry[key] = split
+
+
+def parse_state_id(state_id: str) -> tuple[str, int]:
+    """``{segment_id}:{决策 K 线序号}`` → ``(segment_id, bar_index)``。"""
+    _require(isinstance(state_id, str) and ":" in state_id, f"state_id 格式非法: {state_id!r}")
+    segment_id, _, raw_index = state_id.rpartition(":")
+    _require(bool(segment_id), f"state_id 缺少 segment id: {state_id!r}")
+    try:
+        bar_index = int(raw_index)
+    except ValueError:
+        raise DatasetError(f"state_id 的决策 K 线序号非法: {state_id!r}") from None
+    _require(bar_index >= 0, f"state_id 的决策 K 线序号必须 ≥ 0: {state_id!r}")
+    return segment_id, bar_index
+
+
+def _format_ratio(value: float, precision: int) -> str:
+    return f"{value:.{precision}f}"
+
+
+def _ratio_or_na(numerator: float, denominator: float, precision: int) -> str:
+    if denominator <= 0:
+        return "na"
+    return _format_ratio(numerator / denominator, precision)
+
+
+def _independent_px_line(bar: Bar, reference: Bar, precision: int) -> str:
+    """独立重算的决策 K 线价格比值行（不调用状态序列化实现，避免自证）。"""
+    values = (
+        _ratio_or_na(bar.open, reference.open, precision),
+        _ratio_or_na(bar.high, reference.open, precision),
+        _ratio_or_na(bar.low, reference.open, precision),
+        _ratio_or_na(bar.close, reference.open, precision),
+    )
+    return f"px_ratio: o={values[0]} h={values[1]} l={values[2]} c={values[3]}"
+
+
+def _independent_vol_line(bar: Bar, reference: Bar, precision: int) -> str:
+    """独立重算的成交量/持仓量归一化比值行。"""
+    values = (
+        _ratio_or_na(bar.volume, reference.volume, precision),
+        _ratio_or_na(bar.open_oi, reference.open_oi, precision),
+        _ratio_or_na(bar.close_oi, reference.close_oi, precision),
+    )
+    return f"vol_ratio: v={values[0]} oi_open={values[1]} oi_close={values[2]}"
+
+
+def check_state_leakage(
+    records: list[dict[str, Any]],
+    *,
+    bars_by_segment: Mapping[str, tuple[Bar, ...]],
+    price_precision: int,
+) -> None:
+    """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的 bar 计算。
+
+    * 记录里的价格比值行必须等于按 ``bars[bar_index]``（分母 = 片段首根）**独立重算**
+      的结果 → 状态若误用下一根/其它根会失败；
+    * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量（它们只能以比值出现）。
+    """
+    for record in records:
+        segment_id, bar_index = parse_state_id(record["state_id"])
+        bars = bars_by_segment.get(segment_id)
+        _require(bars is not None, f"审计缺少片段 {segment_id!r} 的 K 线")
+        _require(
+            0 <= bar_index < len(bars),
+            f"记录 {record['id']} 的决策 K 线序号超出片段范围: {bar_index}",
+        )
+        state_text = record["state"]
+        reference = bars[0]
+        bar = bars[bar_index]
+        for expected in (
+            _independent_px_line(bar, reference, price_precision),
+            _independent_vol_line(bar, reference, price_precision),
+        ):
+            _require(
+                expected in state_text,
+                f"记录 {record['id']} 状态中的比值行与决策 K 线不一致"
+                f"（期望 {expected!r}）",
+            )
+        neighbours = {0, bar_index - 1, bar_index, bar_index + 1}
+        for neighbour in sorted(index for index in neighbours if 0 <= index < len(bars)):
+            check_no_absolute_values(state_text, bars[neighbour], precision=price_precision)
+
+
+def check_no_absolute_values(state_text: str, bar: Bar, *, precision: int) -> None:
+    """状态文本不得包含该根 K 线的**绝对价格**（绝对数只留在行情层）。
+
+    只检查价格 token（含固定小数位形式与浮点 ``repr`` 形式）：成交量/持仓量为小整数，
+    与状态里的 ``bar=<序号>`` 等数字 token 容易假阳性，且序列化器在结构上只输出比值行
+    （由字节级夹具测试锁定），故不参与 token 检查。
+    """
+    tokens: set[str] = set()
+    for price in (bar.open, bar.high, bar.low, bar.close):
+        tokens.add(f"{price:.{precision}f}")
+        tokens.add(repr(float(price)))
+    for token in sorted(tokens):
+        if re.search(rf"(?<![\d.]){re.escape(token)}(?![\d.])", state_text):
+            raise DatasetError(f"状态文本出现绝对价格 {token!r}（绝对数不得进入模型输入）")
+
+
+def build_audit_payload(
+    *,
+    run_id: str,
+    params: EpisodeParams,
+    segments: tuple[Segment, ...],
+    symbols: Mapping[str, float],
+    outcomes: Mapping[str, SegmentOutcome],
+    records_by_split: Mapping[str, list[dict[str, Any]]],
+    split_digests: Mapping[str, str],
+    input_hashes: Mapping[str, str],
+) -> dict[str, Any]:
+    """构造审计文件内容（不含墙钟时间，保证双跑逐字节一致）。"""
+    per_segment: list[dict[str, Any]] = []
+    for segment in segments:
+        outcome = outcomes[segment.segment_id]
+        per_segment.append(
+            {
+                "segment_id": segment.segment_id,
+                "symbol": segment.symbol,
+                "period": segment.period,
+                "split_role": segment.split_role,
+                "start_ts": segment.start.isoformat(),
+                "end_ts": segment.end.isoformat(),
+                "tick_size": float(symbols[segment.symbol]),
+                "source_data_version": outcome.source_data_version,
+                "bars": outcome.bar_count,
+                "processed_bars": outcome.processed_bar_count,
+                "decision_points": len(outcome.decision_points),
+                "selected": len(outcome.selected),
+                "excluded_flat": outcome.excluded_flat,
+                "stop_exit_bars": list(outcome.stop_exits),
+                "deaths": [event.bar_index for event in outcome.deaths],
+                "death_forced_close": [event.forced_close for event in outcome.deaths],
+                "segment_end_forced_close": outcome.segment_end_forced_close,
+                "action_counts": dict(sorted(outcome.action_counts.items())),
+                "realized_pnl_ratio": round(outcome.realized_pnl_ratio, 12),
+                "peak_equity": round(outcome.peak_equity, 12),
+            }
+        )
+
+    per_split = {
+        split: {
+            "records": len(records_by_split.get(split, [])),
+            "questions": sum(
+                len(record["questions"]) for record in records_by_split.get(split, [])
+            ),
+        }
+        for split in SPLIT_ROLES
+    }
+    return {
+        "schema": AUDIT_SCHEMA,
+        "run_id": run_id,
+        "input": dict(sorted(input_hashes.items())),
+        "frozen_decisions": dict(sorted(FROZEN_DECISIONS.items())),
+        "params": params.as_dict(),
+        "totals": {
+            "segments": len(segments),
+            "bars": sum(outcome.bar_count for outcome in outcomes.values()),
+            "processed_bars": sum(
+                outcome.processed_bar_count for outcome in outcomes.values()
+            ),
+            "decision_points": sum(
+                len(outcome.decision_points) for outcome in outcomes.values()
+            ),
+            "selected": sum(len(outcome.selected) for outcome in outcomes.values()),
+            "excluded_flat": sum(
+                outcome.excluded_flat for outcome in outcomes.values()
+            ),
+            "stop_exits": sum(len(outcome.stop_exits) for outcome in outcomes.values()),
+            "deaths": sum(len(outcome.deaths) for outcome in outcomes.values()),
+            "segment_end_forced_closes": sum(
+                1
+                for outcome in outcomes.values()
+                if outcome.segment_end_forced_close is not None
+            ),
+        },
+        "per_split": per_split,
+        "per_segment": per_segment,
+        "outputs": {"split_files": dict(sorted(split_digests.items()))},
+    }
+
+
+def check_audit_consistency(
+    payload: Mapping[str, Any], records_by_split: Mapping[str, list[dict[str, Any]]]
+) -> None:
+    """审计计数与记录集的一致性校验（写出前自检，防止"计数与数据不一致"）。"""
+    per_split = payload["per_split"]
+    total_records = 0
+    for split in SPLIT_ROLES:
+        records = records_by_split.get(split, [])
+        declared = per_split[split]["records"]
+        _require(
+            declared == len(records),
+            f"审计 per_split[{split}].records={declared} 与记录数 {len(records)} 不一致",
+        )
+        declared_questions = per_split[split]["questions"]
+        actual_questions = sum(len(record["questions"]) for record in records)
+        _require(
+            declared_questions == actual_questions,
+            f"审计 per_split[{split}].questions={declared_questions} "
+            f"与记录问题数 {actual_questions} 不一致",
+        )
+        total_records += len(records)
+    selected = sum(
+        entry["selected"] for entry in payload["per_segment"]
+    )
+    decision_points = sum(entry["decision_points"] for entry in payload["per_segment"])
+    excluded = sum(entry["excluded_flat"] for entry in payload["per_segment"])
+    _require(
+        selected == total_records,
+        f"审计 selected={selected} 与总记录数 {total_records} 不一致",
+    )
+    _require(
+        decision_points == selected + excluded,
+        f"审计 decision_points={decision_points} 与 selected+excluded="
+        f"{selected + excluded} 不一致",
+    )
+    _require(
+        payload["totals"]["selected"] == total_records,
+        "审计 totals.selected 与记录数不一致",
+    )
+
+
+def verify_determinism(
+    segments: tuple[Segment, ...],
+    *,
+    symbols: Mapping[str, float],
+    data_dir: str | Path,
+    params: EpisodeParams,
+    work_root: str | Path,
+) -> dict[str, str]:
+    """同输入双跑生成全部输出文件并比对 sha256（确定性自检）。
+
+    :return: ``{文件名: sha256}``（两跑一致时的结果）
+    :raises DatasetError: 文件集合或任一文件摘要不一致
+    """
+    # 延迟导入：nanojev_records 在模块层依赖本模块的审计构造函数
+    from dataset.market_episode.nanojev_records import generate_dataset
+
+    root = Path(work_root)
+    first = generate_dataset(
+        segments, symbols=symbols, data_dir=data_dir, params=params, output_dir=root / "a"
+    )
+    second = generate_dataset(
+        segments, symbols=symbols, data_dir=data_dir, params=params, output_dir=root / "b"
+    )
+    first_files = sorted(path.name for path in first.run_dir.iterdir() if path.is_file())
+    second_files = sorted(path.name for path in second.run_dir.iterdir() if path.is_file())
+    _require(first_files == second_files, "双跑输出文件集合不一致")
+    _require(first.run_id == second.run_id, "双跑 run_id 不一致")
+    digests: dict[str, str] = {}
+    for name in first_files:
+        left = file_sha256(first.run_dir / name)
+        right = file_sha256(second.run_dir / name)
+        _require(left == right, f"双跑输出不一致: {name}")
+        digests[name] = left
+    return digests
+
+
+__all__ = [
+    "AUDIT_SCHEMA",
+    "FROZEN_DECISIONS",
+    "GOLD_LABEL_KINDS",
+    "RECORD_REQUIRED_FIELDS",
+    "build_audit_payload",
+    "check_audit_consistency",
+    "check_no_absolute_values",
+    "check_record_ids_unique",
+    "check_record_shape",
+    "check_records",
+    "check_split_isolation",
+    "check_state_leakage",
+    "parse_state_id",
+    "verify_determinism",
+]

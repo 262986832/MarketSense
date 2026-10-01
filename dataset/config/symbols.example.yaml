@@ -1,0 +1,10 @@
+# 品种配置模板（入库；实际配置复制为 symbols.local.yaml，已被 .gitignore 覆盖）
+#
+#   cp dataset/config/symbols.example.yaml dataset/config/symbols.local.yaml
+#
+# tick size 按品种写入配置（冻结要求）：买卖成交价 = 决策 K 线最高 + 1 tick /
+# 最低 − 1 tick；止损距离 = 当根振幅 + 1 tick。
+schema: marketsense.symbols.v1
+symbols:
+  DCE.v2701:
+    tick_size: 5

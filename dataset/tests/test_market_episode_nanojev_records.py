@@ -124,13 +124,12 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
 
     assert state == (
         f"{STATE_SCHEMA} \n "
-        "bar=0 \n "
-        "px_ratio: o=1.000000 h=1.002000 l=0.998000 c=1.000000 \n "
-        "vol_ratio: v=1.000000 oi_open=1.000000 oi_close=1.000000 \n "
-        "position: flat \n "
-        "drawdown: 0.000000 \n "
-        "board_state: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000"
-        " today_h=1.002000 today_l=0.998000"
+        "账户: 持仓=空仓 回撤=0.000000 \n "
+        "联动: v=1.000000 oi_open=1.000000 oi_close=1.000000 \n "
+        "日线: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000 \n "
+        "日内: bar=0 today_h=1.002000 today_l=0.998000 \n "
+        "现价: o=1.000000 h=1.002000 l=0.998000 c=1.000000 \n "
+        "盘口: na"
     )
 
 
@@ -148,13 +147,12 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
 
     assert state == (
         f"{STATE_SCHEMA} \n "
-        "bar=1 \n "
-        "px_ratio: o=1.000000 h=1.010000 l=1.000500 c=1.008000 \n "
-        "vol_ratio: v=1.000000 oi_open=1.002000 oi_close=1.001996 \n "
-        "position: short entry=0.998500 stop=1.000500 \n "
-        "drawdown: 0.001500 \n "
-        "board_state: prev_h=2.010000 prev_l=1.980000 prev_c=1.990000"
-        " today_h=1.010000 today_l=0.999500"
+        "账户: 持仓=持空 entry=0.998500 stop=1.000500 回撤=0.001500 \n "
+        "联动: v=1.000000 oi_open=1.002000 oi_close=1.001996 \n "
+        "日线: prev_h=2.010000 prev_l=1.980000 prev_c=1.990000 \n "
+        "日内: bar=1 today_h=1.010000 today_l=0.999500 \n "
+        "现价: o=1.000000 h=1.010000 l=1.000500 c=1.008000 \n "
+        "盘口: na"
     )
 
 
@@ -171,8 +169,8 @@ def test_render_state_marks_undefined_denominators_as_na() -> None:
         board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
     )
 
-    assert "vol_ratio: v=na oi_open=1.002000 oi_close=1.001996" in state
-    assert "board_state: prev_h=2.010000" in state  # board_state 行不受分母影响（价格分母正常）
+    assert "联动: v=na oi_open=1.002000 oi_close=1.001996" in state
+    assert "日线: prev_h=2.010000" in state  # 日线行不受分母影响（价格分母正常）
     assert "inf" not in state and "nan" not in state
     assert zero_oi  # 非零分母分支由上一个夹具覆盖
 
@@ -192,7 +190,7 @@ def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar
 
     for absolute in ("1000.000000", "1010.000000", "999.500000", "1008.000000"):
         assert absolute not in state
-    assert len(state.splitlines()) == 7  # 模板 v3：7 行（含 board_state；行间连接符为 " \n "）
+    assert len(state.splitlines()) == 7  # 模板 v4：7 行（账户/联动/日线/日内/现价/盘口；行间连接符为 " \n "）
 
 
 # --------------------------------------------------------------------------- #
@@ -266,8 +264,8 @@ def test_build_record_maps_ids_split_questions_and_gold() -> None:
     assert flat_record["gold"] == {QUESTION_ID: ACTION_OPEN_LONG}
     assert flat_record["gold_label_kind"] == {QUESTION_ID: "deterministic_truth"}
     assert flat_record["state"].startswith(STATE_SCHEMA)
-    assert "position: flat" in flat_record["state"]
-    assert "position: long entry=1.012000 stop=0.998000" in holding_record["state"]
+    assert "持仓=空仓" in flat_record["state"]
+    assert "持仓=持多 entry=1.012000 stop=0.998000" in holding_record["state"]
 
 
 def test_build_record_rejects_action_outside_position_criteria() -> None:
@@ -308,10 +306,8 @@ def test_build_record_board_state_uses_prev_daily_and_prefix_extrema() -> None:
 
     # prev：2010/1980/1990 ÷ 首根开盘 100；today：前缀 [0..1] 极值 110/99.8 ÷ 100
     # （第 3 根 high=200 不进入 today_h）
-    assert (
-        "board_state: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000"
-        " today_h=1.100000 today_l=0.998000" in record["state"]
-    )
+    assert "日线: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000" in record["state"]
+    assert "日内: bar=1 today_h=1.100000 today_l=0.998000" in record["state"]
     assert "20.000000" not in record["state"]
 
 
@@ -513,7 +509,7 @@ def test_generate_dataset_skips_segments_without_prev_daily_and_reports(
     assert result.record_counts["dev"] + result.record_counts["test"] > 0
     skipped = result.audit["board_state"]["skipped_segments"]
     assert [entry["segment_id"] for entry in skipped] == ["seg-train"]
-    # 非跳过片段（次日，首根开盘 100）的记录含 board_state 行：prev = 首日日线行
+    # 非跳过片段（次日，首根开盘 100）的记录含日线行：prev = 首日日线行
     dev_rows = [
         json.loads(line)
         for line in (result.run_dir / "dev.jsonl").read_text(encoding="utf-8").splitlines()
@@ -521,7 +517,7 @@ def test_generate_dataset_skips_segments_without_prev_daily_and_reports(
     ]
     assert dev_rows
     for row in dev_rows:
-        assert "board_state: prev_h=40.100000 prev_l=39.900000 prev_c=40.050000" in row["state"]
+        assert "日线: prev_h=40.100000 prev_l=39.900000 prev_c=40.050000" in row["state"]
     train_rows = [
         json.loads(line)
         for line in (result.run_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()

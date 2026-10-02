@@ -131,16 +131,22 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 
 - 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
   同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
-- **状态文本模板（v3）**：`marketsense.episode_state.v3`，7 行：`bar=` 序号、`px_ratio:`、
-  `vol_ratio:`、`position:`、`drawdown:`、`board_state:`（v2 新增）；
+- **状态文本模板（v4）**：`marketsense.episode_state.v4`，7 行：`账户:`、`联动:`、`日线:`、
+  `日内:`（行首含 `bar=` 序号）、`现价:`、`盘口:`（na 占位）；
   行间用 `" \n "` 连接（换行符前后各一个空格，v3 起生效，转义后的 JSON 文本更易读）。
-  `board_state: prev_h=<..> prev_l=<..> prev_c=<..> today_h=<..> today_l=<..>`：
-  - `prev_*` = **上一交易日**日线高/低/收（来源 `{symbol}_1d.csv`，取日线文件中严格早于片段
+  - `账户: 持仓=<空仓|持多|持空>[ entry=<..> stop=<..>] 回撤=<..>`：持仓值中文标签
+    （v4 拍板：空仓/持多/持空，未知方向报错不静默）；持仓非空时 `entry/stop` 在 `回撤` 前；
+  - `联动: v=<..> oi_open=<..> oi_close=<..>`：成交量/持仓量归一化比值
+    （分母 = 片段首根同名列）；
+  - `日线: prev_h=<..> prev_l=<..> prev_c=<..>`（v4 起由原 board_state 行拆出）：
+    `prev_*` = **上一交易日**日线高/低/收（来源 `{symbol}_1d.csv`，取日线文件中严格早于片段
     交易日的最后一行）÷ 片段首根开盘价；
-  - `today_*` = 片段首根至决策 K 线（含）的 1m 高/低**累计极值** ÷ 片段首根开盘价
+  - `日内: bar=<片段内 0 基序号> today_h=<..> today_l=<..>`（v4 起由原 board_state 行拆出）：
+    `today_*` = 片段首根至决策 K 线（含）的 1m 高/低**累计极值** ÷ 片段首根开盘价
     （State(T) 只用 ≤ 决策 K 线的数据，无未来泄漏）；
-  - 分母与 `px_ratio` 一致（全交易日片段下片段首根 = 交易日窗口首根 = 今日开盘，
-    与 `dataset board-state` 同口径）；今日开盘价不写（比值恒为 1.000000，纯冗余 token）；
+  - `现价: o=<..> h=<..> l=<..> c=<..>`：决策 K 线 OHLC 比值；价格分母 = 片段首根开盘价
+    （全交易日片段下片段首根 = 交易日窗口首根 = 今日开盘，与 `dataset board-state` 同口径）；
+    今日开盘价不写（比值恒为 1.000000，纯冗余 token）；分母 ≤ 0 时逐值写 `na`（不产生 `inf`）；
   - 片段无上一交易日日线 → **跳过该片段**（不产出记录），记入审计
     `board_state.skipped_segments` 与 stderr 告警；全部片段被跳过则硬报错不写出产物。
 - **questions/candidates 文案（2026-10-02 用户拍板精简）**：唯一 choice 题 `next_action`，候选文案只留动作语义——空仓 `open_long=买入开仓 / open_short=卖出开仓 / stay_flat=继续空仓`，持仓 `close=平仓 / hold=继续持有 / reverse=反手`；成交价位由执行程序与滑点决定，不进模型输入。questions 文本由 `QUESTION_SCHEMA = marketsense.episode_question.v1` 标记（首次建立），纳入审计 `input.question_schema_sha256` 与 `run_id` 哈希；文案再演进必须换标记（产生新 run）。
@@ -154,11 +160,12 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 - 本流水线已在真实片段上端到端运行：首轮（2026-10-01，无 board_state，模板 v1）
   `run-c1cb097177a3`；v2（含 board_state 行，2026-10-02）`run-13aff088b982`；
   同日候选文案精简 `run-b25cfd1ff370`；同日状态模板 v3（换行符前后加空格）
-  **当前产物** `run-36b037252a62`
+  `run-36b037252a62`；同日状态模板 v4（六部分中文标签重排：账户/联动/日线/日内/现价/盘口，
+  `bar=` 归入日内行，盘口 `na` 占位）**当前产物** `run-3db1bf63afc2`
   （DCE.v2701 2026-09 全月，train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only`
-  通过；state 文本为上一 run（v2 + 精简文案）的换行符替换版（逐条一致，含 v3 schema 标记），
+  通过；state 文本为 v4 六部分结构，数值语义与 v3 逐项等价，
   真实数据双跑 sha256 一致；见主 README §5「首轮真实数据」）。
-  v2 与 v3 run 的 5729 条记录 board_state 值均与 `dataset board-state` CSV 全量交叉核对一致。
+  v2/v3/v4 run 的 5729 条记录 board_state 值均与 `dataset board-state` CSV 全量交叉核对一致。
 
 契约硬门（只读执行第三方脚本）：
 
@@ -271,7 +278,7 @@ from dataset import (
 - 本包不做实时订阅、不做模型/决策，也不定义最终模型输入格式（非目标）；
   `board-state`（盘面状态读取）是首个状态 building block（研究 building block，非最终格式）。
 - episode 训练数据生成已在真实片段上端到端运行（2026-10-01 首轮 `run-c1cb097177a3`；
-  当前产物 `run-36b037252a62`（v3 状态 + 候选文案精简）；详细结果见主 README §5「首轮真实数据」）。
+  当前产物 `run-3db1bf63afc2`（v4 状态 + 候选文案精简）；详细结果见主 README §5「首轮真实数据」）。
 - K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
   新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。
 - 转折点发射语义于 2026-09-26 变更（甲口径：`up`/`down` 点 `timestamp`/`bar_index` =

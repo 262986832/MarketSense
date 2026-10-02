@@ -7,8 +7,9 @@
 * ``family_id`` = ``metadata.source_group_id`` = ``segment_id``（一个片段 = 一个 episode，
   直接复用 NanoJev 的 state/source_group 跨 split 泄漏检查）；
 * ``split`` = 片段的 ``split_role``；
-* ``state`` = 确定性文本序列化的**相对比值**状态（决策 K 线完整数据的比值表达 +
-  成交量/持仓量归一化 + 当前仓位 + 账户回撤幅度 + 盘面状态 board_state 行）；
+* ``state`` = 确定性文本序列化的**相对比值**状态（v4 六部分：账户（仓位 + 回撤）/
+  联动（量/持仓量）/ 日线（上一交易日高/低/收）/ 日内（``bar=`` 序号 + 今日高/低）/
+  现价（决策 K 线 OHLC）/ 盘口（na 占位））；
 * ``questions`` 恰好一个 choice 题 ``next_action``：空仓
   ``{open_long, open_short, stay_flat}`` / 持仓 ``{close, hold, reverse}``；
   候选文案只留动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
@@ -16,30 +17,37 @@
 * ``gold`` = 规则真值动作 ID + ``gold_label_kind: "deterministic_truth"``
   （首轮不发 ``gold_probs``：NanoJev 校验器允许硬 gold 无概率，trainer 自动派生 one-hot）。
 
-**状态序列化模板（实现阶段冻结项 2；v2 起新增 board_state 行，2026-10-02 用户拍板方案 A；
-v3 起行间换行符前后加空格，转义后的 JSON 文本更易读，同日拍板）**
+**状态序列化模板（实现阶段冻结项 2；v2 起新增盘面状态行，2026-10-02 用户拍板方案 A；
+v3 起行间换行符前后加空格，转义后的 JSON 文本更易读，同日拍板；v4 起行重排为宏观→微观
+六部分（账户/联动/日线/日内/现价/盘口），持仓值中文化（空仓/持多/持空）+ 盘口 ``na``
+占位，数值语义与 v3 逐项等价，同日用户拍板）**
 
 ```text
-marketsense.episode_state.v3
-bar=<片段内 0 基序号>
-px_ratio: o=<..> h=<..> l=<..> c=<..>
-vol_ratio: v=<..> oi_open=<..> oi_close=<..>
-position: flat | long entry=<..> stop=<..> | short entry=<..> stop=<..>
-drawdown: <..>
-board_state: prev_h=<..> prev_l=<..> prev_c=<..> today_h=<..> today_l=<..>
+marketsense.episode_state.v4
+账户: 持仓=空仓 回撤=<..>
+联动: v=<..> oi_open=<..> oi_close=<..>
+日线: prev_h=<..> prev_l=<..> prev_c=<..>
+日内: bar=<片段内 0 基序号> today_h=<..> today_l=<..>
+现价: o=<..> h=<..> l=<..> c=<..>
+盘口: na
 ```
 
-（行与行之间用 ``" \n "`` 连接，即换行符前后各一个空格。）
+（行与行之间用 ``" \n "`` 连接，即换行符前后各一个空格。持仓非空时账户行为：
+``账户: 持仓=持多|持空 entry=<..> stop=<..> 回撤=<..>``。）
 
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
-* **无历史窗口**：状态只含决策 K 线单根 + 仓位 + 回撤 + 盘面状态，绝对价格不进入模型输入；
-* **board_state 行**（v2 新增，与 ``dataset/board_state.py`` 同口径）：
-  - ``prev_h/prev_l/prev_c`` = **上一交易日**日线高/低/收（来源 ``{symbol}_1d.csv``，
-    取日线文件中严格早于片段交易日的最后一行）÷ 片段首根开盘价；
+* **无历史窗口**：状态只含决策 K 线单根 + 仓位 + 回撤 + 盘面状态（v4 拆「日线」「日内」
+  两行），绝对价格不进入模型输入；「盘口」行为 ``na`` 常量占位（真实 bid/ask 未接，非目标）；
+* **账户行**（v4）：持仓值中文标签（空仓/持多/持空，未知方向抛 ``DatasetError`` 不静默）；
+  持仓非空时 ``entry/stop`` 在 ``回撤`` 前（沿用 v3 的 position→drawdown 相对顺序，仅合并为一行）；
+* **日线行**（原 v2 board_state 行 prev 部分，v4 拆出；与 ``dataset/board_state.py`` 同口径）：
+  ``prev_h/prev_l/prev_c`` = **上一交易日**日线高/低/收（来源 ``{symbol}_1d.csv``，
+  取日线文件中严格早于片段交易日的最后一行）÷ 片段首根开盘价；
+* **日内行**（原 v2 board_state 行 today 部分 + ``bar=`` 序号，v4 拆出）：
   - ``today_h/today_l`` = 片段首根至决策 K 线（**含**）的 1m 高/低**累计极值** ÷ 片段首根开盘价
     （State(T) 只用 ≤ 决策 K 线的数据，无未来泄漏）；
-  - 分母与 px_ratio 一致（全交易日片段下片段首根 = 交易日窗口首根 = 今日开盘，
+  - 分母与现价行一致（全交易日片段下片段首根 = 交易日窗口首根 = 今日开盘，
     见 ``artifacts/nanojev-integration-alignment/01-requirement/requirement-report.md``）；
   - 今日开盘价不写（它是分母本身，比值恒为 1.000000，写入是纯冗余 token）；
   - 片段无上一交易日日线 → **跳过该片段**（不产出记录），记入审计与 stderr 告警（不静默）。
@@ -83,7 +91,9 @@ from dataset.market_episode.labels import (
 )
 from dataset.market_episode.replay import (
     Bar,
+    LONG,
     PositionSnapshot,
+    SHORT,
     format_ratio_value,
     load_segment_bars,
     px_ratio_line,
@@ -97,9 +107,10 @@ from dataset.market_episode.segments import (
     validate_segments,
 )
 
-#: 状态文本的 schema 版本标记（格式演进必须换标记；v2 新增 board_state 行，
-#: v3 行间换行符前后加空格——转义后的 JSON 文本更易读，2026-10-02 用户拍板）
-STATE_SCHEMA = "marketsense.episode_state.v3"
+#: 状态文本的 schema 版本标记（格式演进必须换标记；v2 新增盘面状态行；v3 行间换行符
+#: 前后加空格——转义后的 JSON 文本更易读；v4 行重排为宏观→微观六部分（账户/联动/日线/
+#: 日内/现价/盘口）+ 持仓值中文化 + 盘口 na 占位，数值语义与 v3 逐项等价，2026-10-02 用户拍板）
+STATE_SCHEMA = "marketsense.episode_state.v4"
 #: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
 QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
@@ -118,6 +129,13 @@ HELD_CRITERIA: Mapping[str, str] = {
     ACTION_CLOSE: "平仓",
     ACTION_HOLD: "继续持有",
     ACTION_REVERSE: "反手",
+}
+#: 账户行「持仓=」值映射（v4：flat（代码中为 ``None``）→空仓、long→持多、short→持空；
+#: 未知方向抛 ``DatasetError``，保持确定性不静默）
+POSITION_LABELS: Mapping[str | None, str] = {
+    None: "空仓",
+    LONG: "持多",
+    SHORT: "持空",
 }
 #: gold 的依据类型（冻结首轮形式）
 GOLD_LABEL_KIND = "deterministic_truth"
@@ -152,17 +170,29 @@ class BoardStateValues:
     today_low: float
 
 
-def _board_state_line(
+def _daily_line(
     board_state: BoardStateValues,
     reference_bar: Bar,
     price_precision: int,
 ) -> str:
-    """盘面状态比值行（分母 = 片段首根开盘价，与 px_ratio 一致；分母 ≤ 0 时逐值写 ``na``）。"""
+    """日线行：上一交易日高/低/收的比值（分母 = 片段首根开盘价；分母 ≤ 0 时逐值写 ``na``）。"""
     return (
-        "board_state: "
+        "日线: "
         f"prev_h={format_ratio_value(ratio_or_none(board_state.prev_day_high, reference_bar.open), price_precision)}"
         f" prev_l={format_ratio_value(ratio_or_none(board_state.prev_day_low, reference_bar.open), price_precision)}"
         f" prev_c={format_ratio_value(ratio_or_none(board_state.prev_day_close, reference_bar.open), price_precision)}"
+    )
+
+
+def _intraday_line(
+    bar: Bar,
+    board_state: BoardStateValues,
+    reference_bar: Bar,
+    price_precision: int,
+) -> str:
+    """日内行：片段内 0 基序号 + 今日高/低累计极值的比值（State(T) 只用 ≤ 决策 K 线的数据）。"""
+    return (
+        f"日内: bar={bar.index}"
         f" today_h={format_ratio_value(ratio_or_none(board_state.today_high, reference_bar.open), price_precision)}"
         f" today_l={format_ratio_value(ratio_or_none(board_state.today_low, reference_bar.open), price_precision)}"
     )
@@ -177,28 +207,31 @@ def render_state(
     price_precision: int,
     board_state: BoardStateValues,
 ) -> str:
-    """确定性状态文本（模板见模块 docstring）。
+    """确定性状态文本（v4 六部分：账户/联动/日线/日内/现价/盘口；模板见模块 docstring）。
 
     只做「决策 K 线单根 + 仓位 + 回撤 + 盘面状态」的序列化：函数签名决定它无法访问
     决策 K 线之后的任何 bar（``board_state`` 的今日值由调用方只用 ≤ 决策 K 线的数据算好
     传入，无未来数据泄漏在构造层面成立）。
     """
     if position is None:
-        position_line = "position: flat"
+        held_text = POSITION_LABELS[None]
     else:
-        position_line = (
-            f"position: {position.direction} entry={format_ratio_value(position.entry_ratio, price_precision)}"
+        label = POSITION_LABELS.get(position.direction)
+        if label is None:
+            raise DatasetError(f"未知持仓方向，无法序列化账户行: {position.direction!r}")
+        held_text = (
+            f"{label} entry={format_ratio_value(position.entry_ratio, price_precision)}"
             f" stop={format_ratio_value(position.stop_ratio, price_precision)}"
         )
     return " \n ".join(
         (
             STATE_SCHEMA,
-            f"bar={bar.index}",
-            px_ratio_line(bar, reference_bar, price_precision),
+            f"账户: 持仓={held_text} 回撤={format_ratio_value(drawdown, price_precision)}",
             vol_ratio_line(bar, reference_bar, price_precision),
-            position_line,
-            f"drawdown: {format_ratio_value(drawdown, price_precision)}",
-            _board_state_line(board_state, reference_bar, price_precision),
+            _daily_line(board_state, reference_bar, price_precision),
+            _intraday_line(bar, board_state, reference_bar, price_precision),
+            px_ratio_line(bar, reference_bar, price_precision),
+            "盘口: na",
         )
     )
 
@@ -482,6 +515,7 @@ __all__ = [
     "FLAT_CRITERIA",
     "GOLD_LABEL_KIND",
     "HELD_CRITERIA",
+    "POSITION_LABELS",
     "QUESTION_ID",
     "QUESTION_INSTRUCTIONS",
     "QUESTION_SCHEMA",

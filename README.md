@@ -144,16 +144,16 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 2026-10-02 用户拍板方案 A：状态模板升为 **v2**（`render_state` 新增 board_state 行，
 昨日高/低/收与今日高/低随状态文本进入训练记录）。
 
-**首轮真实数据（2026-10-01 生成；2026-10-02 v2/v3 含盘面状态 + 候选文案精简，均通过契约校验）**：
+**首轮真实数据（2026-10-01 生成；2026-10-02 v2/v3/v4 状态模板 + 候选文案精简，均通过契约校验）**：
 DCE.v2701（PVC）2026-09 全月 21 个交易日片段（`data/segments/sep2026.jsonl`：
 train 9-1~9-18 / dev 9-21~9-24 / test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
-当前产物 `data/nanojev_dataset/run-36b037252a62/`（模板 v3 + 精简候选文案，
-**train 4188 / dev 886 / test 655**，7125 决策点，全部非空；state 文本为上一 run
-（v2 + 精简文案）的换行符替换版（逐条一致，含 v3 schema 标记），而 v2 run 的
-board_state 值已与 `dataset board-state` CSV 全量交叉核对一致，当前 run 确定性双跑
-sha256 一致）；历史 `run-13aff088b982/`（v2 状态、候选文案含价位括号）、
-`run-b25cfd1ff370/`（v2 状态 + 精简文案）与首轮 `run-c1cb097177a3/`（模板 v1，
-无 board_state）保留。四者 NanoJev 原生 `--validate-only` 契约硬门均通过。
+当前产物 `data/nanojev_dataset/run-3db1bf63afc2/`（模板 v4 + 精简候选文案，
+**train 4188 / dev 886 / test 655**，7125 决策点，全部非空；state 文本为 v4 六部分
+中文标签结构（账户/联动/日线/日内/现价/盘口），数值语义与 v3 逐项等价，board_state
+值已与 `dataset board-state` CSV 全量交叉核对一致，确定性双跑 sha256 一致）；
+历史 `run-36b037252a62/`（模板 v3）、`run-b25cfd1ff370/`（v2 状态 + 精简文案）、
+`run-13aff088b982/`（v2 状态、候选文案含价位括号）与首轮 `run-c1cb097177a3/`（模板 v1，
+无 board_state）保留。五者 NanoJev 原生 `--validate-only` 契约硬门均通过。
 2026-10-02 用户拍板：候选文案精简为动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
 成交价位由执行程序与滑点决定，不进模型输入（`QUESTION_SCHEMA = marketsense.episode_question.v1`）。
 `tick_size = 5` 为**用户确认值**
@@ -435,11 +435,14 @@ episode:
 ```
 
 - 模型可见价格一律为**比值**（分母 = 片段首根开盘价，6 位小数）；绝对 OHLC 只留在 `data/ohlcv/` 原始层。
-- **状态文本（模板 v2）**：7 行（`bar=`/`px_ratio:`/`vol_ratio:`/`position:`/`drawdown:`/`board_state:`）；
-  **board_state 行（2026-10-02 拍板新增）**：`prev_h/prev_l/prev_c` = 上一交易日日线高/低/收
+- **状态文本（模板 v4）**：7 行（`账户:`/`联动:`/`日线:`/`日内:`含 `bar=`/`现价:`/`盘口:` na 占位）；
+  `账户: 持仓=<空仓|持多|持空>[ entry=<..> stop=<..>] 回撤=<..>`（v4 拍板：持仓值中文标签，
+  持仓非空时 entry/stop 在 回撤 前）；
+  **日线行（v4 起由原 board_state 行拆出）**：`prev_h/prev_l/prev_c` = 上一交易日日线高/低/收
   （来源 `{symbol}_1d.csv`，取严格早于片段交易日的最后一行）÷ 片段首根开盘价；
-  `today_h/today_l` = 片段首根至决策 K 线（含）的 1m 高/低累计极值 ÷ 片段首根开盘价
-  （State(T) 只用 ≤ 决策 K 线数据，无未来泄漏）；分母与 px_ratio 一致；
+  **日内行（同上拆出，行首含 `bar=` 片段内序号）**：`today_h/today_l` = 片段首根至决策 K 线
+  （含）的 1m 高/低累计极值 ÷ 片段首根开盘价（State(T) 只用 ≤ 决策 K 线数据，无未来泄漏）；
+  价格分母与现价行一致；`盘口: na` 为占位（真实 bid/ask 未接，非目标）；
   片段无上一交易日日线 → 跳过该片段（审计 `board_state.skipped_segments` + stderr 告警），
   全部片段被跳过则硬报错；与 `dataset board-state` 同口径。
 - **questions/candidates 文案（2026-10-02 拍板精简）**：唯一 choice 题 `next_action`，
@@ -463,9 +466,11 @@ episode:
   且其 `--validate-only` 对空目录也不会拦截（`:423-424`）。生成后请自行确认非空。
 - 2026-10-01 已在真实片段上端到端运行（DCE.v2701，2026-09 全月，首轮 `run-c1cb097177a3`）；
   2026-10-02 模板 v2（含 board_state 行）重生成 `run-13aff088b982`；同日候选文案精简
-  生成 `run-b25cfd1ff370`；同日状态模板 v3（行间换行符前后加空格）生成**当前产物**
-  `run-36b037252a62`，train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only` 通过；
-  v2/v3 run 的 board_state 值与 `dataset board-state` CSV 全量交叉核对一致；
+  生成 `run-b25cfd1ff370`；同日状态模板 v3（行间换行符前后加空格）生成 `run-36b037252a62`；
+  同日状态模板 v4（六部分中文标签重排：账户/联动/日线/日内/现价/盘口，`bar=` 归入日内行，
+  盘口 `na` 占位）生成**当前产物** `run-3db1bf63afc2`，train 4188 / dev 886 / test 655
+  全部非空，NanoJev `--validate-only` 通过；
+  v2/v3/v4 run 的 board_state 值与 `dataset board-state` CSV 全量交叉核对一致；
   「生成后自行确认非空」的提醒仍适用于任何新清单。
 
 > 语义细节（冻结的标签与执行规则、实现阶段冻结项及默认值）见
@@ -592,7 +597,7 @@ tokenize/前向冒烟或未来训练（CUDA 机）时 `from_pretrained` 直接�
 **真实训练机（CUDA）应按 `requirements-toy.txt` 安装固定版本**；数据产物无需任何改动：
 
 ```bash
-python3 NanoJev/scripts/train_pipeline_decisions.py --input data/nanojev_dataset/run-36b037252a62
+python3 NanoJev/scripts/train_pipeline_decisions.py --input data/nanojev_dataset/run-3db1bf63afc2
 ```
 
 ---

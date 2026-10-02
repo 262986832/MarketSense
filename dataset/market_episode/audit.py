@@ -5,7 +5,7 @@
 * :func:`check_split_isolation` 镜像 NanoJev
   ``train_pipeline_decisions.read_training_records`` 的 state/source_group 跨 split
   检查口径（同一 ``state_id``／``metadata.source_group_id`` 只能属于一个 split）；
-* :func:`check_state_leakage` **独立重算**决策 K 线比值块与盘面状态 board_state 行，并与
+* :func:`check_state_leakage` **独立重算**决策 K 线的现价/联动/日线/日内四行（v4），并与
   记录内的状态文本比对（不调用状态序列化实现，避免自证），同时拒绝状态里出现
   绝对价格/量（含上一交易日日线绝对值）；
 * :func:`verify_determinism` 同输入双跑并逐文件比对 sha256；
@@ -46,7 +46,7 @@ GOLD_LABEL_KINDS = frozenset(
 #: 本轮实现的冻结口径（写入审计文件，便于复算时对照；v2 起新增 board_state）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v3:decision_bar_only+board_state",
+    "state_template": "marketsense.episode_state.v4:decision_bar_only+board_state",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "ratio_units:initial_equity=1.0,1_lot=1_notional,no_multiplier,no_fees",
@@ -214,24 +214,24 @@ def _ratio_or_na(numerator: float, denominator: float, precision: int) -> str:
 
 
 def _independent_px_line(bar: Bar, reference: Bar, precision: int) -> str:
-    """独立重算的决策 K 线价格比值行（不调用状态序列化实现，避免自证）。"""
+    """独立重算的决策 K 线价格比值行（v4「现价」行；不调用状态序列化实现，避免自证）。"""
     values = (
         _ratio_or_na(bar.open, reference.open, precision),
         _ratio_or_na(bar.high, reference.open, precision),
         _ratio_or_na(bar.low, reference.open, precision),
         _ratio_or_na(bar.close, reference.open, precision),
     )
-    return f"px_ratio: o={values[0]} h={values[1]} l={values[2]} c={values[3]}"
+    return f"现价: o={values[0]} h={values[1]} l={values[2]} c={values[3]}"
 
 
 def _independent_vol_line(bar: Bar, reference: Bar, precision: int) -> str:
-    """独立重算的成交量/持仓量归一化比值行。"""
+    """独立重算的成交量/持仓量归一化比值行（v4「联动」行）。"""
     values = (
         _ratio_or_na(bar.volume, reference.volume, precision),
         _ratio_or_na(bar.open_oi, reference.open_oi, precision),
         _ratio_or_na(bar.close_oi, reference.close_oi, precision),
     )
-    return f"vol_ratio: v={values[0]} oi_open={values[1]} oi_close={values[2]}"
+    return f"联动: v={values[0]} oi_open={values[1]} oi_close={values[2]}"
 
 
 def check_state_leakage(
@@ -243,7 +243,7 @@ def check_state_leakage(
 ) -> None:
     """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的 bar 计算。
 
-    * 记录里的价格比值行、盘面状态 board_state 行必须等于按 ≤ 决策 K 线的数据
+    * 记录里的现价/联动/日线/日内四行必须等于按 ≤ 决策 K 线的数据
       **独立重算**的结果 → 状态若误用下一根/其它根会失败；
     * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量，也不得出现上一交易日
       日线的绝对价格（它们只能以比值出现）。
@@ -259,30 +259,25 @@ def check_state_leakage(
         state_text = record["state"]
         reference = bars[0]
         bar = bars[bar_index]
-        for expected in (
-            _independent_px_line(bar, reference, price_precision),
-            _independent_vol_line(bar, reference, price_precision),
-        ):
-            _require(
-                expected in state_text,
-                f"记录 {record['id']} 状态中的比值行与决策 K 线不一致"
-                f"（期望 {expected!r}）",
-            )
+        prefix = bars[: bar_index + 1]
         prev_daily = prev_daily_by_segment.get(segment_id)
         _require(
             prev_daily is not None,
-            f"审计缺少片段 {segment_id!r} 的上一交易日日线（board_state 无法独立重算）",
+            f"审计缺少片段 {segment_id!r} 的上一交易日日线（日线行无法独立重算）",
         )
         assert prev_daily is not None
-        prefix = bars[: bar_index + 1]
-        expected_board = _independent_board_line(
-            prefix, prev_daily, reference, price_precision
+        expected_lines = (
+            ("现价", _independent_px_line(bar, reference, price_precision)),
+            ("联动", _independent_vol_line(bar, reference, price_precision)),
+            ("日线", _independent_daily_line(prev_daily, reference, price_precision)),
+            ("日内", _independent_intraday_line(prefix, bar_index, reference, price_precision)),
         )
-        _require(
-            expected_board in state_text,
-            f"记录 {record['id']} 状态中的 board_state 行与决策 K 线不一致"
-            f"（期望 {expected_board!r}）",
-        )
+        for line_label, expected in expected_lines:
+            _require(
+                expected in state_text,
+                f"记录 {record['id']} 状态中的{line_label}行与决策 K 线不一致"
+                f"（期望 {expected!r}）",
+            )
         neighbours = {0, bar_index - 1, bar_index, bar_index + 1}
         for neighbour in sorted(index for index in neighbours if 0 <= index < len(bars)):
             check_no_absolute_values(state_text, bars[neighbour], precision=price_precision)
@@ -303,21 +298,33 @@ def _absolute_price_tokens(values, precision: int) -> set[str]:
     return tokens
 
 
-def _independent_board_line(
-    bars_prefix,
+def _independent_daily_line(
     prev_daily: tuple[float, float, float],
     reference: Bar,
     precision: int,
 ) -> str:
-    """独立重算 board_state 行（today = 前缀累计极值；prev = 日线值 ÷ 片段首根开盘）。"""
+    """独立重算日线行（prev = 上一交易日日线值 ÷ 片段首根开盘）。"""
     prev_high, prev_low, prev_close = prev_daily
-    today_high = max(bar.high for bar in bars_prefix)
-    today_low = min(bar.low for bar in bars_prefix)
     return (
-        "board_state: "
+        "日线: "
         f"prev_h={format_ratio_value(ratio_or_none(prev_high, reference.open), precision)}"
         f" prev_l={format_ratio_value(ratio_or_none(prev_low, reference.open), precision)}"
         f" prev_c={format_ratio_value(ratio_or_none(prev_close, reference.open), precision)}"
+    )
+
+
+def _independent_intraday_line(
+    bars_prefix,
+    bar_index: int,
+    reference: Bar,
+    precision: int,
+) -> str:
+    """独立重算日内行（today = 前缀累计极值；``bar=`` 取 state_id 解析出的序号，
+    与序列化侧的 ``bar.index`` 交叉锁定）。"""
+    today_high = max(bar.high for bar in bars_prefix)
+    today_low = min(bar.low for bar in bars_prefix)
+    return (
+        f"日内: bar={bar_index}"
         f" today_h={format_ratio_value(ratio_or_none(today_high, reference.open), precision)}"
         f" today_l={format_ratio_value(ratio_or_none(today_low, reference.open), precision)}"
     )
@@ -327,8 +334,8 @@ def check_no_absolute_values(state_text: str, bar: Bar, *, precision: int) -> No
     """状态文本不得包含该根 K 线的**绝对价格**（绝对数只留在行情层）。
 
     只检查价格 token（含固定小数位形式与浮点 ``repr`` 形式）：成交量/持仓量为小整数，
-    与状态里的 ``bar=<序号>`` 等数字 token 容易假阳性，且序列化器在结构上只输出比值行
-    （由字节级夹具测试锁定），故不参与 token 检查。
+    与状态里 ``日内`` 行的 ``bar=<序号>`` 等数字 token 容易假阳性，且序列化器在结构上
+    只输出比值行（由字节级夹具测试锁定），故不参与 token 检查。
     """
     tokens = _absolute_price_tokens((bar.open, bar.high, bar.low, bar.close), precision)
     for token in sorted(tokens):

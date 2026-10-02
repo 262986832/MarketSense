@@ -206,7 +206,7 @@ def test_state_leakage_detects_absolute_price_in_state(tmp_path: Path) -> None:
 
 
 def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
-    """board_state 行与独立重算不一致（today_h 篡改）→ 必须被检出。"""
+    """日内行与独立重算不一致（today_h 篡改）→ 必须被检出。"""
     workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
     check_state_leakage(
         records,
@@ -217,12 +217,12 @@ def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
 
     tampered = [copy.deepcopy(record) for record in records]
     assert "today_h=" in tampered[0]["state"]
-    # 人为把 board_state 的 today_h 换成片段首根以外的值
+    # 人为把日内行的 today_h 换成片段首根以外的值
     tampered[0]["state"] = re.sub(
         r"today_h=[\d.]+", "today_h=9.999999", tampered[0]["state"], count=1
     )
 
-    with pytest.raises(DatasetError, match="board_state 行与决策 K 线不一致"):
+    with pytest.raises(DatasetError, match="日内行与决策 K 线不一致"):
         check_state_leakage(
             tampered,
             bars_by_segment=bars_by_segment,
@@ -373,7 +373,7 @@ def test_state_of_flat_minute_uses_bars_up_to_its_own_index() -> None:
                                      prev_day_close=1990.0, today_high=1012.0, today_low=990.0),
     )
 
-    assert "px_ratio: o=1.009000 h=1.012000 l=0.990000 c=0.992000" in state
+    assert "现价: o=1.009000 h=1.012000 l=0.990000 c=0.992000" in state
 
 
 def test_audit_records_source_data_version_per_segment(tmp_path: Path) -> None:

@@ -325,4 +325,4 @@ def test_visible_state_contains_no_absolute_prices() -> None:
 
     for price in (1000, 1000.5, 999.5, 1010, 1008):
         assert f"{price:.6f}" not in state
-    assert "px_ratio" in state and "vol_ratio" in state and "drawdown" in state
+    assert "现价" in state and "联动" in state and "回撤" in state

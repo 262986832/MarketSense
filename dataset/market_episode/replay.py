@@ -125,9 +125,9 @@ def format_ratio_value(value: float | None, precision: int) -> str:
 
 
 def px_ratio_line(bar: Bar, reference_bar: Bar, precision: int) -> str:
-    """决策 K 线 OHLC 的比值行（分母 = 片段首根开盘价，冻结）。"""
+    """决策 K 线 OHLC 的比值行（v4「现价」行；分母 = 片段首根开盘价，冻结）。"""
     return (
-        "px_ratio: "
+        "现价: "
         f"o={format_ratio_value(ratio_or_none(bar.open, reference_bar.open), precision)}"
         f" h={format_ratio_value(ratio_or_none(bar.high, reference_bar.open), precision)}"
         f" l={format_ratio_value(ratio_or_none(bar.low, reference_bar.open), precision)}"
@@ -136,9 +136,9 @@ def px_ratio_line(bar: Bar, reference_bar: Bar, precision: int) -> str:
 
 
 def vol_ratio_line(bar: Bar, reference_bar: Bar, precision: int) -> str:
-    """决策 K 线成交量/持仓量的归一化比值行（分母 = 片段首根同名列）。"""
+    """决策 K 线成交量/持仓量的归一化比值行（v4「联动」行；分母 = 片段首根同名列）。"""
     return (
-        "vol_ratio: "
+        "联动: "
         f"v={format_ratio_value(ratio_or_none(bar.volume, reference_bar.volume), precision)}"
         f" oi_open={format_ratio_value(ratio_or_none(bar.open_oi, reference_bar.open_oi), precision)}"
         f" oi_close={format_ratio_value(ratio_or_none(bar.close_oi, reference_bar.close_oi), precision)}"

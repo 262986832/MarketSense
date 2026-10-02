@@ -197,7 +197,7 @@ first_timestamp, last_timestamp, file_sha256, source_data_version
 **转折点 CSV**（`data/turning_points/{symbol}_{period}.csv`）：
 
 ```text
-point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volume_ratio,oi_ratio
+point_index,kind,timestamp,price,bar_index,volume,oi,trend_extreme_price,trend_extreme_bar_index,dt_minutes,price_ratio,volume_ratio,oi_ratio
 ```
 
 `kind ∈ {start, up, down, close}`（2026-09-25 起反转类 kind 由 `high`/`low` 更名为
@@ -208,6 +208,13 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 开盘）与 `close`（末根收盘）取自身根。每个点携带其值根 K 线的：`volume`（该 K 线
 成交量合计）、`oi`（该 K 线**结束时刻**持仓量，天勤 `close_oi` 口径；`open_oi` 口径
 可由 `bar_index` 关联 K 线 CSV 补算）。
+`trend_extreme_price`/`trend_extreme_bar_index`（2026-10-02 起）为 up/down 点的
+**当次趋势段**实际极值：段 = 闭区间 `[上一已确认 up/down 点触发根, 触发根 − 1]`
+（初始段起点 = bar 0，触发根归下一段，段长 = 触发根 − 段起点）；up 点 = 段内实际
+最高、down 点 = 段内实际最低，平局取最早 bar；`start`/`close` 为空单元格。不变式：
+up 点 `trend_extreme_price` ≥ `price`、down 点 ≤ `price`（相等当且仅当极值就在
+值根）。段长不入 CSV（可由 `bar_index` + 点序列确定性推导；数据层子函数
+`recent_trend_extremes` 返回段长）。
 后四列为相邻点**相对值**，由点序列确定性派生：`dt_minutes` = 当前点与前一点
 `timestamp` 之差（单位分钟）；`price_ratio`/`volume_ratio`/`oi_ratio` = 当前点值 /
 前一点值（比值，减 1 即变化幅度）。首点无前一点 → 四列均为空单元格；前一点值为 0
@@ -254,10 +261,14 @@ from dataset import (
     validate_ohlcv, ValidationReport,
     save_ohlcv, load_ohlcv, LoadedOHLCV,
     TianQinProvider, DataProvider,
-    TurningPoint, find_turning_points, resolve_initial_direction,
+    TurningPoint, TrendExtreme, find_turning_points, resolve_initial_direction,
     save_turning_points, load_turning_points, WindowMeta,
-    RelativeMetrics, relative_metrics,
+    RelativeMetrics, relative_metrics, recent_trend_extremes,
 )
+
+# 最近 n 个高/低点的当次趋势段极值（时间倒序，含段长；n 超额/非法 → DatasetError）
+loaded = load_turning_points("DCE.v2701", "1d", data_dir="data/turning_points")
+highs, lows = recent_trend_extremes(loaded.points, n=1)
 ```
 
 ## 测试
@@ -270,6 +281,7 @@ from dataset import (
 - 全部测试**不触网**：天勤通过 `api_factory` 注入 `FakeTqApi` 桩。
 - 2026-09-26 实测：`168 passed`（两次运行 9.72s / 10.80s）。
 - 2026-09-30 实测（含 episode 流水线测试）：`277 passed`（11.64s）。
+- 2026-10-02 实测（含当次趋势极值用例）：`320 passed, 1 xfailed`（11.95s；转折点用例 45 个）。
 
 ## 已知边界（未验证项）
 
@@ -285,3 +297,8 @@ from dataset import (
   触发根，`price`/`volume`/`oi` 取前一根）。旧落盘文件与新文件同 schema（列集合相同），
   `load_turning_points` 不会拒绝旧文件，但值含义不同；须重新 `turning-points` /
   `prepare` 再生成（无兼容层）。
+- 转折点 CSV 于 2026-10-02 扩展（11 → 13 列）：新增 `trend_extreme_price` /
+  `trend_extreme_bar_index`（up/down 点的当次趋势段实际极值，检测触发序列不变），
+  并新增数据层子函数 `recent_trend_extremes`（最近 n 个高/低点段极值，含段长）。
+  旧 11 列文件 `load_turning_points` 按「缺少必需列」拒绝，须重新
+  `python -m dataset turning-points` 再生成（无兼容层）。

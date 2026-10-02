@@ -57,6 +57,34 @@
 * 相对 2026-09-25 旧口径，``up``/``down`` 点的字段含义变化；新旧落盘文件列集合
   相同，:func:`load_turning_points` 不会拒绝旧文件，但值含义不同，依赖方须以
   ``python -m dataset turning-points`` / ``prepare`` 重新生成（无兼容层）。
+
+点信息增补（2026-10-02 当次趋势极值）
+-------------------------------------
+
+``up`` / ``down`` 点额外携带其**当次趋势段**的实际极值（检测触发序列不变，
+只增不删）：
+
+* 段范围 = 闭区间 ``[s, t − 1]``：``s`` 为上一个**已确认** up/down 点的触发根
+  ``bar_index``（窗口内无前序反转点时初始段 ``s = 0``，即 start 点所在根）；
+  触发根 ``t`` 不属于当次段——它属于下一段（up 触发根创新低，是下一段下跌腿的
+  首根动力；down 对称）。段长 = ``t − s``（恒 ≥ 1；相邻两次触发真实存在，
+  同根双条件后下一根立即反向时 ``t = s + 1``，段 = ``[s, s]`` 单根段非退化）。
+* 极值语义（用户确认）：``up`` 点 = 高点，``trend_extreme_price`` = 段内实际最高
+  ``max(high[s..t−1])``；``down`` 点 = 低点，段内实际最低 ``min(low[s..t−1])``。
+* 极值所在 bar = 段内**首个**达到极值的 K 线（平局取最早，与
+  ``max(range, key=…)`` 首次出现语义一致，确定性）。
+* 不变式：up 点 ``trend_extreme_price ≥ price``（``price`` = 段末根高点）、
+  down 点 ``≤ price``；相等当且仅当极值就在值根（段末根）。
+* ``start`` / ``close`` 点及收尾进行中的段不产生极值（两字段为 ``None``，
+  CSV 空单元格）；sidecar（窗口元信息）不变。
+* 落盘列由 11 列扩为 13 列，新列 ``trend_extreme_price`` /
+  ``trend_extreme_bar_index`` 插在 ``oi`` 之后、相对值之前（保持「绝对值在前，
+  相对值在后」分组）。旧 11 列文件 :func:`load_turning_points` 按「缺少必需列」
+  拒绝 → 必须用 ``python -m dataset turning-points`` 重新生成（无兼容层）。
+
+数据层子函数 :func:`recent_trend_extremes`（详见函数 docstring）可从点序列取
+最近 ``n`` 个高点与 ``n`` 个低点的段极值（:class:`TrendExtreme`，含段长；段长
+由点序列确定性推导，不入 CSV）。
 """
 
 from __future__ import annotations
@@ -91,6 +119,8 @@ TURNING_POINT_COLUMNS: Final[tuple[str, ...]] = (
     "bar_index",
     "volume",
     "oi",
+    "trend_extreme_price",
+    "trend_extreme_bar_index",
     "dt_minutes",
     "price_ratio",
     "volume_ratio",
@@ -120,6 +150,10 @@ class TurningPoint:
         = ``bar_index − 1``，可推导）
     :param volume: 值根 K 线的成交量（K 线时间范围内的成交量合计）
     :param oi: 值根 K 线结束时刻的持仓量（天勤 ``close_oi`` 口径）
+    :param trend_extreme_price: 当次趋势段实际极值（up 点 = 段内最高、down 点 =
+        段内最低；2026-10-02 起 up/down 点填充；start/close 为 ``None``）
+    :param trend_extreme_bar_index: 极值所在 bar（窗口 0 基，平局取最早；
+        start/close 为 ``None``）
     """
 
     kind: str
@@ -128,6 +162,24 @@ class TurningPoint:
     bar_index: int
     volume: int
     oi: int
+    trend_extreme_price: float | None = None
+    trend_extreme_bar_index: int | None = None
+
+
+@dataclass(frozen=True)
+class TrendExtreme:
+    """一个 up/down 点所在趋势段的当次极值（2026-10-02）。
+
+    :param kind: ``"up"``（段内实际最高）| ``"down"``（段内实际最低）
+    :param trend_extreme_price: 段内实际最高/最低价
+    :param trend_extreme_bar_index: 极值所在 bar（窗口 0 基，平局取最早）
+    :param segment_length: 段长（K 线数量，≥ 1；由点序列确定性推导）
+    """
+
+    kind: str
+    trend_extreme_price: float
+    trend_extreme_bar_index: int
+    segment_length: int
 
 
 @dataclass(frozen=True)
@@ -220,13 +272,31 @@ def resolve_initial_direction(df: pd.DataFrame, mode: str) -> str:
     return "up" if float(df["close"].iloc[0]) >= float(df["open"].iloc[0]) else "down"
 
 
+def _segment_extreme(
+    values: Sequence[float], start: int, end: int, *, highest: bool
+) -> tuple[float, int]:
+    """闭区间 ``[start, end]``（含两端）内的实际极值及首个达到极值的 bar（0 基）。
+
+    平局取最早 bar：只有**严格**更优才更新（与 ``max(range, key=…)`` 首次出现
+    语义一致，确定性）。
+    """
+    best_price = values[start]
+    best_index = start
+    for index in range(start + 1, end + 1):
+        better = values[index] > best_price if highest else values[index] < best_price
+        if better:
+            best_price = values[index]
+            best_index = index
+    return best_price, best_index
+
+
 def find_turning_points(
     df: pd.DataFrame,
     *,
     initial_direction: str = "auto",
 ) -> list[TurningPoint]:
     """按人工规则提取转折点路径（检测触发序列与早期版本一致；发射字段按 2026-09-26
-    甲口径，见模块 docstring「发射口径（2026-09-26 甲口径）」）。
+    甲口径，并自 2026-10-02 起 up/down 点携带当次趋势段极值，见模块 docstring）。
 
     :param df: 标准 OHLCV（含 ``timestamp/open/high/low/close``，按时间升序，
         且全部为**已收盘** K 线）；增补信息需要 ``volume`` 与 ``close_oi`` 列
@@ -270,26 +340,42 @@ def find_turning_points(
         return points
 
     # t 从 1 开始：up/down 点在触发根 t 确认，值根 t − 1 恒存在（无边界特判）
+    # segment_start：当次趋势段起点（上一个已确认 up/down 点的触发根，初始 0）。
+    # 段 = [segment_start, t − 1] 闭区间，触发根 t 归下一段（见模块 docstring
+    # 2026-10-02 节）；up 点取段内实际最高、down 点取段内实际最低，平局取最早。
+    segment_start = 0
     for t in range(1, n):
         if direction == "up":
             # 严格小于才转向；触发根当根不按新状态重判（单比较，不级联）
             if lows[t] < lows[t - 1]:
+                extreme_price, extreme_index = _segment_extreme(
+                    highs, segment_start, t - 1, highest=True
+                )
                 points.append(
                     TurningPoint(
                         "up", timestamps[t], highs[t - 1], t,
                         volumes[t - 1], ois[t - 1],
+                        trend_extreme_price=extreme_price,
+                        trend_extreme_bar_index=extreme_index,
                     )
                 )
                 direction = "down"
+                segment_start = t
         else:
             if highs[t] > highs[t - 1]:
+                extreme_price, extreme_index = _segment_extreme(
+                    lows, segment_start, t - 1, highest=False
+                )
                 points.append(
                     TurningPoint(
                         "down", timestamps[t], lows[t - 1], t,
                         volumes[t - 1], ois[t - 1],
+                        trend_extreme_price=extreme_price,
+                        trend_extreme_bar_index=extreme_index,
                     )
                 )
                 direction = "up"
+                segment_start = t
 
     # 路径收尾：进行中的段不输出（尚未确认），只补最后一根收盘价
     points.append(
@@ -326,6 +412,69 @@ def relative_metrics(points: Sequence[TurningPoint]) -> tuple[RelativeMetrics, .
     return tuple(metrics)
 
 
+def recent_trend_extremes(
+    points: Sequence[TurningPoint], *, n: int = 1
+) -> tuple[tuple[TrendExtreme, ...], tuple[TrendExtreme, ...]]:
+    """取最近 ``n`` 个 up 点的段内最高与 ``n`` 个 down 点的段内最低（2026-10-02）。
+
+    返回 ``(highs, lows)`` 二值 tuple，各为 :class:`TrendExtreme` 元组，
+    **按时间倒序**（最近优先）。高点 = up 点的段内实际最高、低点 = down 点的
+    段内实际最低（模块 docstring 2026-10-02 节语义）。
+
+    段长由点序列**确定性推导**（不入 CSV）：up/down 点（触发根 ``t`` = 其
+    ``bar_index``）的段起点 = 序列中上一个 up/down 点的 ``bar_index``
+    （无前序 → 0），``segment_length = t − 段起点``。内存序列与
+    :func:`load_turning_points` 回读序列同构（``bar_index`` 经 CSV 精确回读）。
+
+    :param points: 转折点序列（须经 :func:`find_turning_points` 或
+        :func:`load_turning_points` 构造，up/down 点已携带极值字段）
+    :param n: 取最近的高点/低点数量（≥ 1）
+    :return: ``(highs, lows)``，各为 ``n`` 个 :class:`TrendExtreme`（时间倒序）
+    :raises DatasetError: ``n`` 非整数（含 bool）或 ``< 1``；up/down 点数量任一
+        ``< n``；序列中 up/down 点缺极值字段
+    """
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise DatasetError(f"n 必须为整数（不含 bool）: {n!r}")
+    if n < 1:
+        raise DatasetError(f"n 必须 ≥ 1: {n}")
+
+    ups = [p for p in points if p.kind == "up"]
+    downs = [p for p in points if p.kind == "down"]
+    if len(ups) < n:
+        raise DatasetError(
+            f"up 点数量不足: n={n}, 序列中实际 up 点 {len(ups)} 个"
+        )
+    if len(downs) < n:
+        raise DatasetError(
+            f"down 点数量不足: n={n}, 序列中实际 down 点 {len(downs)} 个"
+        )
+
+    highs: list[TrendExtreme] = []
+    lows: list[TrendExtreme] = []
+    previous_trigger: int | None = None
+    for point in points:
+        if point.kind not in ("up", "down"):
+            continue
+        if point.trend_extreme_price is None or point.trend_extreme_bar_index is None:
+            raise DatasetError(
+                "up/down 点缺少当次趋势极值字段"
+                f"（须经 find_turning_points/load_turning_points 构造）: "
+                f"kind={point.kind}, bar_index={point.bar_index}"
+            )
+        segment_start = 0 if previous_trigger is None else previous_trigger
+        extreme = TrendExtreme(
+            kind=point.kind,
+            trend_extreme_price=point.trend_extreme_price,
+            trend_extreme_bar_index=point.trend_extreme_bar_index,
+            segment_length=point.bar_index - segment_start,
+        )
+        (highs if point.kind == "up" else lows).append(extreme)
+        previous_trigger = point.bar_index
+
+    # 时间倒序（最近优先）：取各自最近 n 个后反转
+    return tuple(reversed(highs[-n:])), tuple(reversed(lows[-n:]))
+
+
 def turning_points_filename(symbol: str, period: str) -> str:
     """转折点文件名：``{symbol}_{period}.csv``。"""
     return f"{symbol}_{period}.{OUTPUT_FORMAT}"
@@ -339,6 +488,11 @@ def _format_timestamp(value: pd.Timestamp) -> str:
 def _float_or_nan(value: float | None) -> float:
     """相对值写入 CSV 的表示：``None`` → ``NaN``（``to_csv`` 输出空单元格）。"""
     return float("nan") if value is None else float(value)
+
+
+def _int_or_nan(value: int | None) -> float:
+    """可空整数列写入 CSV 的表示：``None`` → ``NaN``（``to_csv`` 输出空单元格）。"""
+    return float("nan") if value is None else int(value)
 
 
 def save_turning_points(
@@ -380,6 +534,8 @@ def save_turning_points(
                 "bar_index": int(point.bar_index),
                 "volume": int(point.volume),
                 "oi": int(point.oi),
+                "trend_extreme_price": _float_or_nan(point.trend_extreme_price),
+                "trend_extreme_bar_index": _int_or_nan(point.trend_extreme_bar_index),
                 "dt_minutes": _float_or_nan(metric.dt_minutes),
                 "price_ratio": _float_or_nan(metric.price_ratio),
                 "volume_ratio": _float_or_nan(metric.volume_ratio),
@@ -472,6 +628,30 @@ def load_turning_points(
 
     optional = {name: _optional_floats(name) for name in RELATIVE_COLUMNS}
 
+    # 当次趋势极值列（2026-10-02）：空单元格合法（start/close 点不产生极值）；
+    # 有值时 price 收敛 float、bar_index 收敛 int（非数值/小数 → DataLoadError，
+    # 与 volume/oi 同等严格度）。空单元格（NaN）与非数值垃圾区分开，不静默。
+    def _optional_extreme_floats(name: str) -> list[float | None]:
+        raw_column = raw[name]
+        values = pd.to_numeric(raw_column, errors="coerce")
+        junk = values.isna() & ~raw_column.isna()
+        if bool(junk.any()):
+            raise DataLoadError(f"{name} 存在缺失或非数值")
+        return [None if pd.isna(v) else float(v) for v in values]
+
+    def _optional_extreme_ints(name: str) -> list[int | None]:
+        raw_column = raw[name]
+        values = pd.to_numeric(raw_column, errors="coerce")
+        junk = values.isna() & ~raw_column.isna()
+        if bool(junk.any()):
+            raise DataLoadError(f"{name} 存在缺失或非数值")
+        if bool((values.dropna() % 1 != 0).any()):
+            raise DataLoadError(f"{name} 必须为整数，存在小数值")
+        return [None if pd.isna(v) else int(v) for v in values]
+
+    extreme_prices = _optional_extreme_floats("trend_extreme_price")
+    extreme_bars = _optional_extreme_ints("trend_extreme_bar_index")
+
     points = tuple(
         TurningPoint(
             kind=str(row.kind),
@@ -480,9 +660,13 @@ def load_turning_points(
             bar_index=int(row.bar_index),
             volume=int(count),
             oi=int(oi_value),
+            trend_extreme_price=extreme_prices[index],
+            trend_extreme_bar_index=extreme_bars[index],
         )
-        for row, stamp, count, oi_value in zip(
-            raw.itertuples(index=False), stamps, counts, ois, strict=True
+        for index, (row, stamp, count, oi_value) in enumerate(
+            zip(
+                raw.itertuples(index=False), stamps, counts, ois, strict=True
+            )
         )
     )
     relative = tuple(

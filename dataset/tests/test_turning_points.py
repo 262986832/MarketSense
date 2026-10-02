@@ -17,11 +17,13 @@ from dataset.turning_points import (
     TURNING_POINT_COLUMNS,
     TURNING_POINT_KINDS,
     RelativeMetrics,
+    TrendExtreme,
     TurningPoint,
     WindowMeta,
     build_window_meta,
     find_turning_points,
     load_turning_points,
+    recent_trend_extremes,
     relative_metrics,
     resolve_initial_direction,
     save_turning_points,
@@ -519,3 +521,348 @@ def test_relative_metrics_dt_minutes_across_gap() -> None:
     points = [_tp("start", 0, 100.0, 100, 5000), _tp("up", 3, 110.0, 100, 5010)]
     metrics = relative_metrics(points)
     assert metrics[1].dt_minutes == 15.0  # 3 × 5 分钟步长
+
+
+# ---- 当次趋势极值（2026-10-02）----
+
+
+def _reversal_rows() -> list[tuple[float, float, float, float]]:
+    """多反转构造（3 up + 3 down）：段内极值不等于值根、相邻触发、初始段并存。
+
+    触发序列（initial_direction="up"）：up@3 / down@7 / up@10 / down@13 /
+    up@16 / down@19，close@20。
+    """
+    return [
+        (100, 101, 99, 100),    # bar0
+        (100, 110, 100, 109),   # bar1   上涨段实际高点 110
+        (109, 108, 102, 104),   # bar2   high 回落，low 102 ≥ 100 → 保持
+        (104, 105, 98, 100),    # bar3   low 98 < 102 → up 点（值根 bar2 high=108）
+        (100, 101, 80, 85),     # bar4   down 态保持；段内实际低点 80
+        (85, 90, 85, 88),       # bar5   high 90 ≤ 101 → 保持
+        (88, 89, 84, 86),       # bar6   high 89 ≤ 90 → 保持
+        (86, 102, 84, 95),      # bar7   high 102 > 89 → down 点（值根 bar6 low=84）
+        (95, 120, 94, 118),     # bar8   up 态保持；段内实际高点 120
+        (118, 110, 100, 105),   # bar9   low 100 ≥ 94 → 保持
+        (105, 108, 95, 98),     # bar10  low 95 < 100 → up 点（值根 bar9 high=110）
+        (98, 99, 70, 75),       # bar11  down 态保持；段内实际低点 70
+        (75, 80, 72, 78),       # bar12  high 80 ≤ 99 → 保持
+        (78, 85, 74, 82),       # bar13  high 85 > 80 → down 点（值根 bar12 low=72）
+        (82, 100, 81, 98),      # bar14  up 态保持；段内实际高点 100
+        (98, 96, 85, 90),       # bar15  low 85 ≥ 81 → 保持
+        (90, 95, 78, 80),       # bar16  low 78 < 85 → up 点（值根 bar15 high=96）
+        (80, 81, 60, 65),       # bar17  down 态保持；段内实际低点 60
+        (65, 70, 62, 68),       # bar18  high 70 ≤ 81 → 保持
+        (68, 90, 65, 85),       # bar19  high 90 > 70 → down 点（值根 bar18 low=62）
+        (85, 86, 84, 85),       # bar20  up 态保持；close
+    ]
+
+
+def test_up_point_carries_segment_high_different_from_price() -> None:
+    """验收标准 1：上涨段 High 回落后 Low 破位触发 → up 点极值 = 段内实际最高
+    （≠ price = 段末根 high），bar_index 指向极值根。"""
+    rows = [
+        (100, 101, 99, 100),
+        (100, 120, 100, 119),   # 段内实际高点 120
+        (119, 115, 105, 110),   # high 回落（low 105 ≥ 100 保持上涨）
+        (110, 112, 104, 108),   # low 104 < 105 触发 → up 点
+    ]
+    df = build_ohlcv(rows)
+    points = find_turning_points(df, initial_direction="up")
+
+    assert _kinds(points) == ["start", "up", "close"]
+    up = points[1]
+    assert up.bar_index == 3
+    assert up.price == df["high"].iloc[2] == 115.0  # 值根 = 段末根
+    assert up.trend_extreme_price == 120.0 == df["high"].iloc[1]
+    assert up.trend_extreme_bar_index == 1
+    # start/close 点不产生极值
+    assert points[0].trend_extreme_price is None
+    assert points[0].trend_extreme_bar_index is None
+    assert points[2].trend_extreme_price is None
+    assert points[2].trend_extreme_bar_index is None
+
+
+def test_down_point_carries_segment_low_different_from_price() -> None:
+    """down 对称：下跌段 Low 回升后 High 破前高触发 → down 点极值 = 段内实际最低
+    （≠ price = 段末根 low）。"""
+    rows = [
+        (100, 105, 90, 95),
+        (95, 96, 50, 60),       # 段内实际低点 50
+        (60, 80, 55, 75),       # low 回升（high 80 ≤ 96 保持下跌）
+        (75, 90, 56, 85),       # high 90 > 80 触发 → down 点
+    ]
+    df = build_ohlcv(rows)
+    points = find_turning_points(df, initial_direction="down")
+
+    assert _kinds(points) == ["start", "down", "close"]
+    down = points[1]
+    assert down.bar_index == 3
+    assert down.price == df["low"].iloc[2] == 55.0
+    assert down.trend_extreme_price == 50.0 == df["low"].iloc[1]
+    assert down.trend_extreme_bar_index == 1
+
+
+def test_adjacent_trigger_segment_is_single_bar_extreme_equals_price() -> None:
+    """相邻触发（t = s+1）：段 = [s, s] 单根段（长度 1），
+    trend_extreme_price == price（极值就在值根）。"""
+    rows = [
+        (100, 100, 90, 95),
+        (95, 101, 89, 100),   # down 点 bar1（high 101 > 100）；同根 low 89 创新低不再判
+        (100, 102, 85, 99),   # up 点 bar2（low 85 < 89）
+    ]
+    df = build_ohlcv(rows)
+    points = find_turning_points(df, initial_direction="down")
+
+    assert _kinds(points) == ["start", "down", "up", "close"]
+    down, up = points[1], points[2]
+    assert down.bar_index == 1 and up.bar_index == 2
+    assert down.price == df["low"].iloc[0] == 90.0
+    assert down.trend_extreme_price == down.price == 90.0
+    assert down.trend_extreme_bar_index == 0
+    assert up.price == df["high"].iloc[1] == 101.0
+    assert up.trend_extreme_price == up.price == 101.0
+    assert up.trend_extreme_bar_index == 1
+    # 段长经子函数推导 = 1（单根段非退化）
+    highs, lows = recent_trend_extremes(points, n=1)
+    assert highs[0].segment_length == 1
+    assert lows[0].segment_length == 1
+
+
+def test_initial_segment_first_root_trigger_segment_is_bar0() -> None:
+    """初始段首根触发（t=1）：段 = [0, 0]，极值 = 现有 price（段长 1 经子函数推导）。"""
+    df = build_ohlcv([
+        (100, 100, 90, 95),
+        (95, 100, 85, 90),   # low 85 < 90 → up 点 t=1；段 [0, 0]
+        (90, 95, 86, 90),    # down 态：high 95 ≤ 100 → 保持
+        (90, 96, 85, 91),    # high 96 > 95 → down 点 t=3；段 [1, 2]
+    ])
+    points = find_turning_points(df, initial_direction="up")
+
+    assert _kinds(points) == ["start", "up", "down", "close"]
+    up, down = points[1], points[2]
+    assert up.bar_index == 1
+    assert up.price == df["high"].iloc[0] == 100.0
+    assert up.trend_extreme_price == 100.0
+    assert up.trend_extreme_bar_index == 0
+    # 段长经子函数推导：初始段（无前序反转点 → 起点 0）
+    highs, lows = recent_trend_extremes(points, n=1)
+    assert highs[0].segment_length == 1
+    assert lows[0].segment_length == 2
+
+
+def test_last_bar_trigger_close_fields_are_none() -> None:
+    """末根触发（与 close 同 bar）：up 点正常计算（平局取最早 bar），
+    close 点新字段为 None。"""
+    df = build_ohlcv([(100, 100, 90, 95), (95, 100, 91, 100), (100, 100, 89, 100)])
+    points = find_turning_points(df, initial_direction="up")
+
+    assert _kinds(points) == ["start", "up", "close"]
+    up, close = points[1], points[2]
+    assert up.bar_index == close.bar_index == 2
+    assert up.price == df["high"].iloc[1] == 100.0
+    # 段 [0, 1]：high 100, 100 平局 → 取最早 bar 0
+    assert up.trend_extreme_price == 100.0
+    assert up.trend_extreme_bar_index == 0
+    assert close.trend_extreme_price is None
+    assert close.trend_extreme_bar_index is None
+    assert points[0].trend_extreme_price is None
+    assert points[0].trend_extreme_bar_index is None
+
+
+def test_turning_point_extreme_invariants_hold_for_multi_reversal() -> None:
+    """不变式：全部 up 点 trend_extreme_price ≥ price、down 点 ≤ price；
+    start/close 点新字段为 None。"""
+    df = build_ohlcv(_reversal_rows())
+    points = find_turning_points(df, initial_direction="up")
+
+    assert _kinds(points) == [
+        "start", "up", "down", "up", "down", "up", "down", "close",
+    ]
+    assert [p.bar_index for p in points] == [0, 3, 7, 10, 13, 16, 19, 20]
+    for point in points:
+        if point.kind == "up":
+            assert point.trend_extreme_price is not None
+            assert point.trend_extreme_price >= point.price
+        elif point.kind == "down":
+            assert point.trend_extreme_price is not None
+            assert point.trend_extreme_price <= point.price
+        else:
+            assert point.trend_extreme_price is None
+            assert point.trend_extreme_bar_index is None
+
+
+def test_recent_trend_extremes_returns_recent_n_in_reverse_order() -> None:
+    """n=1/2/3：返回最近 n 个高/低点（时间倒序，含极值/bar/段长，含初始段）。"""
+    df = build_ohlcv(_reversal_rows())
+    points = find_turning_points(df, initial_direction="up")
+
+    highs1, lows1 = recent_trend_extremes(points, n=1)
+    assert highs1 == (TrendExtreme("up", 100.0, 14, 3),)
+    assert lows1 == (TrendExtreme("down", 60.0, 17, 3),)
+
+    highs2, lows2 = recent_trend_extremes(points, n=2)
+    assert highs2 == (
+        TrendExtreme("up", 100.0, 14, 3),
+        TrendExtreme("up", 120.0, 8, 3),
+    )
+    assert lows2 == (
+        TrendExtreme("down", 60.0, 17, 3),
+        TrendExtreme("down", 70.0, 11, 3),
+    )
+
+    highs3, lows3 = recent_trend_extremes(points, n=3)
+    assert highs3 == (
+        TrendExtreme("up", 100.0, 14, 3),
+        TrendExtreme("up", 120.0, 8, 3),
+        TrendExtreme("up", 110.0, 1, 3),
+    )
+    assert lows3 == (
+        TrendExtreme("down", 60.0, 17, 3),
+        TrendExtreme("down", 70.0, 11, 3),
+        TrendExtreme("down", 80.0, 4, 4),  # down@7：段 [3, 6]，段长 4
+    )
+
+
+def test_recent_trend_extremes_matches_loaded_sequence(tmp_path: Path) -> None:
+    """内存序列与 load_turning_points 回读序列调用结果一致。"""
+    df = build_ohlcv(_reversal_rows())
+    points = find_turning_points(df, initial_direction="up")
+    meta = build_window_meta(
+        df, initial_direction_requested="up", initial_direction_resolved="up"
+    )
+    save_turning_points(
+        points, symbol="DCE.v2701", period="1m", output_dir=tmp_path, window_meta=meta
+    )
+    loaded = load_turning_points("DCE.v2701", "1m", data_dir=tmp_path)
+
+    assert recent_trend_extremes(points, n=2) == recent_trend_extremes(loaded.points, n=2)
+
+
+def test_recent_trend_extremes_rejects_n_exceeded_and_invalid() -> None:
+    """n 超额（消息给出 n 与实际数量）、n=0 / 非整数 / bool → DatasetError。"""
+    points = find_turning_points(build_ohlcv(_reversal_rows()), initial_direction="up")
+
+    with pytest.raises(DatasetError, match="up 点数量不足") as excinfo:
+        recent_trend_extremes(points, n=4)
+    assert "n=4" in str(excinfo.value) and "3 个" in str(excinfo.value)
+
+    # up 多于 down 的序列：down 不足
+    single_up = find_turning_points(
+        build_ohlcv([
+            (100, 101, 99, 100),
+            (100, 120, 100, 119),
+            (119, 115, 105, 110),
+            (110, 112, 104, 108),
+        ]),
+        initial_direction="up",
+    )
+    with pytest.raises(DatasetError, match="down 点数量不足"):
+        recent_trend_extremes(single_up, n=1)
+
+    with pytest.raises(DatasetError, match="n 必须"):
+        recent_trend_extremes(points, n=0)
+    with pytest.raises(DatasetError, match="n 必须为整数"):
+        recent_trend_extremes(points, n=1.5)
+    with pytest.raises(DatasetError, match="n 必须为整数"):
+        recent_trend_extremes(points, n=True)
+
+
+def test_recent_trend_extremes_rejects_missing_extreme_fields() -> None:
+    """手写 up/down 点缺极值字段（未经 find/load 构造）→ DatasetError。"""
+    manual = [
+        _tp("start", 0, 100.0, 100, 5000),
+        _tp("up", 1, 110.0, 100, 5010),
+        _tp("down", 2, 99.0, 100, 5020),
+        _tp("close", 2, 99.5, 100, 5030),
+    ]
+    with pytest.raises(DatasetError, match="缺少当次趋势极值字段"):
+        recent_trend_extremes(manual, n=1)
+
+
+def test_recent_trend_extremes_start_close_only_raises() -> None:
+    """无反转序列（仅 start/close）→ up/down 数量不足 → DatasetError。"""
+    points = find_turning_points(build_ohlcv([(100, 105, 95, 102)]))
+    assert _kinds(points) == ["start", "close"]
+    with pytest.raises(DatasetError, match="up 点数量不足"):
+        recent_trend_extremes(points, n=1)
+
+
+def test_save_load_round_trip_with_extreme_columns(tmp_path: Path) -> None:
+    """CSV 13 列：up/down 新列有值、start/close 空单元格 → 回读 None；
+    回读序列与内存序列逐字段一致（新列含在内）。"""
+    df = build_ohlcv(_reversal_rows())
+    points = find_turning_points(df, initial_direction="up")
+    meta = build_window_meta(
+        df, initial_direction_requested="up", initial_direction_resolved="up"
+    )
+    path = save_turning_points(
+        points, symbol="DCE.v2701", period="1m", output_dir=tmp_path, window_meta=meta
+    )
+
+    frame = pd.read_csv(path)
+    assert len(TURNING_POINT_COLUMNS) == 13
+    assert list(frame.columns) == list(TURNING_POINT_COLUMNS)
+    assert len(frame) == len(points)
+    for index, point in enumerate(points):
+        if point.kind in ("up", "down"):
+            assert frame["trend_extreme_price"].iloc[index] == pytest.approx(
+                point.trend_extreme_price
+            )
+            assert frame["trend_extreme_bar_index"].iloc[index] == point.trend_extreme_bar_index
+        else:
+            assert pd.isna(frame["trend_extreme_price"].iloc[index])
+            assert pd.isna(frame["trend_extreme_bar_index"].iloc[index])
+
+    loaded = load_turning_points("DCE.v2701", "1m", data_dir=tmp_path)
+    assert [p.kind for p in loaded.points] == _kinds(points)
+    assert [p.price for p in loaded.points] == [p.price for p in points]
+    assert [p.trend_extreme_price for p in loaded.points] == [
+        p.trend_extreme_price for p in points
+    ]
+    assert [p.trend_extreme_bar_index for p in loaded.points] == [
+        p.trend_extreme_bar_index for p in points
+    ]
+    # 新列回读后子函数结果与内存序列一致
+    assert recent_trend_extremes(loaded.points, n=3) == recent_trend_extremes(points, n=3)
+
+
+def test_load_rejects_legacy_eleven_column_file(tmp_path: Path) -> None:
+    """旧 11 列文件（无当次趋势极值列）→ DataLoadError（缺少必需列），
+    必须重新生成（无兼容层）。"""
+    legacy_columns = (
+        "point_index", "kind", "timestamp", "price", "bar_index", "volume",
+        "oi", "dt_minutes", "price_ratio", "volume_ratio", "oi_ratio",
+    )
+    path = tmp_path / "DCE.v2701_1m.csv"
+    path.write_text(
+        f"{','.join(legacy_columns)}\n"
+        "0,start,2026-09-23 09:00:00+08:00,100,0,100,5000,,,,\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DataLoadError, match="缺少必需列"):
+        load_turning_points("DCE.v2701", "1m", data_dir=tmp_path)
+
+
+def test_load_extreme_columns_strict_parsing(tmp_path: Path) -> None:
+    """新列严格解析（与 volume/oi 同等严格度）：bar_index 小数 → DataLoadError；
+    非数值垃圾 → DataLoadError（不静默归 None）。"""
+    header = ",".join(TURNING_POINT_COLUMNS)
+    path = tmp_path / "DCE.v2701_1m.csv"
+
+    # trend_extreme_bar_index 小数
+    path.write_text(
+        f"{header}\n"
+        "0,up,2026-09-23 09:00:00+08:00,100,1,100,5010,100.0,1.5,1.0,1.0,1.0,1.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DataLoadError, match="必须为整数"):
+        load_turning_points("DCE.v2701", "1m", data_dir=tmp_path)
+
+    # trend_extreme_price 非数值垃圾
+    path.write_text(
+        f"{header}\n"
+        "0,up,2026-09-23 09:00:00+08:00,100,1,100,5010,abc,1,1.0,1.0,1.0,1.0\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DataLoadError, match="存在缺失或非数值"):
+        load_turning_points("DCE.v2701", "1m", data_dir=tmp_path)

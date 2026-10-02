@@ -330,14 +330,18 @@ sidecar 记录 `provider/symbol/period/row_count/first_timestamp/last_timestamp/
 转折点 CSV 列：
 
 ```text
-point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volume_ratio,oi_ratio
+point_index,kind,timestamp,price,bar_index,volume,oi,trend_extreme_price,trend_extreme_bar_index,dt_minutes,price_ratio,volume_ratio,oi_ratio
 ```
 
 `kind ∈ {start, up, down, close}`。`up`/`down` 点（原 `high`/`low`，2026-09-25 起更名）的
 `timestamp/price/volume/oi` 取**极值 K 线的前一根**（锚点 `bar_index = 极值 bar − 1`，
 `price` = 前一根 high/low）；极值落在 bar 0 时整点留在 bar 0、`price` 取 bar 0 自身
 极值价。每个点携带其 `bar_index` 所指那根 K 线的 `volume`（成交量合计）
-与 `oi`（该 K 线结束时刻持仓量，天勤 `close_oi` 口径）。后四列为相邻点相对值
+与 `oi`（该 K 线结束时刻持仓量，天勤 `close_oi` 口径）。`trend_extreme_price`/
+`trend_extreme_bar_index`（2026-10-02 起）为 up/down 点的**当次趋势段**实际极值
+（段 = 闭区间 `[上一已确认 up/down 点触发根, 触发根 − 1]`，初始段起点 = bar 0；
+up 点 = 段内实际最高、down 点 = 段内实际最低，平局取最早 bar；`start`/`close` 为
+空单元格；up 点极值 ≥ `price`、down 点 ≤ `price`）。后四列为相邻点相对值
 （由点序列确定性派生）：`dt_minutes` = 与前一点时间差（单位分钟）；
 `price_ratio`/`volume_ratio`/`oi_ratio` = 当前点值 / 前一点值（比值）。
 首点无前一点 → 四列为空；前一点值为 0 时比值无定义，同样留空（不产生 `inf`）。
@@ -367,6 +371,11 @@ point_index,kind,timestamp,price,bar_index,volume,oi,dt_minutes,price_ratio,volu
 - 转折点契约于 2026-09-25 变更：极值类 kind 更名（`high`/`low` → `up`/`down`）且
   `up`/`down` 点锚点前移至极值 K 线的前一根；旧 kind 落盘文件不再可读，需重新
   `turning-points` 再生成。
+- 转折点 CSV 于 2026-10-02 扩展（11 → 13 列）：新增 `trend_extreme_price` /
+  `trend_extreme_bar_index`（up/down 点的当次趋势段实际极值，检测触发序列不变），
+  并新增数据层子函数 `recent_trend_extremes`（最近 n 个高/低点段极值，含段长）。
+  旧 11 列文件 `load_turning_points` 按「缺少必需列」拒绝，需重新
+  `python -m dataset turning-points` 再生成（无兼容层）。
 
 #### 7. `episode-generate`：episode 训练数据生成（首轮流水线）
 

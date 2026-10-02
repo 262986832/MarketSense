@@ -104,16 +104,17 @@ python -m dataset board-state --symbol DCE.v2701 --start 2026-09-01 --end 2026-0
 ### `episode-generate`：episode 训练数据生成
 
 输入用户指定的震荡片段清单（每片段 = 一个 episode，`dataset/config/segments.example.jsonl`
-为模板）与已落盘 1 分钟 K 线，确定性地输出对齐 NanoJev 训练契约的按 split JSONL + 审计文件。
-不联网、不取数、不训练模型、不修改 `NanoJev/`；模型可见价格一律用比值（分母 = 片段首根开盘价，
-6 位小数）。模块与语义分层：`dataset/market_episode/replay.py`（mechanics：决策 K 线成交
-模型、止损锚定、t-1 盯市回撤与死亡、片段末强平）与 `labels.py`（policy：盈亏比规则真值
-标签 + (b) 采样），另有 `segments.py`（清单/品种配置/参数）、`nanojev_records.py`
-（记录映射与落盘）、`audit.py`（确定性双跑、跨 split 隔离、泄漏抽查、计数汇总）。
+为模板）与已落盘 1 分钟 K 线及 1 分钟日线（日线供 board_state 行的上一交易日值），确定性地输出
+对齐 NanoJev 训练契约的按 split JSONL + 审计文件。不联网、不取数、不训练模型、不修改 `NanoJev/`；
+模型可见价格一律用比值（分母 = 片段首根开盘价，6 位小数）。模块与语义分层：
+`dataset/market_episode/replay.py`（mechanics：决策 K 线成交模型、止损锚定、t-1 盯市回撤与死亡、
+片段末强平）与 `labels.py`（policy：盈亏比规则真值标签 + (b) 采样），另有 `segments.py`
+（清单/品种配置/参数）、`nanojev_records.py`（记录映射与落盘）、`audit.py`（确定性双跑、
+跨 split 隔离、泄漏抽查、计数汇总）。
 
-前置与用法：先 `dataset fetch --period 1m` 落盘 K 线，再把
-`dataset/config/symbols.example.yaml` 复制为 `symbols.local.yaml` 并填 `tick_size`，
-然后用 `--segments` 指向片段清单（详细步骤与配置项见 `README.md` §7.2 小节 7）：
+前置与用法：先 `dataset fetch --period 1m` 与 `dataset fetch --period 1d` 落盘 K 线（缺日线
+硬报错不静默），再把 `dataset/config/symbols.example.yaml` 复制为 `symbols.local.yaml` 并填
+`tick_size`，然后用 `--segments` 指向片段清单（详细步骤与配置项见 `README.md` §7.2 小节 7）：
 
 ```bash
 python -m dataset episode-generate --segments data/segments/my_segments.jsonl
@@ -130,16 +131,29 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 
 - 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
   同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
+- **状态文本模板（v2）**：`marketsense.episode_state.v2`，7 行：`bar=` 序号、`px_ratio:`、
+  `vol_ratio:`、`position:`、`drawdown:`、`board_state:`（v2 新增）。
+  `board_state: prev_h=<..> prev_l=<..> prev_c=<..> today_h=<..> today_l=<..>`：
+  - `prev_*` = **上一交易日**日线高/低/收（来源 `{symbol}_1d.csv`，取日线文件中严格早于片段
+    交易日的最后一行）÷ 片段首根开盘价；
+  - `today_*` = 片段首根至决策 K 线（含）的 1m 高/低**累计极值** ÷ 片段首根开盘价
+    （State(T) 只用 ≤ 决策 K 线的数据，无未来泄漏）；
+  - 分母与 `px_ratio` 一致（全交易日片段下片段首根 = 交易日窗口首根 = 今日开盘，
+    与 `dataset board-state` 同口径）；今日开盘价不写（比值恒为 1.000000，纯冗余 token）；
+  - 片段无上一交易日日线 → **跳过该片段**（不产出记录），记入审计
+    `board_state.skipped_segments` 与 stderr 告警；全部片段被跳过则硬报错不写出产物。
 - 确定性：无墙钟/随机；同输入双跑输出 sha256 一致。
-- `run_id` = sha256(片段清单 + 品种配置 + 参数) 的前 12 位；**不含行情数据指纹**，
-  因此同清单/同参数下换数据重跑会**覆盖**同目录产物（README 及变更报告早期“不覆盖历史产物”的
-  表述仅在清单/参数变化时成立）。
+- `run_id` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记) 的前 12 位；**状态格式变���
+  产生新 run**（旧 run 保留不覆盖）；仍**不含行情数据指纹**，因此同清单/同参数下换数据重跑会
+  **覆盖**同目录产物（README 及变更报告早期“不覆盖历史产物”的表述仅在清单/参数/schema 变化时成立）。
 - **空 split 不报错**：某 split 为空时对应 `.jsonl` 为 0 字节且 CLI 仍以 0 退出；NanoJev trainer
   要求 `train`/`dev`/`test` 非空（`NanoJev/scripts/train_pipeline_decisions.py:477-479`），
   其 `--validate-only` 也不会拦空目录（`:423-424`）——生成后需自行确认非空。
-- 本流水线已在真实片段上端到端运行（2026-10-01，DCE.v2701 2026-09 全月，
-  `run-c1cb097177a3`，train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only` 通过；
-  见主 README §5「首轮真实数据」）。
+- 本流水线已在真实片段上端到端运行：首轮（2026-10-01，无 board_state，模板 v1）
+  `run-c1cb097177a3`；v2（含 board_state 行，2026-10-02）`run-13aff088b982`
+  （DCE.v2701 2026-09 全月，train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only`
+  通过；5729 条记录的 board_state 值与 `dataset board-state` CSV 全量交叉核对一致；
+  真实数据双跑 sha256 一致；见主 README §5「首轮真实数据」）。
 
 契约硬门（只读执行第三方脚本）：
 

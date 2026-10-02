@@ -5,8 +5,9 @@
 * :func:`check_split_isolation` 镜像 NanoJev
   ``train_pipeline_decisions.read_training_records`` 的 state/source_group 跨 split
   检查口径（同一 ``state_id``／``metadata.source_group_id`` 只能属于一个 split）；
-* :func:`check_state_leakage` **独立重算**决策 K 线比值块并与记录内的状态文本比对
-  （不调用状态序列化实现，避免自证），同时拒绝状态里出现绝对价格/量；
+* :func:`check_state_leakage` **独立重算**决策 K 线比值块与盘面状态 board_state 行，并与
+  记录内的状态文本比对（不调用状态序列化实现，避免自证），同时拒绝状态里出现
+  绝对价格/量（含上一交易日日线绝对值）；
 * :func:`verify_determinism` 同输入双跑并逐文件比对 sha256；
 * :func:`build_audit_payload` 汇总死亡/剔除/每 split 计数、输入指纹与生成参数。
 """
@@ -23,7 +24,7 @@ from dataset.errors import DatasetError
 from dataset.storage import file_sha256
 
 from dataset.market_episode.labels import SegmentOutcome
-from dataset.market_episode.replay import Bar
+from dataset.market_episode.replay import Bar, format_ratio_value, ratio_or_none
 from dataset.market_episode.segments import SPLIT_ROLES, EpisodeParams, Segment
 
 #: 审计文件 schema 标记
@@ -42,16 +43,18 @@ GOLD_LABEL_KINDS = frozenset(
     }
 )
 
-#: 本轮实现的冻结口径（写入审计文件，便于复算时对照）
+#: 本轮实现的冻结口径（写入审计文件，便于复算时对照；v2 起新增 board_state）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v1:decision_bar_only",
+    "state_template": "marketsense.episode_state.v2:decision_bar_only+board_state",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "ratio_units:initial_equity=1.0,1_lot=1_notional,no_multiplier,no_fees",
     "flat_sample_band": "configurable_minutes_around_opportunity_minutes",
     "initial_state": "first_bar_is_first_decision_point,flat,peak=1.0",
     "reversal_condition_2": "stop_reached_first_or_scan_end_without_exceeding_current_bar",
+    "board_state_prev_day": "daily_file_1d_prev_trading_day_over_segment_first_open",
+    "board_state_today": "segment_bars_cumulative_extrema_through_decision_bar",
 }
 
 
@@ -235,12 +238,14 @@ def check_state_leakage(
     *,
     bars_by_segment: Mapping[str, tuple[Bar, ...]],
     price_precision: int,
+    prev_daily_by_segment: Mapping[str, tuple[float, float, float]],
 ) -> None:
     """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的 bar 计算。
 
-    * 记录里的价格比值行必须等于按 ``bars[bar_index]``（分母 = 片段首根）**独立重算**
-      的结果 → 状态若误用下一根/其它根会失败；
-    * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量（它们只能以比值出现）。
+    * 记录里的价格比值行、盘面状态 board_state 行必须等于按 ≤ 决策 K 线的数据
+      **独立重算**的结果 → 状态若误用下一根/其它根会失败；
+    * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量，也不得出现上一交易日
+      日线的绝对价格（它们只能以比值出现）。
     """
     for record in records:
         segment_id, bar_index = parse_state_id(record["state_id"])
@@ -262,9 +267,59 @@ def check_state_leakage(
                 f"记录 {record['id']} 状态中的比值行与决策 K 线不一致"
                 f"（期望 {expected!r}）",
             )
+        prev_daily = prev_daily_by_segment.get(segment_id)
+        _require(
+            prev_daily is not None,
+            f"审计缺少片段 {segment_id!r} 的上一交易日日线（board_state 无法独立重算）",
+        )
+        assert prev_daily is not None
+        prefix = bars[: bar_index + 1]
+        expected_board = _independent_board_line(
+            prefix, prev_daily, reference, price_precision
+        )
+        _require(
+            expected_board in state_text,
+            f"记录 {record['id']} 状态中的 board_state 行与决策 K 线不一致"
+            f"（期望 {expected_board!r}）",
+        )
         neighbours = {0, bar_index - 1, bar_index, bar_index + 1}
         for neighbour in sorted(index for index in neighbours if 0 <= index < len(bars)):
             check_no_absolute_values(state_text, bars[neighbour], precision=price_precision)
+        for token in sorted(_absolute_price_tokens(prev_daily, price_precision)):
+            if re.search(rf"(?<![\d.]){re.escape(token)}(?![\d.])", state_text):
+                raise DatasetError(
+                    f"记录 {record['id']} 状态出现上一交易日绝对价格 {token!r}"
+                    "（绝对数不得进入模型输入）"
+                )
+
+
+def _absolute_price_tokens(values, precision: int) -> set[str]:
+    """绝对价格 token 集合（固定小数位形式与浮点 ``repr`` 形式）。"""
+    tokens: set[str] = set()
+    for price in values:
+        tokens.add(f"{price:.{precision}f}")
+        tokens.add(repr(float(price)))
+    return tokens
+
+
+def _independent_board_line(
+    bars_prefix,
+    prev_daily: tuple[float, float, float],
+    reference: Bar,
+    precision: int,
+) -> str:
+    """独立重算 board_state 行（today = 前缀累计极值；prev = 日线值 ÷ 片段首根开盘）。"""
+    prev_high, prev_low, prev_close = prev_daily
+    today_high = max(bar.high for bar in bars_prefix)
+    today_low = min(bar.low for bar in bars_prefix)
+    return (
+        "board_state: "
+        f"prev_h={format_ratio_value(ratio_or_none(prev_high, reference.open), precision)}"
+        f" prev_l={format_ratio_value(ratio_or_none(prev_low, reference.open), precision)}"
+        f" prev_c={format_ratio_value(ratio_or_none(prev_close, reference.open), precision)}"
+        f" today_h={format_ratio_value(ratio_or_none(today_high, reference.open), precision)}"
+        f" today_l={format_ratio_value(ratio_or_none(today_low, reference.open), precision)}"
+    )
 
 
 def check_no_absolute_values(state_text: str, bar: Bar, *, precision: int) -> None:
@@ -274,10 +329,7 @@ def check_no_absolute_values(state_text: str, bar: Bar, *, precision: int) -> No
     与状态里的 ``bar=<序号>`` 等数字 token 容易假阳性，且序列化器在结构上只输出比值行
     （由字节级夹具测试锁定），故不参与 token 检查。
     """
-    tokens: set[str] = set()
-    for price in (bar.open, bar.high, bar.low, bar.close):
-        tokens.add(f"{price:.{precision}f}")
-        tokens.add(repr(float(price)))
+    tokens = _absolute_price_tokens((bar.open, bar.high, bar.low, bar.close), precision)
     for token in sorted(tokens):
         if re.search(rf"(?<![\d.]){re.escape(token)}(?![\d.])", state_text):
             raise DatasetError(f"状态文本出现绝对价格 {token!r}（绝对数不得进入模型输入）")
@@ -293,11 +345,16 @@ def build_audit_payload(
     records_by_split: Mapping[str, list[dict[str, Any]]],
     split_digests: Mapping[str, str],
     input_hashes: Mapping[str, str],
+    board_state_skipped: Mapping[str, str] | None = None,
+    daily_source_versions: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
     """构造审计文件内容（不含墙钟时间，保证双跑逐字节一致）。"""
     per_segment: list[dict[str, Any]] = []
     for segment in segments:
-        outcome = outcomes[segment.segment_id]
+        outcome = outcomes.get(segment.segment_id)
+        if outcome is None:
+            # board_state 跳过的片段不产出 per_segment 审计（在 board_state.skipped_segments 记录）
+            continue
         per_segment.append(
             {
                 "segment_id": segment.segment_id,
@@ -362,6 +419,13 @@ def build_audit_payload(
         "per_split": per_split,
         "per_segment": per_segment,
         "outputs": {"split_files": dict(sorted(split_digests.items()))},
+        "board_state": {
+            "skipped_segments": [
+                {"segment_id": key, "reason": value}
+                for key, value in sorted((board_state_skipped or {}).items())
+            ],
+            "daily_source_versions": dict(sorted((daily_source_versions or {}).items())),
+        },
     }
 
 

@@ -15,7 +15,12 @@ from dataset import config as config_module
 from dataset.cli import EXIT_FAILURE, EXIT_OK, EXIT_USAGE, build_parser, main
 from dataset.market_episode.nanojev_records import AUDIT_FILENAME
 from dataset.market_episode.segments import SPLIT_ROLES
-from dataset.tests.market_episode_fixtures import build_workspace, write_manifest, segment_record
+from dataset.tests.market_episode_fixtures import (
+    build_two_day_workspace,
+    build_workspace,
+    write_manifest,
+    segment_record,
+)
 
 _ROWS = [
     (100, 100.2, 99.8, 100),
@@ -191,6 +196,30 @@ def test_episode_generate_rejects_manifest_without_required_splits(tmp_path: Pat
 
     assert code == EXIT_FAILURE
     assert "train/dev/test" in capsys.readouterr().err
+
+
+def test_episode_generate_reports_skipped_segments_on_stderr(tmp_path: Path, capsys) -> None:
+    """无上一交易日日线的片段被跳过并打 stderr 告警（不静默）。"""
+    workspace = build_two_day_workspace(tmp_path)
+    output_dir = tmp_path / "out"
+
+    code = main(
+        [
+            "episode-generate",
+            "--segments",
+            str(workspace.manifest),
+            "--config",
+            str(workspace.config_path),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == EXIT_OK, captured.err
+    assert "[board-state 跳过片段] seg-train" in captured.err
+    assert "trade_date=2024-01-02" in captured.err
+    assert "共跳过 1 个片段" in captured.err
 
 
 def test_episode_generate_uses_configured_output_dir_by_default(tmp_path: Path, capsys) -> None:

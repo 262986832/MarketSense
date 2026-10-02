@@ -27,6 +27,7 @@ from dataset.market_episode.nanojev_records import (
     HELD_CRITERIA,
     QUESTION_ID,
     STATE_SCHEMA,
+    BoardStateValues,
     build_record,
     generate_dataset,
     render_state,
@@ -40,8 +41,10 @@ from dataset.market_episode.segments import (
     load_symbols_config,
 )
 from dataset.tests.market_episode_fixtures import (
+    DAILY_ROWS,
     SYMBOL,
     bars,
+    build_two_day_workspace,
     build_workspace,
     segment_record,
     timestamp_at,
@@ -101,6 +104,10 @@ def _mirror_nanojev_validate(records: list[dict]) -> None:
 # --------------------------------------------------------------------------- #
 # 状态序列化模板（实现阶段冻结项 2：冻结后写夹具固定字节）
 # --------------------------------------------------------------------------- #
+#: 盘面状态绝对值夹具（量级与 1m 行情拉开，避免绝对 token 假阳性）
+_BOARD = dict(prev_day_high=2010.0, prev_day_low=1980.0, prev_day_close=1990.0)
+
+
 def test_render_state_template_is_byte_stable_for_flat_position() -> None:
     bar_list = bars(_PATTERN)
 
@@ -110,6 +117,7 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
         position=None,
         drawdown=0.0,
         price_precision=6,
+        board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
     )
 
     assert state == (
@@ -118,7 +126,9 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
         "px_ratio: o=1.000000 h=1.002000 l=0.998000 c=1.000000\n"
         "vol_ratio: v=1.000000 oi_open=1.000000 oi_close=1.000000\n"
         "position: flat\n"
-        "drawdown: 0.000000"
+        "drawdown: 0.000000\n"
+        "board_state: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000"
+        " today_h=1.002000 today_l=0.998000"
     )
 
 
@@ -131,6 +141,7 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
         position=PositionSnapshot(direction="short", entry_ratio=0.9985, stop_ratio=1.0005),
         drawdown=0.0015,
         price_precision=6,
+        board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
     )
 
     assert state == (
@@ -139,7 +150,9 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
         "px_ratio: o=1.000000 h=1.010000 l=1.000500 c=1.008000\n"
         "vol_ratio: v=1.000000 oi_open=1.002000 oi_close=1.001996\n"
         "position: short entry=0.998500 stop=1.000500\n"
-        "drawdown: 0.001500"
+        "drawdown: 0.001500\n"
+        "board_state: prev_h=2.010000 prev_l=1.980000 prev_c=1.990000"
+        " today_h=1.010000 today_l=0.999500"
     )
 
 
@@ -153,9 +166,11 @@ def test_render_state_marks_undefined_denominators_as_na() -> None:
         position=None,
         drawdown=0.0,
         price_precision=6,
+        board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
     )
 
     assert "vol_ratio: v=na oi_open=1.002000 oi_close=1.001996" in state
+    assert "board_state: prev_h=2.010000" in state  # board_state 行不受分母影响（价格分母正常）
     assert "inf" not in state and "nan" not in state
     assert zero_oi  # 非零分母分支由上一个夹具覆盖
 
@@ -169,11 +184,13 @@ def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar
         position=None,
         drawdown=0.0,
         price_precision=6,
+        board_state=BoardStateValues(prev_day_high=2010.0, prev_day_low=1980.0,
+                                     prev_day_close=1990.0, today_high=1010.0, today_low=999.5),
     )
 
     for absolute in ("1000.000000", "1010.000000", "999.500000", "1008.000000"):
         assert absolute not in state
-    assert len(state.splitlines()) == 6
+    assert len(state.splitlines()) == 7  # 模板 v2：7 行（含 board_state）
 
 
 # --------------------------------------------------------------------------- #
@@ -209,10 +226,18 @@ def test_build_record_maps_ids_split_questions_and_gold() -> None:
     )
 
     flat_record = build_record(
-        segment=segment, bars=bar_list, point=flat_point, price_precision=6
+        segment=segment,
+        bars=bar_list,
+        point=flat_point,
+        price_precision=6,
+        prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
     )
     holding_record = build_record(
-        segment=segment, bars=bar_list, point=holding_point, price_precision=6
+        segment=segment,
+        bars=bar_list,
+        point=holding_point,
+        price_precision=6,
+        prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
     )
 
     assert flat_record["id"] == flat_record["state_id"] == "seg-train:0"
@@ -234,7 +259,44 @@ def test_build_record_rejects_action_outside_position_criteria() -> None:
     bad_point = DecisionPoint(1, ACTION_CLOSE, "holding", True, None, 0.0, None, None)
 
     with pytest.raises(DatasetError, match="与仓位候选集不匹配"):
-        build_record(segment=_segment(), bars=bar_list, point=bad_point, price_precision=6)
+        build_record(
+            segment=_segment(),
+            bars=bar_list,
+            point=bad_point,
+            price_precision=6,
+            prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
+        )
+
+
+def test_build_record_board_state_uses_prev_daily_and_prefix_extrema() -> None:
+    """board_state：prev_* = 上一交易日日线 ÷ 片段首根开盘；
+    today_* = 首根至决策 K 线（含）累计极值，不含决策 K 线之后的 bar。"""
+    bar_list = bars(_PATTERN + [(100, 200, 99, 100)])  # 第 3 根 high=200（决策 K 线之后）
+    segment = _segment(last_index=2)
+    record = build_record(
+        segment=segment,
+        bars=bar_list,
+        point=DecisionPoint(
+            1,
+            ACTION_HOLD,
+            "holding",
+            True,
+            PositionSnapshot("long", 1.012, 0.998),
+            0.012,
+            None,
+            None,
+        ),
+        price_precision=6,
+        prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
+    )
+
+    # prev：2010/1980/1990 ÷ 首根开盘 100；today：前缀 [0..1] 极值 110/99.8 ÷ 100
+    # （第 3 根 high=200 不进入 today_h）
+    assert (
+        "board_state: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000"
+        " today_h=1.100000 today_l=0.998000" in record["state"]
+    )
+    assert "20.000000" not in record["state"]
 
 
 # --------------------------------------------------------------------------- #
@@ -390,6 +452,83 @@ def test_generate_dataset_rejects_workspace_with_only_train_segments(tmp_path: P
 
 #: 12 根恒定振幅 K 线：两向盈亏比恒为 0 → 片段内没有任何机会分钟
 _FLAT_ROWS = [(100.0, 100.2, 99.8, 100.0)] * 12
+
+
+def test_generate_dataset_rejects_workspace_without_prev_daily_for_any_segment(
+    tmp_path: Path,
+) -> None:
+    """日线数据起点不早于片段交易日 → 全部片段跳过 → 硬错误（不写出产物，不静默）。"""
+    workspace = build_workspace(
+        tmp_path,
+        _ROWS,
+        daily_rows=((4010.0, 4000.0, 3990.0, 4005.0),),
+        daily_start="2024-01-02 00:00:00",  # 与片段同日：无严格早于它的日线行
+    )
+
+    with pytest.raises(DatasetError, match="所有片段都缺少上一交易日日线"):
+        generate_dataset(
+            load_segments(workspace.manifest),
+            symbols=load_symbols_config(workspace.symbols_path),
+            data_dir=workspace.data_dir,
+            params=EpisodeParams(),
+            output_dir=tmp_path / "out",
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def test_generate_dataset_skips_segments_without_prev_daily_and_reports(
+    tmp_path: Path,
+) -> None:
+    """部分片段无上一交易日日线：跳过不产出记录，记入审计与结果（不静默）。"""
+    workspace = build_two_day_workspace(tmp_path)
+
+    result = generate_dataset(
+        load_segments(workspace.manifest),
+        symbols=load_symbols_config(workspace.symbols_path),
+        data_dir=workspace.data_dir,
+        params=EpisodeParams(),
+        output_dir=tmp_path / "out",
+    )
+
+    assert set(result.board_state_skipped) == {"seg-train"}
+    (reason,) = result.board_state_skipped.values()
+    assert reason.startswith("trade_date=2024-01-02")
+    assert result.record_counts["train"] == 0
+    assert result.record_counts["dev"] + result.record_counts["test"] > 0
+    skipped = result.audit["board_state"]["skipped_segments"]
+    assert [entry["segment_id"] for entry in skipped] == ["seg-train"]
+    # 非跳过片段（次日，首根开盘 100）的记录含 board_state 行：prev = 首日日线行
+    dev_rows = [
+        json.loads(line)
+        for line in (result.run_dir / "dev.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert dev_rows
+    for row in dev_rows:
+        assert "board_state: prev_h=40.100000 prev_l=39.900000 prev_c=40.050000" in row["state"]
+    train_rows = [
+        json.loads(line)
+        for line in (result.run_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert train_rows == []  # 跳过的片段不产出记录（已知空 split 缺陷仍单独存在）
+
+
+def test_generate_dataset_state_schema_changes_run_id(tmp_path: Path) -> None:
+    """STATE_SCHEMA 纳入 run_id 哈希：状态格式变更产生新 run（旧 run 保留不覆盖）。"""
+    workspace, first = _generate(tmp_path / "a")
+    assert first.run_id.startswith("run-")
+    assert first.audit["input"]["state_schema_sha256"]
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "dataset.market_episode.nanojev_records.STATE_SCHEMA",
+            "marketsense.episode_state.vX-test",
+        )
+        _, other = _generate(tmp_path / "b")
+
+    assert other.run_id != first.run_id
+    assert workspace.data_dir.is_dir()
 
 
 @pytest.mark.xfail(

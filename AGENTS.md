@@ -36,11 +36,12 @@ MarketSense 是一个**研究型**项目，研究问题：
      —— 可生成 **K 线数据、转折点数据**；
   2. `scripts/plot_price_line.py`：转折点 **价格折线数据**（PNG）；
   3. `dataset episode-generate`：**首轮 episode 训练数据流水线**（已实现，并已在真实片段上端到端运行，见下方执行记录）
-     —— 输入用户指定的震荡片段清单 + 1 分钟 K 线 + 品种 `tick_size` 配置，
+     —— 输入用户指定的震荡片段清单 + 1 分钟 K 线及日线 + 品种 `tick_size` 配置，
      确定性输出对齐 NanoJev 训练契约的按 split JSONL + 审计文件。最小用法：
 
      ```bash
-     # 前置：①1m K 线已落盘（dataset fetch --period 1m）②symbols.local.yaml 填 tick_size
+     # 前置：①1m 与 1d K 线已落盘（dataset fetch --period 1m / 1d；日线供 board_state 行）
+     #      ②symbols.local.yaml 填 tick_size
      #      ③片段清单写入 data/segments/（模板 dataset/config/segments.example.jsonl）
      python -m dataset episode-generate --segments data/segments/my_segments.jsonl
      # 契约硬门（只读执行第三方脚本；train/dev/test 必须非空）
@@ -65,18 +66,23 @@ MarketSense 是一个**研究型**项目，研究问题：
   固定 1 手、无动态仓位、无机械止盈止损；开仓/平仓/反手标签由**盈亏比规则真值**给出
   （严格大于阈值、多空取更优侧；反转 K 线两条件；反手 = 同根两个决策）；
   模型可见价格一律用**比值**（分母 = 片段首根开盘价，6 位小数），绝对 OHLC 不得进模型输入。
+  2026-10-02 用户拍板方案 A：状态模板升 v2（`render_state` 新增 board_state 行，
+  prev 日线高/低/收与今日高/低随状态文本进训练记录；prev 真值源 = 1d 日线文件，
+  分母 = 片段首根开盘；缺上一交易日日线的片段跳过并告警）。
   完整语义与实现阶段冻结项见 `artifacts/nanojev-training-data/02-design/tech-design.md`。
-- **首轮真实数据（2026-10-01 已生成并通过契约校验）**：DCE.v2701（PVC）2026-09 全月
-  21 个交易日片段（`data/segments/sep2026.jsonl`：train 9-1~9-18 / dev 9-21~9-24 /
-  test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
-  `data/nanojev_dataset/run-c1cb097177a3/`（**train 4188 / dev 886 / test 655**，全部非空），
-  NanoJev 原生 `--validate-only` 契约硬门通过。`tick_size = 5` 为**用户确认值**
+- **首轮真实数据（2026-10-01 生成；2026-10-02 重生成 v2 含盘面状态，均通过契约校验）**：
+  DCE.v2701（PVC）2026-09 全月 21 个交易日片段（`data/segments/sep2026.jsonl`：
+  train 9-1~9-18 / dev 9-21~9-24 / test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
+  当前产物 `data/nanojev_dataset/run-13aff088b982/`（模板 v2 含 board_state 行，
+  **train 4188 / dev 886 / test 655**，全部非空，board_state 值与 board-state CSV
+  全量交叉核对一致，双跑 sha256 一致）；历史首轮 `run-c1cb097177a3/`（模板 v1）保留。
+  两者 NanoJev 原生 `--validate-only` 契约硬��均通过。`tick_size = 5` 为**用户确认值**
   （公开资料记载最小变动价位 1 元/吨，按用户确认执行，见 `dataset/config/symbols.local.yaml`）。
   Mac Intel 16G（无 CUDA）已完成数据通路三级 CPU 冒烟（`--self-check` / tokenize / 前向，
   全部通过）；**训练与推理入口硬性要求 CUDA，本机不可训练**（详见 `README.md` §7.4）。
 - **下一阶段核心任务**：
-  1. 在真实片段上端到端生成并校验（**已完成，2026-10-01**，见上方「首轮真实数据」；
-     新片段清单仍按 `dataset/config/segments.example.jsonl` 格式提供）；
+  1. 在真实片段上端到端生成并校验（**已完成，2026-10-01；2026-10-02 v2 重生成**，
+     见上方「首轮真实数据」；新片段清单仍按 `dataset/config/segments.example.jsonl` 格式提供）；
   2. 价格折线/episode 数据之外，**后续还要补充其它材料与数据**（具体形式**未决**，
      进入具体任务前先讨论确认，见 §8）；
   3. 训练与评估、趋势行情的 OOD 安全评估（未设计）。

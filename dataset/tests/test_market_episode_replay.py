@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from dataset.errors import DatasetError
-from dataset.market_episode.nanojev_records import render_state
+from dataset.market_episode.nanojev_records import BoardStateValues, render_state
 from dataset.market_episode.replay import (
     LONG,
     REASON_DEATH,
@@ -285,12 +285,15 @@ def test_visible_state_depends_only_on_bars_up_to_decision_bar() -> None:
     base_rows = [(1000, 1000.5, 999.5, 1000), (1000, 1010, 1000.5, 1008), (1008, 1009, 964, 966)]
     index = 1
     reference_bar = bars(base_rows)[0]
+    board = BoardStateValues(prev_day_high=2000.0, prev_day_low=1980.0, prev_day_close=1990.0,
+                             today_high=1010.0, today_low=999.5)
     state_before = render_state(
         bar=bars(base_rows)[index],
         reference_bar=reference_bar,
         position=None,
         drawdown=0.0,
         price_precision=6,
+        board_state=board,
     )
 
     mutated = bars(base_rows + [(966, 1200, 900, 1100)])[index]  # 决策 K 线之后的 bar 改变
@@ -300,6 +303,7 @@ def test_visible_state_depends_only_on_bars_up_to_decision_bar() -> None:
         position=None,
         drawdown=0.0,
         price_precision=6,
+        board_state=board,
     )
 
     assert state_before == state_after
@@ -315,6 +319,8 @@ def test_visible_state_contains_no_absolute_prices() -> None:
         position=None,
         drawdown=0.0,
         price_precision=6,
+        board_state=BoardStateValues(prev_day_high=2000.0, prev_day_low=1980.0,
+                                     prev_day_close=1990.0, today_high=1010.0, today_low=999.5),
     )
 
     for price in (1000, 1000.5, 999.5, 1010, 1008):

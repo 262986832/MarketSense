@@ -339,6 +339,13 @@ def _run_episode_generate(args: argparse.Namespace) -> int:
     counts = ", ".join(
         f"{split}={result.record_counts[split]}" for split in SPLIT_ROLES
     )
+    for segment_id, reason in sorted(result.board_state_skipped.items()):
+        print(f"[board-state 跳过片段] {segment_id}: {reason}", file=sys.stderr)
+    if result.board_state_skipped:
+        print(
+            f"共跳过 {len(result.board_state_skipped)} 个片段（缺上一交易日日线，详见 stderr）",
+            file=sys.stderr,
+        )
     print(f"已生成 episode 训练数据：{result.run_dir}（记录数 {counts}）")
     print(f"审计文件：{result.run_dir / AUDIT_FILENAME}")
     return EXIT_OK

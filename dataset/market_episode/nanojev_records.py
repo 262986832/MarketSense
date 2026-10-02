@@ -8,26 +8,36 @@
   直接复用 NanoJev 的 state/source_group 跨 split 泄漏检查）；
 * ``split`` = 片段的 ``split_role``；
 * ``state`` = 确定性文本序列化的**相对比值**状态（决策 K 线完整数据的比值表达 +
-  成交量/持仓量归一化 + 当前仓位 + 账户回撤幅度）；
+  成交量/持仓量归一化 + 当前仓位 + 账户回撤幅度 + 盘面状态 board_state 行）；
 * ``questions`` 恰好一个 choice 题 ``next_action``：空仓
   ``{open_long, open_short, stay_flat}`` / 持仓 ``{close, hold, reverse}``；
 * ``gold`` = 规则真值动作 ID + ``gold_label_kind: "deterministic_truth"``
   （首轮不发 ``gold_probs``：NanoJev 校验器允许硬 gold 无概率，trainer 自动派生 one-hot）。
 
-**状态序列化模板（实现阶段冻结项 2，本轮冻结；变更需走新版本标记）**
+**状态序列化模板（实现阶段冻结项 2；v2 起新增 board_state 行，2026-10-02 用户拍板方案 A）**
 
 ```text
-marketsense.episode_state.v1
+marketsense.episode_state.v2
 bar=<片段内 0 基序号>
 px_ratio: o=<..> h=<..> l=<..> c=<..>
 vol_ratio: v=<..> oi_open=<..> oi_close=<..>
 position: flat | long entry=<..> stop=<..> | short entry=<..> stop=<..>
 drawdown: <..>
+board_state: prev_h=<..> prev_l=<..> prev_c=<..> today_h=<..> today_l=<..>
 ```
 
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
-* **无历史窗口**：状态只含决策 K 线单根 + 仓位 + 回撤，绝对价格不进入模型输入；
+* **无历史窗口**：状态只含决策 K 线单根 + 仓位 + 回撤 + 盘面状态，绝对价格不进入模型输入；
+* **board_state 行**（v2 新增，与 ``dataset/board_state.py`` 同口径）：
+  - ``prev_h/prev_l/prev_c`` = **上一交易日**日线高/低/收（来源 ``{symbol}_1d.csv``，
+    取日线文件中严格早于片段交易日的最后一行）÷ 片段首根开盘价；
+  - ``today_h/today_l`` = 片段首根至决策 K 线（**含**）的 1m 高/低**累计极值** ÷ 片段首根开盘价
+    （State(T) 只用 ≤ 决策 K 线的数据，无未来泄漏）；
+  - 分母与 px_ratio 一致（全交易日片段下片段首根 = 交易日窗口首根 = 今日开盘，
+    见 ``artifacts/nanojev-integration-alignment/01-requirement/requirement-report.md``）；
+  - 今日开盘价不写（它是分母本身，比值恒为 1.000000，写入是纯冗余 token）；
+  - 片段无上一交易日日线 → **跳过该片段**（不产出记录），记入审计与 stderr 告警（不静默）。
 * 输出按 ``run`` 目录隔离（``<output_dir>/<run_id>``，``run_id`` 由输入指纹确定性派生，
   同输入同目录同字节，不覆盖其它输入的产物）。
 """
@@ -36,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -43,8 +54,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import pandas as pd
+
 from dataset.errors import DatasetError
-from dataset.storage import file_sha256
+from dataset.storage import file_sha256, load_ohlcv
 
 from dataset.market_episode.audit import (
     build_audit_payload,
@@ -69,6 +82,7 @@ from dataset.market_episode.replay import (
     format_ratio_value,
     load_segment_bars,
     px_ratio_line,
+    ratio_or_none,
     vol_ratio_line,
 )
 from dataset.market_episode.segments import (
@@ -78,8 +92,8 @@ from dataset.market_episode.segments import (
     validate_segments,
 )
 
-#: 状态文本的 schema 版本标记（格式演进必须换标记）
-STATE_SCHEMA = "marketsense.episode_state.v1"
+#: 状态文本的 schema 版本标记（格式演进必须换标记；v2 新增 board_state 行）
+STATE_SCHEMA = "marketsense.episode_state.v2"
 #: 记录中的 choice 题目 ID
 QUESTION_ID = "next_action"
 #: 题目说明（确定性固定文案）
@@ -111,6 +125,38 @@ class GenerationResult:
     record_counts: Mapping[str, int]
     output_sha256: Mapping[str, str]
     audit: Mapping[str, Any]
+    board_state_skipped: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class BoardStateValues:
+    """盘面状态绝对值（序列化时再除以片段首根开盘价）。
+
+    * ``prev_day_*``：上一交易日日线高/低/收（来源 ``{symbol}_1d.csv``，绝对价格层）；
+    * ``today_*``：片段首根至决策 K 线（含）的 1m 高/低累计极值（State(T) 只用 ≤ 决策 K 线数据）。
+    """
+
+    prev_day_high: float
+    prev_day_low: float
+    prev_day_close: float
+    today_high: float
+    today_low: float
+
+
+def _board_state_line(
+    board_state: BoardStateValues,
+    reference_bar: Bar,
+    price_precision: int,
+) -> str:
+    """盘面状态比值行（分母 = 片段首根开盘价，与 px_ratio 一致；分母 ≤ 0 时逐值写 ``na``）。"""
+    return (
+        "board_state: "
+        f"prev_h={format_ratio_value(ratio_or_none(board_state.prev_day_high, reference_bar.open), price_precision)}"
+        f" prev_l={format_ratio_value(ratio_or_none(board_state.prev_day_low, reference_bar.open), price_precision)}"
+        f" prev_c={format_ratio_value(ratio_or_none(board_state.prev_day_close, reference_bar.open), price_precision)}"
+        f" today_h={format_ratio_value(ratio_or_none(board_state.today_high, reference_bar.open), price_precision)}"
+        f" today_l={format_ratio_value(ratio_or_none(board_state.today_low, reference_bar.open), price_precision)}"
+    )
 
 
 def render_state(
@@ -120,11 +166,13 @@ def render_state(
     position: PositionSnapshot | None,
     drawdown: float,
     price_precision: int,
+    board_state: BoardStateValues,
 ) -> str:
     """确定性状态文本（模板见模块 docstring）。
 
-    只做「决策 K 线单根 + 仓位 + 回撤」的序列化：函数签名决定它无法访问决策 K 线
-    之后的任何 bar（无未来数据泄漏在构造层面成立）。
+    只做「决策 K 线单根 + 仓位 + 回撤 + 盘面状态」的序列化：函数签名决定它无法访问
+    决策 K 线之后的任何 bar（``board_state`` 的今日值由调用方只用 ≤ 决策 K 线的数据算好
+    传入，无未来数据泄漏在构造层面成立）。
     """
     if position is None:
         position_line = "position: flat"
@@ -141,6 +189,7 @@ def render_state(
             vol_ratio_line(bar, reference_bar, price_precision),
             position_line,
             f"drawdown: {format_ratio_value(drawdown, price_precision)}",
+            _board_state_line(board_state, reference_bar, price_precision),
         )
     )
 
@@ -151,15 +200,29 @@ def build_record(
     bars: tuple[Bar, ...],
     point: DecisionPoint,
     price_precision: int,
+    prev_day_ohlc: tuple[float, float, float],
 ) -> dict[str, Any]:
-    """把一个入选决策点映射为 NanoJev 训练记录。"""
+    """把一个入选决策点映射为 NanoJev 训练记录。
+
+    ``prev_day_ohlc`` = 上一交易日日线 (高, 低, 收)（来源 1d 文件，绝对价格层）；
+    ``today_high/today_low`` 只由 ``bars[: point.bar_index + 1]``（≤ 决策 K 线）累计，
+    无未来数据泄漏。
+    """
     bar = bars[point.bar_index]
+    prefix = bars[: point.bar_index + 1]
     state = render_state(
         bar=bar,
         reference_bar=bars[0],
         position=point.position,
         drawdown=point.drawdown,
         price_precision=price_precision,
+        board_state=BoardStateValues(
+            prev_day_high=prev_day_ohlc[0],
+            prev_day_low=prev_day_ohlc[1],
+            prev_day_close=prev_day_ohlc[2],
+            today_high=max(item.high for item in prefix),
+            today_low=min(item.low for item in prefix),
+        ),
     )
     criteria = FLAT_CRITERIA if point.position is None else HELD_CRITERIA
     if point.action not in criteria:
@@ -232,6 +295,42 @@ def _write_files_atomically(run_dir: Path, files: Mapping[str, str]) -> dict[str
     return digests
 
 
+def _load_daily_ohlc(data_dir: str | Path, symbol: str) -> Any:
+    """读 ``{symbol}_1d.csv`` 返回 LoadedOHLCV（日线文件逐行一个交易日，升序）。
+
+    :raises DataLoadError: 1d 文件缺失/损坏（硬错误，不静默跳过）
+    """
+    return load_ohlcv(symbol, "1d", data_dir=data_dir)
+
+
+def _daily_rows(loaded: Any) -> tuple[tuple[Any, float, float, float], ...]:
+    """LoadedOHLCV → 按文件序的 (交易日, 高, 低, 收) 元组（交易日 = 日线 timestamp 日历日）。"""
+    return tuple(
+        (pd.Timestamp(ts).date(), float(high), float(low), float(close))
+        for ts, high, low, close in zip(
+            loaded.df["timestamp"], loaded.df["high"], loaded.df["low"], loaded.df["close"]
+        )
+    )
+
+
+def _prev_daily_ohlc(
+    daily_rows: tuple[tuple[Any, float, float, float], ...],
+    trade_date: Any,
+) -> tuple[float, float, float] | None:
+    """上一交易日日线 (高, 低, 收)：日线文件中严格早于 ``trade_date`` 的最后一行。
+
+    无前日（数据起点）或日线值非有限 → 返回 ``None``（调用方跳过该片段，不静默）。
+    """
+    prev: tuple[float, float, float] | None = None
+    for row_date, high, low, close in daily_rows:
+        if row_date >= trade_date:
+            break
+        prev = (high, low, close)
+    if prev is not None and not all(math.isfinite(value) for value in prev):
+        return None
+    return prev
+
+
 def generate_dataset(
     segments: tuple[Segment, ...] | list[Segment],
     *,
@@ -245,6 +344,10 @@ def generate_dataset(
     流程：清单/数据校验 → 逐片段回放 + 标签 → 记录映射 → 自检（结构、隔离、泄漏、
     计数一致）→ 原子落盘到 ``<output_dir>/<run_id>``。
 
+    v2 起：每个片段需在 ``{symbol}_1d.csv`` 中找到严格早于片段交易日的上一交易日
+    日线（供 board_state 行）；找不到的片段被跳过（记入审计与结果，不静默），
+    全部片段被跳过则硬错误（不写出任何产物）。
+
     :raises DatasetError: 校验失败或自检不通过（不写出任何产物）
     """
     segments = tuple(segments)
@@ -253,8 +356,23 @@ def generate_dataset(
     outcomes: dict[str, SegmentOutcome] = {}
     bars_by_segment: dict[str, tuple[Bar, ...]] = {}
     records_by_split: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLIT_ROLES}
+    daily_loaded_by_symbol: dict[str, Any] = {}
+    prev_daily_by_segment: dict[str, tuple[float, float, float]] = {}
+    board_state_skipped: dict[str, str] = {}
 
     for segment in segments:
+        loaded = daily_loaded_by_symbol.get(segment.symbol)
+        if loaded is None:
+            loaded = _load_daily_ohlc(data_dir, segment.symbol)
+            daily_loaded_by_symbol[segment.symbol] = loaded
+        # 片段交易日 = 片段结束时间的日历日（窗口止于 14:59；清单与测试夹具均满足）
+        prev = _prev_daily_ohlc(_daily_rows(loaded), segment.end.date())
+        if prev is None:
+            board_state_skipped[segment.segment_id] = (
+                f"trade_date={segment.end.date()} 无上一交易日日线（或值非有限，1d 文件）"
+            )
+            continue
+        prev_daily_by_segment[segment.segment_id] = prev
         bars, source_version = load_segment_bars(segment, data_dir=data_dir)
         outcome = evaluate_segment(
             segment,
@@ -272,15 +390,25 @@ def generate_dataset(
                     bars=bars,
                     point=point,
                     price_precision=params.price_precision,
+                    prev_day_ohlc=prev,
                 )
             )
+
+    if not prev_daily_by_segment:
+        raise DatasetError(
+            "所有片段都缺少上一交易日日线（1d 文件），无法生成 board_state 状态；"
+            f"跳过明细: {dict(sorted(board_state_skipped.items()))}"
+        )
 
     all_records = [
         record for split in SPLIT_ROLES for record in records_by_split[split]
     ]
     check_records(all_records)
     check_state_leakage(
-        all_records, bars_by_segment=bars_by_segment, price_precision=params.price_precision
+        all_records,
+        bars_by_segment=bars_by_segment,
+        price_precision=params.price_precision,
+        prev_daily_by_segment=prev_daily_by_segment,
     )
 
     segments_text = _dump_json([segment.canonical() for segment in segments])
@@ -291,9 +419,11 @@ def generate_dataset(
         "segments_sha256": _sha256_text(segments_text),
         "symbols_sha256": _sha256_text(symbols_text),
         "params_sha256": _sha256_text(params_text),
+        "state_schema_sha256": _sha256_text(STATE_SCHEMA),
     }
+    # run_id 把 STATE_SCHEMA 纳入哈希输入：状态格式变更产生新 run（旧 run 保留不覆盖）
     run_id = "run-" + _sha256_text(
-        "|".join((segments_text, symbols_text, params_text))
+        "|".join((segments_text, symbols_text, params_text, STATE_SCHEMA))
     )[:12]
 
     split_texts: dict[str, str] = {}
@@ -313,6 +443,11 @@ def generate_dataset(
         records_by_split=records_by_split,
         split_digests=split_digests,
         input_hashes=input_hashes,
+        board_state_skipped=board_state_skipped,
+        daily_source_versions={
+            symbol: loaded.source_data_version
+            for symbol, loaded in daily_loaded_by_symbol.items()
+        },
     )
     check_audit_consistency(payload, records_by_split)
 
@@ -327,6 +462,7 @@ def generate_dataset(
         record_counts={split: len(records_by_split[split]) for split in SPLIT_ROLES},
         output_sha256=digests,
         audit=payload,
+        board_state_skipped=board_state_skipped,
     )
 
 
@@ -338,6 +474,7 @@ __all__ = [
     "QUESTION_ID",
     "QUESTION_INSTRUCTIONS",
     "STATE_SCHEMA",
+    "BoardStateValues",
     "GenerationResult",
     "build_record",
     "generate_dataset",

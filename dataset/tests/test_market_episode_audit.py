@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,11 @@ from dataset.market_episode.audit import (
     parse_state_id,
     verify_determinism,
 )
-from dataset.market_episode.nanojev_records import generate_dataset, render_state
+from dataset.market_episode.nanojev_records import (
+    BoardStateValues,
+    generate_dataset,
+    render_state,
+)
 from dataset.market_episode.replay import load_segment_bars
 from dataset.market_episode.segments import (
     SPLIT_ROLES,
@@ -35,6 +40,7 @@ from dataset.tests.market_episode_fixtures import (
     bars,
     build_workspace,
     frame,
+    prev_daily_map,
 )
 
 #: 一段 = 开多 → 持有 → 程序止损离场 → 空仓（每段 4 根）；重复 3 段覆盖 train/dev/test
@@ -89,11 +95,14 @@ def test_parse_state_id_round_trip_and_rejects_bad_format() -> None:
 
 
 def test_generated_records_pass_all_audit_checks(tmp_path: Path) -> None:
-    _, _, _, params, result, records, bars_by_segment = _workspace_and_records(tmp_path)
+    workspace, _, _, params, result, records, bars_by_segment = _workspace_and_records(tmp_path)
 
     check_records(records)
     check_state_leakage(
-        records, bars_by_segment=bars_by_segment, price_precision=params.price_precision
+        records,
+        bars_by_segment=bars_by_segment,
+        price_precision=params.price_precision,
+        prev_daily_by_segment=prev_daily_map(workspace),
     )
     check_audit_consistency(result.audit, _records_by_split(result))
     assert all(row["split"] in SPLIT_ROLES for row in records)
@@ -131,9 +140,12 @@ def test_split_isolation_detects_injected_source_group_split(tmp_path: Path) -> 
 
 
 def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None:
-    _, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
     check_state_leakage(
-        records, bars_by_segment=bars_by_segment, price_precision=params.price_precision
+        records,
+        bars_by_segment=bars_by_segment,
+        price_precision=params.price_precision,
+        prev_daily_by_segment=prev_daily_map(workspace),
     )
 
     # 人为把某条记录的状态换成分片内"下一根"的比值行 → 必须被检出
@@ -149,16 +161,26 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
         position=None,
         drawdown=0.0,
         price_precision=params.price_precision,
+        board_state=BoardStateValues(
+            prev_day_high=2010.0,
+            prev_day_low=1980.0,
+            prev_day_close=1990.0,
+            today_high=max(bar.high for bar in segment_bars[: bar_index + 2]),
+            today_low=min(bar.low for bar in segment_bars[: bar_index + 2]),
+        ),
     )
 
     with pytest.raises(DatasetError, match="与决策 K 线不一致"):
         check_state_leakage(
-            tampered, bars_by_segment=bars_by_segment, price_precision=params.price_precision
+            tampered,
+            bars_by_segment=bars_by_segment,
+            price_precision=params.price_precision,
+            prev_daily_by_segment=prev_daily_map(workspace),
         )
 
 
 def test_state_leakage_detects_absolute_price_in_state(tmp_path: Path) -> None:
-    _, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
     segment_id, bar_index = parse_state_id(records[0]["state_id"])
     segment_bars = bars_by_segment[segment_id]
     bar = segment_bars[bar_index]
@@ -176,7 +198,54 @@ def test_state_leakage_detects_absolute_price_in_state(tmp_path: Path) -> None:
     tampered[0]["state"] = tampered[0]["state"] + f"\nnext_close: {next_bar.close:.6f}"
     with pytest.raises(DatasetError, match="绝对价格"):
         check_state_leakage(
-            tampered, bars_by_segment=bars_by_segment, price_precision=params.price_precision
+            tampered,
+            bars_by_segment=bars_by_segment,
+            price_precision=params.price_precision,
+            prev_daily_by_segment=prev_daily_map(workspace),
+        )
+
+
+def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
+    """board_state 行与独立重算不一致（today_h 篡改）→ 必须被检出。"""
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
+    check_state_leakage(
+        records,
+        bars_by_segment=bars_by_segment,
+        price_precision=params.price_precision,
+        prev_daily_by_segment=prev_daily_map(workspace),
+    )
+
+    tampered = [copy.deepcopy(record) for record in records]
+    assert "today_h=" in tampered[0]["state"]
+    # 人为把 board_state 的 today_h 换成片段首根以外的值
+    tampered[0]["state"] = re.sub(
+        r"today_h=[\d.]+", "today_h=9.999999", tampered[0]["state"], count=1
+    )
+
+    with pytest.raises(DatasetError, match="board_state 行与决策 K 线不一致"):
+        check_state_leakage(
+            tampered,
+            bars_by_segment=bars_by_segment,
+            price_precision=params.price_precision,
+            prev_daily_by_segment=prev_daily_map(workspace),
+        )
+
+
+def test_state_leakage_detects_prev_daily_absolute_price(tmp_path: Path) -> None:
+    """上一交易日日线绝对价格不得出现在状态文本（只能以比值出现）。"""
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
+    prev_daily = prev_daily_map(workspace)[parse_state_id(records[0]["state_id"])[0]]
+
+    tampered = [copy.deepcopy(record) for record in records]
+    tampered[0]["state"] = (
+        tampered[0]["state"] + f"\nprev_close_raw: {prev_daily[2]:.{params.price_precision}f}"
+    )
+    with pytest.raises(DatasetError, match="上一交易日绝对价格"):
+        check_state_leakage(
+            tampered,
+            bars_by_segment=bars_by_segment,
+            price_precision=params.price_precision,
+            prev_daily_by_segment=prev_daily_map(workspace),
         )
 
 
@@ -300,6 +369,8 @@ def test_state_of_flat_minute_uses_bars_up_to_its_own_index() -> None:
         position=None,
         drawdown=0.0,
         price_precision=6,
+        board_state=BoardStateValues(prev_day_high=2010.0, prev_day_low=1980.0,
+                                     prev_day_close=1990.0, today_high=1012.0, today_low=990.0),
     )
 
     assert "px_ratio: o=1.009000 h=1.012000 l=0.990000 c=0.992000" in state

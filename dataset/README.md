@@ -131,8 +131,9 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 
 - 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
   同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
-- **状态文本模板（v2）**：`marketsense.episode_state.v2`，7 行：`bar=` 序号、`px_ratio:`、
-  `vol_ratio:`、`position:`、`drawdown:`、`board_state:`（v2 新增）。
+- **状态文本模板（v3）**：`marketsense.episode_state.v3`，7 行：`bar=` 序号、`px_ratio:`、
+  `vol_ratio:`、`position:`、`drawdown:`、`board_state:`（v2 新增）；
+  行间用 `" \n "` 连接（换行符前后各一个空格，v3 起生效，转义后的 JSON 文本更易读）。
   `board_state: prev_h=<..> prev_l=<..> prev_c=<..> today_h=<..> today_l=<..>`：
   - `prev_*` = **上一交易日**日线高/低/收（来源 `{symbol}_1d.csv`，取日线文件中严格早于片段
     交易日的最后一行）÷ 片段首根开盘价；
@@ -142,18 +143,22 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
     与 `dataset board-state` 同口径）；今日开盘价不写（比值恒为 1.000000，纯冗余 token）；
   - 片段无上一交易日日线 → **跳过该片段**（不产出记录），记入审计
     `board_state.skipped_segments` 与 stderr 告警；全部片段被跳过则硬报错不写出产物。
+- **questions/candidates 文案（2026-10-02 用户拍板精简）**：唯一 choice 题 `next_action`，候选文案只留动作语义——空仓 `open_long=买入开仓 / open_short=卖出开仓 / stay_flat=继续空仓`，持仓 `close=平仓 / hold=继续持有 / reverse=反手`；成交价位由执行程序与滑点决定，不进模型输入。questions 文本由 `QUESTION_SCHEMA = marketsense.episode_question.v1` 标记（首次建立），纳入审计 `input.question_schema_sha256` 与 `run_id` 哈希；文案再演进必须换标记（产生新 run）。
 - 确定性：无墙钟/随机；同输入双跑输出 sha256 一致。
-- `run_id` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记) 的前 12 位；**状态格式变���
-  产生新 run**（旧 run 保留不覆盖）；仍**不含行情数据指纹**，因此同清单/同参数下换数据重跑会
+- `run_id` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记 + questions schema 标记) 的前 12 位；**状态/候选文案变更产生新 run**（旧 run 保留不覆盖）；
+  仍**不含行情数据指纹**，因此同清单/同参数下换数据重跑会
   **覆盖**同目录产物（README 及变更报告早期“不覆盖历史产物”的表述仅在清单/参数/schema 变化时成立）。
 - **空 split 不报错**：某 split 为空时对应 `.jsonl` 为 0 字节且 CLI 仍以 0 退出；NanoJev trainer
   要求 `train`/`dev`/`test` 非空（`NanoJev/scripts/train_pipeline_decisions.py:477-479`），
   其 `--validate-only` 也不会拦空目录（`:423-424`）——生成后需自行确认非空。
 - 本流水线已在真实片段上端到端运行：首轮（2026-10-01，无 board_state，模板 v1）
-  `run-c1cb097177a3`；v2（含 board_state 行，2026-10-02）`run-13aff088b982`
+  `run-c1cb097177a3`；v2（含 board_state 行，2026-10-02）`run-13aff088b982`；
+  同日候选文案精简 `run-b25cfd1ff370`；同日状态模板 v3（换行符前后加空格）
+  **当前产物** `run-36b037252a62`
   （DCE.v2701 2026-09 全月，train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only`
-  通过；5729 条记录的 board_state 值与 `dataset board-state` CSV 全量交叉核对一致；
+  通过；state 文本为上一 run（v2 + 精简文案）的换行符替换版（逐条一致，含 v3 schema 标记），
   真实数据双跑 sha256 一致；见主 README §5「首轮真实数据」）。
+  v2 与 v3 run 的 5729 条记录 board_state 值均与 `dataset board-state` CSV 全量交叉核对一致。
 
 契约硬门（只读执行第三方脚本）：
 
@@ -265,8 +270,8 @@ from dataset import (
   本机权限**未验证**（`U-1`）。无权限时应改用 `--bars`。
 - 本包不做实时订阅、不做模型/决策，也不定义最终模型输入格式（非目标）；
   `board-state`（盘面状态读取）是首个状态 building block（研究 building block，非最终格式）。
-- episode 训练数据生成已在真实片段上端到端运行（2026-10-01，`run-c1cb097177a3`；
-  详细结果见主 README §5「首轮真实数据」）。
+- episode 训练数据生成已在真实片段上端到端运行（2026-10-01 首轮 `run-c1cb097177a3`；
+  当前产物 `run-36b037252a62`（v3 状态 + 候选文案精简）；详细结果见主 README §5「首轮真实数据」）。
 - K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
   新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。
 - 转折点发射语义于 2026-09-26 变更（甲口径：`up`/`down` 点 `timestamp`/`bar_index` =

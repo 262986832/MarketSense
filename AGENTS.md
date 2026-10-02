@@ -68,20 +68,26 @@ MarketSense 是一个**研究型**项目，研究问题：
   模型可见价格一律用**比值**（分母 = 片段首根开盘价，6 位小数），绝对 OHLC 不得进模型输入。
   2026-10-02 用户拍板方案 A：状态模板升 v2（`render_state` 新增 board_state 行，
   prev 日线高/低/收与今日高/低随状态文本进训练记录；prev 真值源 = 1d 日线文件，
-  分母 = 片段首根开盘；缺上一交易日日线的片段跳过并告警）。
+  分母 = 片段首根开盘；缺上一交易日日线的片段跳过并告警）；同日拍板候选文案精简：
+  只留动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
+  成交价位由执行程序与滑点决定，不进模型输入（`QUESTION_SCHEMA = marketsense.episode_question.v1`）；
+  同日拍板状态模板升 v3：行间换行符前后加空格（`" \n "` 连接，转义后的 JSON 文本更易读）。
   完整语义与实现阶段冻结项见 `artifacts/nanojev-training-data/02-design/tech-design.md`。
-- **首轮真实数据（2026-10-01 生成；2026-10-02 重生成 v2 含盘面状态，均通过契约校验）**：
+- **首轮真实数据（2026-10-01 生成；2026-10-02 v2/v3 含盘面状态 + 候选文案精简，均通过契约校验）**：
   DCE.v2701（PVC）2026-09 全月 21 个交易日片段（`data/segments/sep2026.jsonl`：
   train 9-1~9-18 / dev 9-21~9-24 / test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
-  当前产物 `data/nanojev_dataset/run-13aff088b982/`（模板 v2 含 board_state 行，
-  **train 4188 / dev 886 / test 655**，全部非空，board_state 值与 board-state CSV
-  全量交叉核对一致，双跑 sha256 一致）；历史首轮 `run-c1cb097177a3/`（模板 v1）保留。
-  两者 NanoJev 原生 `--validate-only` 契约硬��均通过。`tick_size = 5` 为**用户确认值**
+  当前产物 `data/nanojev_dataset/run-36b037252a62/`（模板 v3 + 精简候选文案，
+  **train 4188 / dev 886 / test 655**，全部非空；state 文本为上一 run 的换行符替换版
+  （逐条一致，含 v3 标记），而 v2 run `run-13aff088b982/` 的 board_state 值已与
+  board-state CSV 全量交叉核对一致；当前 run 双跑 sha256 一致）；
+  历史 `run-b25cfd1ff370/`（v2 状态 + 精简文案）、`run-13aff088b982/`（v2 状态、
+  候选文案含价位括号）与首轮 `run-c1cb097177a3/`（模板 v1）保留。四者 NanoJev 原生
+  `--validate-only` 契约硬门均通过。`tick_size = 5` 为**用户确认值**
   （公开资料记载最小变动价位 1 元/吨，按用户确认执行，见 `dataset/config/symbols.local.yaml`）。
   Mac Intel 16G（无 CUDA）已完成数据通路三级 CPU 冒烟（`--self-check` / tokenize / 前向，
   全部通过）；**训练与推理入口硬性要求 CUDA，本机不可训练**（详见 `README.md` §7.4）。
 - **下一阶段核心任务**：
-  1. 在真实片段上端到端生成并校验（**已完成，2026-10-01；2026-10-02 v2 重生成**，
+  1. 在真实片段上端到端生成并校验（**已完成，2026-10-01；2026-10-02 v2/v3 + 候选文案精简**，
      见上方「首轮真实数据」；新片段清单仍按 `dataset/config/segments.example.jsonl` 格式提供）；
   2. 价格折线/episode 数据之外，**后续还要补充其它材料与数据**（具体形式**未决**，
      进入具体任务前先讨论确认，见 §8）；

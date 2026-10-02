@@ -134,7 +134,7 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 | K 线数据 | `dataset fetch`（天勤取数 → CSV + 来源指纹） | 已实现 |
 | 转折点数据 | `dataset turning-points`（离线提取 → CSV） | 已实现 |
 | 价格折线数据 | 转折点 `price` 序列（`data/turning_points/*.csv`）及其折线图（`scripts/plot_price_line.py` → PNG） | 已实现 |
-| episode 训练数据（首轮） | `dataset episode-generate`（用户片段清单 → 确定性回放 → 盈亏比规则真值标签 → 按 split 的 NanoJev JSONL + 审计；用法见 §7.2） | 已实现，并已在真实片段上端到端生成通过契约校验（首轮 2026-10-01；v2 含盘面状态 2026-10-02，见下方「首轮真实数据」） |
+| episode 训练数据（首轮） | `dataset episode-generate`（用户片段清单 → 确定性回放 → 盈亏比规则真值标签 → 按 split 的 NanoJev JSONL + 审计；用法见 §7.2） | 已实现，并已在真实片段上端到端生成通过契约校验（首轮 2026-10-01；v2/v3 含盘面状态 2026-10-02，见下方「首轮真实数据」） |
 | 盘面状态数据 | `dataset board-state`（离线：固定的前日高/低/收 + 今日开盘，动态的今日最高/最低逐根更新，全部以今日开盘价为基准的相对价；用法见 §7.2） | 已实现，并已在真实数据上运行与交叉核对（2026-10-01） |
 
 首轮 episode 训练数据流水线的语义已在 `artifacts/nanojev-training-data/01-requirement/requirement-report.md`
@@ -144,13 +144,19 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 2026-10-02 用户拍板方案 A：状态模板升为 **v2**（`render_state` 新增 board_state 行，
 昨日高/低/收与今日高/低随状态文本进入训练记录）。
 
-**首轮真实数据（2026-10-01 生成；2026-10-02 重生成 v2 含盘面状态，均通过契约校验）**：
+**首轮真实数据（2026-10-01 生成；2026-10-02 v2/v3 含盘面状态 + 候选文案精简，均通过契约校验）**：
 DCE.v2701（PVC）2026-09 全月 21 个交易日片段（`data/segments/sep2026.jsonl`：
 train 9-1~9-18 / dev 9-21~9-24 / test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
-当前产物 `data/nanojev_dataset/run-13aff088b982/`（模板 v2，**train 4188 / dev 886 / test 655**，
-7125 决策点，全部非空，board_state 值与 `dataset board-state` CSV 全量交叉核对一致，
-真实数据双跑 sha256 一致）；历史首轮 `run-c1cb097177a3/`（模板 v1，无 board_state）保留。
-两者 NanoJev 原生 `--validate-only` 契约硬门均通过。`tick_size = 5` 为**用户确认值**
+当前产物 `data/nanojev_dataset/run-36b037252a62/`（模板 v3 + 精简候选文案，
+**train 4188 / dev 886 / test 655**，7125 决策点，全部非空；state 文本为上一 run
+（v2 + 精简文案）的换行符替换版（逐条一致，含 v3 schema 标记），而 v2 run 的
+board_state 值已与 `dataset board-state` CSV 全量交叉核对一致，当前 run 确定性双跑
+sha256 一致）；历史 `run-13aff088b982/`（v2 状态、候选文案含价位括号）、
+`run-b25cfd1ff370/`（v2 状态 + 精简文案）与首轮 `run-c1cb097177a3/`（模板 v1，
+无 board_state）保留。四者 NanoJev 原生 `--validate-only` 契约硬门均通过。
+2026-10-02 用户拍板：候选文案精简为动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
+成交价位由执行程序与滑点决定，不进模型输入（`QUESTION_SCHEMA = marketsense.episode_question.v1`）。
+`tick_size = 5` 为**用户确认值**
 （公开资料记载最小变动价位 1 元/吨，按用户确认执行，已记录于 `dataset/config/symbols.local.yaml` 注释）；
 切分设计（每交易所交易日一个 episode + 时间顺序三分割）为执行时确定性默认，
 调整只需编辑片段清单重跑（`run_id` 随清单/参数/schema 变化，旧产物保留）。
@@ -436,11 +442,17 @@ episode:
   （State(T) 只用 ≤ 决策 K 线数据，无未来泄漏）；分母与 px_ratio 一致；
   片段无上一交易日日线 → 跳过该片段（审计 `board_state.skipped_segments` + stderr 告警），
   全部片段被跳过则硬报错；与 `dataset board-state` 同口径。
+- **questions/candidates 文案（2026-10-02 拍板精简）**：唯一 choice 题 `next_action`，
+  候选文案只留动作语义——空仓 `open_long=买入开仓 / open_short=卖出开仓 / stay_flat=继续空仓`，
+  持仓 `close=平仓 / hold=继续持有 / reverse=反手`；成交价位由执行程序与滑点决定，不进模型输入。
+  questions 文本由 `QUESTION_SCHEMA = marketsense.episode_question.v1` 标记（首次建立），
+  纳入审计 `input.question_schema_sha256` 与 `run_id` 哈希；文案再演进必须换标记（产生新 run）。
 - `tick_size` 按品种配置：成交价 = 决策 K 线最高 + 1 tick / 最低 − 1 tick；止损距离 = 当根振幅 + 1 tick。
 - **确定性**：无墙钟/随机；同输入两次生成输出 sha256 一致（`audit.json` 记录各文件指纹与双跑比对依据）。
-- **`run_id` 组成**：`run-<12 位十六进制>` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记)。
-  **状态格式变更产生新 run**（旧产物保留）；行情数据本身变化仍不会改变 `run_id`：
-  同清单/同参数下换数据重跑会覆盖同目录产物（若要保留旧产物，请改 `--output-dir` 或用不同清单）。
+- **`run_id` 组成**：`run-<12 位十六进制>` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记
+  + questions schema 标记)。**状态/候选文案变更产生新 run**（旧产物保留）；行情数据本身变化
+  仍不会改变 `run_id`：同清单/同参数下换数据重跑会覆盖同目录产物（若要保留旧产物，
+  请改 `--output-dir` 或用不同清单）。
 - 生成后可用 NanoJev 原生校验器作契约硬门（只读执行第三方脚本）：
   `python3 NanoJev/scripts/train_pipeline_decisions.py --validate-only --input <run_dir>`。
 
@@ -450,9 +462,10 @@ episode:
   而 NanoJev trainer 要求 `train`/`dev`/`test` 非空（`NanoJev/scripts/train_pipeline_decisions.py:477-479`），
   且其 `--validate-only` 对空目录也不会拦截（`:423-424`）。生成后请自行确认非空。
 - 2026-10-01 已在真实片段上端到端运行（DCE.v2701，2026-09 全月，首轮 `run-c1cb097177a3`）；
-  2026-10-02 模板 v2（含 board_state 行）重生成 `run-13aff088b982`，
-  train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only` 通过，
-  board_state 值与 `dataset board-state` CSV 全量交叉核对一致；
+  2026-10-02 模板 v2（含 board_state 行）重生成 `run-13aff088b982`；同日候选文案精简
+  生成 `run-b25cfd1ff370`；同日状态模板 v3（行间换行符前后加空格）生成**当前产物**
+  `run-36b037252a62`，train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only` 通过；
+  v2/v3 run 的 board_state 值与 `dataset board-state` CSV 全量交叉核对一致；
   「生成后自行确认非空」的提醒仍适用于任何新清单。
 
 > 语义细节（冻结的标签与执行规则、实现阶段冻结项及默认值）见
@@ -579,7 +592,7 @@ tokenize/前向冒烟或未来训练（CUDA 机）时 `from_pretrained` 直接�
 **真实训练机（CUDA）应按 `requirements-toy.txt` 安装固定版本**；数据产物无需任何改动：
 
 ```bash
-python3 NanoJev/scripts/train_pipeline_decisions.py --input data/nanojev_dataset/run-13aff088b982
+python3 NanoJev/scripts/train_pipeline_decisions.py --input data/nanojev_dataset/run-36b037252a62
 ```
 
 ---
@@ -596,6 +609,6 @@ python3 NanoJev/scripts/train_pipeline_decisions.py --input data/nanojev_dataset
 | 流程产物（转折点契约变更） | `artifacts/turning-point-updown-price/` | 2026-09-25 转折点契约变更的 DevFlow 产物 |
 | 流程产物（价格折线图脚本） | `artifacts/plot-turning-points-price/` | `scripts/plot_price_line.py` 的 DevFlow 产物（用法见 §7.3） |
 | 流程产物（全量取数） | `artifacts/fetch-v2701-max-klines/` | DCE.v2701 全量 1m/1d 取数（2026-10-01；含区间模式需专业版的实测记录） |
-| 流程产物（episode 数据） | `artifacts/nanojev-episode-sep2026/` | 2026-09 真实片段 episode 数据生成与契约校验（首轮 run-c1cb097177a3；v2 含盘面状态见 §5「首轮真实数据」） |
+| 流程产物（episode 数据） | `artifacts/nanojev-episode-sep2026/` | 2026-09 真实片段 episode 数据生成与契约校验（首轮 run-c1cb097177a3；v2/v3 含盘面状态见 §5「首轮真实数据」） |
 | 流程产物（CPU 冒烟） | `artifacts/nanojev-smoke-intel-mac/` | Mac Intel 数据通路三级冒烟验证与 CUDA 硬约束结论 |
 

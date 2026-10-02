@@ -46,7 +46,7 @@ GOLD_LABEL_KINDS = frozenset(
 #: 本轮实现的冻结口径（写入审计文件，便于复算时对照；v2 起新增 board_state）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v2:decision_bar_only+board_state",
+    "state_template": "marketsense.episode_state.v3:decision_bar_only+board_state",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "ratio_units:initial_equity=1.0,1_lot=1_notional,no_multiplier,no_fees",
@@ -55,6 +55,7 @@ FROZEN_DECISIONS: Mapping[str, str] = {
     "reversal_condition_2": "stop_reached_first_or_scan_end_without_exceeding_current_bar",
     "board_state_prev_day": "daily_file_1d_prev_trading_day_over_segment_first_open",
     "board_state_today": "segment_bars_cumulative_extrema_through_decision_bar",
+    "question_template": "marketsense.episode_question.v1:concise_action_labels",
 }
 
 

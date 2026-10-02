@@ -11,13 +11,16 @@
   成交量/持仓量归一化 + 当前仓位 + 账户回撤幅度 + 盘面状态 board_state 行）；
 * ``questions`` 恰好一个 choice 题 ``next_action``：空仓
   ``{open_long, open_short, stay_flat}`` / 持仓 ``{close, hold, reverse}``；
+  候选文案只留动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
+  成交价位由执行程序与滑点决定，不进模型输入（2026-10-02 用户拍板精简）；
 * ``gold`` = 规则真值动作 ID + ``gold_label_kind: "deterministic_truth"``
   （首轮不发 ``gold_probs``：NanoJev 校验器允许硬 gold 无概率，trainer 自动派生 one-hot）。
 
-**状态序列化模板（实现阶段冻结项 2；v2 起新增 board_state 行，2026-10-02 用户拍板方案 A）**
+**状态序列化模板（实现阶段冻结项 2；v2 起新增 board_state 行，2026-10-02 用户拍板方案 A；
+v3 起行间换行符前后加空格，转义后的 JSON 文本更易读，同日拍板）**
 
 ```text
-marketsense.episode_state.v2
+marketsense.episode_state.v3
 bar=<片段内 0 基序号>
 px_ratio: o=<..> h=<..> l=<..> c=<..>
 vol_ratio: v=<..> oi_open=<..> oi_close=<..>
@@ -25,6 +28,8 @@ position: flat | long entry=<..> stop=<..> | short entry=<..> stop=<..>
 drawdown: <..>
 board_state: prev_h=<..> prev_l=<..> prev_c=<..> today_h=<..> today_l=<..>
 ```
+
+（行与行之间用 ``" \n "`` 连接，即换行符前后各一个空格。）
 
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
@@ -92,23 +97,27 @@ from dataset.market_episode.segments import (
     validate_segments,
 )
 
-#: 状态文本的 schema 版本标记（格式演进必须换标记；v2 新增 board_state 行）
-STATE_SCHEMA = "marketsense.episode_state.v2"
+#: 状态文本的 schema 版本标记（格式演进必须换标记；v2 新增 board_state 行，
+#: v3 行间换行符前后加空格——转义后的 JSON 文本更易读，2026-10-02 用户拍板）
+STATE_SCHEMA = "marketsense.episode_state.v3"
+#: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
+QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
 QUESTION_ID = "next_action"
 #: 题目说明（确定性固定文案）
 QUESTION_INSTRUCTIONS = "选择下一分钟要执行的动作（gold 为确定性规则真值）。"
-#: 空仓候选（动作集合依仓位而变：模型必须知晓仓位）
+#: 空仓候选（动作集合依仓位而变：模型必须知晓仓位）。
+#: 文案只留动作语义；成交价位由执行程序与滑点决定（2026-10-02 用户拍板精简）
 FLAT_CRITERIA: Mapping[str, str] = {
-    ACTION_OPEN_LONG: "开多（买入开仓，按决策 K 线最高 + 1 tick 成交）",
-    ACTION_OPEN_SHORT: "开空（卖出开仓，按决策 K 线最低 − 1 tick 成交）",
+    ACTION_OPEN_LONG: "买入开仓",
+    ACTION_OPEN_SHORT: "卖出开仓",
     ACTION_STAY_FLAT: "继续空仓",
 }
-#: 持仓候选
+#: 持仓候选（文案同上：只留动作语义，价位/执行细节不进模型输入）
 HELD_CRITERIA: Mapping[str, str] = {
-    ACTION_CLOSE: "平仓（多头按决策 K 线最低 − 1 tick 卖出，空头对称）",
+    ACTION_CLOSE: "平仓",
     ACTION_HOLD: "继续持有",
-    ACTION_REVERSE: "反手（同一决策点先平旧仓、再开反向 1 手）",
+    ACTION_REVERSE: "反手",
 }
 #: gold 的依据类型（冻结首轮形式）
 GOLD_LABEL_KIND = "deterministic_truth"
@@ -181,7 +190,7 @@ def render_state(
             f"position: {position.direction} entry={format_ratio_value(position.entry_ratio, price_precision)}"
             f" stop={format_ratio_value(position.stop_ratio, price_precision)}"
         )
-    return "\n".join(
+    return " \n ".join(
         (
             STATE_SCHEMA,
             f"bar={bar.index}",
@@ -420,10 +429,12 @@ def generate_dataset(
         "symbols_sha256": _sha256_text(symbols_text),
         "params_sha256": _sha256_text(params_text),
         "state_schema_sha256": _sha256_text(STATE_SCHEMA),
+        "question_schema_sha256": _sha256_text(QUESTION_SCHEMA),
     }
-    # run_id 把 STATE_SCHEMA 纳入哈希输入：状态格式变更产生新 run（旧 run 保留不覆盖）
+    # run_id 把 STATE_SCHEMA / QUESTION_SCHEMA 纳入哈希输入：状态或候选文案变更产生
+    # 新 run（旧 run 保留不覆盖）
     run_id = "run-" + _sha256_text(
-        "|".join((segments_text, symbols_text, params_text, STATE_SCHEMA))
+        "|".join((segments_text, symbols_text, params_text, STATE_SCHEMA, QUESTION_SCHEMA))
     )[:12]
 
     split_texts: dict[str, str] = {}
@@ -473,6 +484,7 @@ __all__ = [
     "HELD_CRITERIA",
     "QUESTION_ID",
     "QUESTION_INSTRUCTIONS",
+    "QUESTION_SCHEMA",
     "STATE_SCHEMA",
     "BoardStateValues",
     "GenerationResult",

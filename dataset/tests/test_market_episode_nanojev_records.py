@@ -18,6 +18,8 @@ from dataset.market_episode.labels import (
     ACTION_CLOSE,
     ACTION_HOLD,
     ACTION_OPEN_LONG,
+    ACTION_OPEN_SHORT,
+    ACTION_REVERSE,
     ACTION_STAY_FLAT,
     DecisionPoint,
 )
@@ -121,12 +123,12 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
     )
 
     assert state == (
-        f"{STATE_SCHEMA}\n"
-        "bar=0\n"
-        "px_ratio: o=1.000000 h=1.002000 l=0.998000 c=1.000000\n"
-        "vol_ratio: v=1.000000 oi_open=1.000000 oi_close=1.000000\n"
-        "position: flat\n"
-        "drawdown: 0.000000\n"
+        f"{STATE_SCHEMA} \n "
+        "bar=0 \n "
+        "px_ratio: o=1.000000 h=1.002000 l=0.998000 c=1.000000 \n "
+        "vol_ratio: v=1.000000 oi_open=1.000000 oi_close=1.000000 \n "
+        "position: flat \n "
+        "drawdown: 0.000000 \n "
         "board_state: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000"
         " today_h=1.002000 today_l=0.998000"
     )
@@ -145,12 +147,12 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
     )
 
     assert state == (
-        f"{STATE_SCHEMA}\n"
-        "bar=1\n"
-        "px_ratio: o=1.000000 h=1.010000 l=1.000500 c=1.008000\n"
-        "vol_ratio: v=1.000000 oi_open=1.002000 oi_close=1.001996\n"
-        "position: short entry=0.998500 stop=1.000500\n"
-        "drawdown: 0.001500\n"
+        f"{STATE_SCHEMA} \n "
+        "bar=1 \n "
+        "px_ratio: o=1.000000 h=1.010000 l=1.000500 c=1.008000 \n "
+        "vol_ratio: v=1.000000 oi_open=1.002000 oi_close=1.001996 \n "
+        "position: short entry=0.998500 stop=1.000500 \n "
+        "drawdown: 0.001500 \n "
         "board_state: prev_h=2.010000 prev_l=1.980000 prev_c=1.990000"
         " today_h=1.010000 today_l=0.999500"
     )
@@ -190,7 +192,7 @@ def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar
 
     for absolute in ("1000.000000", "1010.000000", "999.500000", "1008.000000"):
         assert absolute not in state
-    assert len(state.splitlines()) == 7  # 模板 v2：7 行（含 board_state）
+    assert len(state.splitlines()) == 7  # 模板 v3：7 行（含 board_state；行间连接符为 " \n "）
 
 
 # --------------------------------------------------------------------------- #
@@ -247,6 +249,20 @@ def test_build_record_maps_ids_split_questions_and_gold() -> None:
     assert flat_record["questions"][QUESTION_ID]["type"] == "choice"
     assert set(flat_record["questions"][QUESTION_ID]["criteria"]) == set(FLAT_CRITERIA)
     assert set(holding_record["questions"][QUESTION_ID]["criteria"]) == set(HELD_CRITERIA)
+    # 候选文案只留动作语义：无括号、无成交价位细节（2026-10-02 用户拍板精简）
+    assert flat_record["questions"][QUESTION_ID]["criteria"] == {
+        ACTION_OPEN_LONG: "买入开仓",
+        ACTION_OPEN_SHORT: "卖出开仓",
+        ACTION_STAY_FLAT: "继续空仓",
+    }
+    assert holding_record["questions"][QUESTION_ID]["criteria"] == {
+        ACTION_CLOSE: "平仓",
+        ACTION_HOLD: "继续持有",
+        ACTION_REVERSE: "反手",
+    }
+    for question in (flat_record["questions"], holding_record["questions"]):
+        for text in question[QUESTION_ID]["criteria"].values():
+            assert "tick" not in text and "（" not in text
     assert flat_record["gold"] == {QUESTION_ID: ACTION_OPEN_LONG}
     assert flat_record["gold_label_kind"] == {QUESTION_ID: "deterministic_truth"}
     assert flat_record["state"].startswith(STATE_SCHEMA)
@@ -515,10 +531,11 @@ def test_generate_dataset_skips_segments_without_prev_daily_and_reports(
 
 
 def test_generate_dataset_state_schema_changes_run_id(tmp_path: Path) -> None:
-    """STATE_SCHEMA 纳入 run_id 哈希：状态格式变更产生新 run（旧 run 保留不覆盖）。"""
+    """STATE_SCHEMA / QUESTION_SCHEMA 纳入 run_id 哈希：状态或候选文案变更产生新 run。"""
     workspace, first = _generate(tmp_path / "a")
     assert first.run_id.startswith("run-")
     assert first.audit["input"]["state_schema_sha256"]
+    assert first.audit["input"]["question_schema_sha256"]
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
@@ -529,6 +546,15 @@ def test_generate_dataset_state_schema_changes_run_id(tmp_path: Path) -> None:
 
     assert other.run_id != first.run_id
     assert workspace.data_dir.is_dir()
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            "dataset.market_episode.nanojev_records.QUESTION_SCHEMA",
+            "marketsense.episode_question.vX-test",
+        )
+        _, third = _generate(tmp_path / "c")
+
+    assert third.run_id not in (first.run_id, other.run_id)
 
 
 @pytest.mark.xfail(

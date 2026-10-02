@@ -66,16 +66,16 @@ MarketSense/
 ├── .gitignore           # 忽略数据、模型产物、密钥等
 ├── README.md            # 本文件
 ├── AGENTS.md            # Agent 工作规范
-├── dataset/             # ▶ 已实现：数据准备子应用（天勤 K 线 + 转折点 + episode 训练数据），用法见 §7.2
+├── dataset/             # ▶ 已实现：数据准备子应用（天勤 K 线 + 转折点 + episode 训练数据 + 盘面状态），用法见 §7.2
 ├── scripts/             # ▶ 已实现：辅助脚本（转折点价格折线图），用法见 §7.3
 ├── artifacts/           # DevFlow 流程产物（见 §8）
 └── NanoJev/             # 第三方决策模型项目（含独立 .git），性质见下
 ```
 
 - **`dataset/` 是 MarketSense 自身的第一块已实现代码**：数据准备子应用
-  （天勤 K 线取数 → 标准化落盘 → 转折点提取 → episode 训练数据生成；
+  （天勤 K 线取数 → 标准化落盘 → 转折点提取 → episode 训练数据生成 → 盘面状态读取；
   `dataset/market_episode/` 为 episode 流水线，含机制/标签分层）；
-  280 个离线测试通过 + 1 个 xfailed（已知缺陷最小复现），2026-09-30 实测，**详细用法见 §7.2**。
+  300 个离线测试通过 + 1 个 xfailed（已知缺陷最小复现），2026-10-01 实测，**详细用法见 §7.2**。
 - 除 `dataset/` 与 `scripts/` 外，MarketSense 自身的特征 / 状态 / 市场描述 /
   模型训练与评估等**尚未建立**。
 - `NanoJev/` 是**第三方决策模型项目**（0.6B 并行决策模型，Qwen3-0.6B 主干 + 决策头，
@@ -135,6 +135,7 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 | 转折点数据 | `dataset turning-points`（离线提取 → CSV） | 已实现 |
 | 价格折线数据 | 转折点 `price` 序列（`data/turning_points/*.csv`）及其折线图（`scripts/plot_price_line.py` → PNG） | 已实现 |
 | episode 训练数据（首轮） | `dataset episode-generate`（用户片段清单 → 确定性回放 → 盈亏比规则真值标签 → 按 split 的 NanoJev JSONL + 审计；用法见 §7.2） | 已实现，并已在真实片段上端到端生成通过契约校验（2026-10-01，见下方「首轮真实数据」） |
+| 盘面状态数据 | `dataset board-state`（离线：固定的前日高/低/收 + 今日开盘，动态的今日最高/最低逐根更新，全部以今日开盘价为基准的相对价；用法见 §7.2） | 已实现，并已在真实数据上运行与交叉核对（2026-10-01） |
 
 首轮 episode 训练数据流水线的语义已在 `artifacts/nanojev-training-data/01-requirement/requirement-report.md`
 （需求）与 `artifacts/nanojev-training-data/02-design/tech-design.md`（设计）中冻结：
@@ -250,6 +251,7 @@ python -m dataset fetch          --symbol S [--symbol S2 ...] --period P (--bars
 python -m dataset turning-points --symbol S [--symbol S2 ...] --period P [--initial-direction auto|up|down] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 python -m dataset prepare        --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--initial-direction ...] [--output-dir DIR] [--config FILE]
 python -m dataset episode-generate --segments FILE [--output-dir DIR] [--config FILE]
+python -m dataset board-state    --symbol S [--symbol S2 ...] [--period 1m] [--start DATE --end DATE] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 ```
 
 | 子命令 | 是否联网 | 作用 |
@@ -258,6 +260,7 @@ python -m dataset episode-generate --segments FILE [--output-dir DIR] [--config 
 | `turning-points` | 否 | 读取已落盘 K 线 → 提取并落盘转折点 |
 | `prepare` | 是 | `fetch` + 转折点，一步完成 |
 | `episode-generate` | 否 | 片段清单 + 已落盘 1 分钟 K 线 → 按 split 的 NanoJev JSONL + 审计 |
+| `board-state` | 否 | 读取已落盘 1m/1d K 线 → 盘面状态 CSV + sidecar |
 
 参数要点：
 
@@ -440,6 +443,41 @@ episode:
 
 > 语义细节（冻结的标签与执行规则、实现阶段冻结项及默认值）见
 > `artifacts/nanojev-training-data/02-design/tech-design.md`；完整契约见 `dataset/README.md`。
+
+#### 8. `board-state`：盘面状态读取
+
+离线读取已落盘 1 分钟 + 日线 K 线，按交易日窗口逐根维护盘面状态（2026-10-01 新增，
+研究 building block，**非最终模型输入格式**）：
+
+```bash
+# 前置：1m 与 1d K 线均已落盘
+python -m dataset board-state --symbol DCE.v2701 --start 2026-09-01 --end 2026-09-30
+# 全部交易日（不限区间）
+python -m dataset board-state --symbol DCE.v2701
+```
+
+语义（确定性、无未来数据泄漏）：
+
+- **窗口**：交易日 `T` 的窗口 = 归属 `T` 的夜盘 K 线（前一历日 21:00 起，周五夜盘 → 周一）
+  + `T` 的日盘 K 线（≤ 14:59），与片段清单同口径；交易日 = 存在日盘 K 线的日历日。
+- **固定状态**：`prev_day_high` / `prev_day_low` / `prev_day_close`（上一交易日日线 OHLC，
+  来源 1d 落盘）、`today_open`（窗口首根开盘价 = 日线开盘口径）。
+- **动态状态**：`today_high` / `today_low` = 已处理 K 线高/低点累计 max/min
+  （`State(T)` 只用 ≤ T 的 K 线）；初始（未处理前）= `today_open`（平盘先验）。
+- **相对价**：六列一律 = 值 / `today_open`（6 位小数），`today_open` 恒为 `1.000000`；
+  绝对 OHLC 只留在 `data/ohlcv/` 原始层。
+
+输出：`data/board_state/{symbol}_board_state.csv` + sidecar（每根 K 线一行；列
+`trade_date, timestamp, bar_index, prev_day_high, prev_day_low, prev_day_close, today_open, today_high, today_low`；
+sidecar 含语义说明、1m/1d 来源指纹、交易日与跳过日清单；无墙钟，同输入 → 同字节输出）。
+
+已知边界：需先 `fetch --period 1m`/`1d` 落盘（缺日线 exit 1）；1m 数据起点首个交易日无前置
+交易日 → 跳过并 stderr 告警；上一交易日在 1m 序列中存在但日线缺该日 → 报错（数据不一致）。
+
+2026-10-01 实测（DCE.v2701，2026-09 全月）：21 个交易日 7125 行；每日末行 `today_high`/`today_low`
+与当日日线高/低（比值）一致、`prev_day_*` 与上一交易日日线一致、`today_open` 恒为 1；
+窗口首根抽查（9-1 = 8-31 21:00 夜盘、9-21 = 9-18 周五夜盘、9-28 = 09:00 中秋无夜盘）符合归属规则；
+两次运行 CSV+sidecar 字节一致。
 
 ### 7.3 `scripts/plot_price_line.py`：转折点价格折线图（快速可视化）
 

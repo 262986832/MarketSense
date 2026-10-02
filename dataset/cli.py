@@ -1,12 +1,13 @@
 """dataset 命令行入口（``python -m dataset``）。
 
-四个子命令：
+五个子命令：
 
 ```text
 fetch          在线取数 → 校验 → 落盘 K 线 CSV + 来源指纹 sidecar
 turning-points 离线读取已落盘 K 线 → 转折点 CSV + 窗口 sidecar（不联网）
 prepare        fetch 后接转折点提取
 episode-generate  片段清单 + 已落盘 1 分钟 K 线 → 按 split 的 NanoJev JSONL + 审计
+board-state    离线读取已落盘 1m/1d K 线 → 盘面状态 CSV + sidecar（不联网）
 ```
 
 退出码：``0`` 成功；``1`` 运行期失败（配置/凭证/取数/校验/读取）；``2`` 用法错误
@@ -20,6 +21,11 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from dataset.board_state import (
+    BOARD_STATE_SUBDIR,
+    build_board_states,
+    save_board_states,
+)
 from dataset.config import DatasetConfig, load_dataset_config
 from dataset.errors import DatasetError
 from dataset.market_episode import (
@@ -37,7 +43,7 @@ from dataset.provider import (
     TianQinProvider,
     validate_data_length,
 )
-from dataset.storage import load_ohlcv, save_ohlcv
+from dataset.storage import load_ohlcv, ohlcv_filename, save_ohlcv
 from dataset.turning_points import (
     INITIAL_DIRECTION_MODES,
     build_window_meta,
@@ -55,11 +61,15 @@ EXIT_USAGE = 2
 OHLCV_SUBDIR = "ohlcv"
 TURNING_POINTS_SUBDIR = "turning_points"
 
+#: 盘面状态子命令唯一支持的周期（窗口语义按 1m 交易日口径定义）
+BOARD_STATE_PERIOD = "1m"
+
 #: 子命令名（argparse ``dest=command`` 取值）
 COMMAND_FETCH = "fetch"
 COMMAND_TURNING_POINTS = "turning-points"
 COMMAND_PREPARE = "prepare"
 COMMAND_EPISODE_GENERATE = "episode-generate"
+COMMAND_BOARD_STATE = "board-state"
 
 
 class UsageError(Exception):
@@ -142,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{fetch,turning-points,prepare,episode-generate}",
+        metavar="{fetch,turning-points,prepare,episode-generate,board-state}",
     )
 
     fetch = subparsers.add_parser(
@@ -176,6 +186,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="产物根目录（默认取配置 episode.output_dir，产物落在 <DIR>/<run_id>/）",
     )
     episode.add_argument("--config", dest="config", metavar="FILE", help="配置文件（YAML）")
+
+    board = subparsers.add_parser(
+        COMMAND_BOARD_STATE,
+        help="离线读取已落盘 1m/1d K 线 → 盘面状态 CSV + sidecar（不联网）",
+    )
+    board.add_argument(
+        "--symbol",
+        dest="symbols",
+        action="append",
+        required=True,
+        metavar="S",
+        help="合约代码（可重复，如 DCE.v2701）",
+    )
+    board.add_argument(
+        "--period",
+        default=BOARD_STATE_PERIOD,
+        metavar="P",
+        help=f"K 线周期（目前仅支持 {BOARD_STATE_PERIOD}，窗口语义按 1m 交易日口径定义）",
+    )
+    board.add_argument(
+        "--start",
+        metavar="DATE",
+        help="只生成 ≥ 该交易所交易日的状态（ISO 日期，与 --end 同时给出）",
+    )
+    board.add_argument(
+        "--end",
+        metavar="DATE",
+        help="只生成 ≤ 该交易所交易日的状态（ISO 日期，与 --start 同时给出）",
+    )
+    board.add_argument(
+        "--data-dir",
+        dest="data_dir",
+        metavar="DIR",
+        help=f"K 线输入目录（默认 <output_dir>/{OHLCV_SUBDIR}）",
+    )
+    board.add_argument(
+        "--output-dir",
+        dest="output_dir",
+        metavar="DIR",
+        help="产物根目录（默认取配置 output_dir）",
+    )
+    board.add_argument("--config", dest="config", metavar="FILE", help="配置文件（YAML）")
     return parser
 
 
@@ -292,6 +344,62 @@ def _run_episode_generate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _run_board_state(args: argparse.Namespace) -> int:
+    """``board-state``：离线构建盘面状态序列（不联网、不触天勤凭证）。"""
+    if args.period != BOARD_STATE_PERIOD:
+        raise UsageError(
+            f"board-state 目前只支持 --period {BOARD_STATE_PERIOD}（窗口语义按 1m 交易日口径定义）"
+        )
+    if (args.start is None) != (args.end is None):
+        raise UsageError("--start 与 --end 必须同时提供（或都不提供）")
+    start = end = None
+    if args.start is not None:
+        start = parse_date_bound(args.start, "start").date()
+        end = parse_date_bound(args.end, "end").date()
+        if start > end:
+            raise UsageError(f"--start 不能晚于 --end: {start} > {end}")
+    config = load_dataset_config(args.config)
+    base_dir = Path(args.output_dir) if args.output_dir else config.output_dir
+    data_dir = (
+        Path(args.data_dir) if getattr(args, "data_dir", None) else ohlcv_dir(base_dir)
+    )
+    for symbol in args.symbols:
+        minute = load_ohlcv(symbol, BOARD_STATE_PERIOD, data_dir=data_dir)
+        validate_ohlcv(minute.df).raise_if_invalid()
+        daily_path = data_dir / ohlcv_filename(symbol, "1d")
+        if not daily_path.is_file():
+            raise DatasetError(
+                f"盘面状态需要日线数据（前日高/低/收来源）: {daily_path}；"
+                "请先 `python -m dataset fetch --period 1d` 落盘日线"
+            )
+        daily = load_ohlcv(symbol, "1d", data_dir=data_dir)
+        validate_ohlcv(daily.df).raise_if_invalid()
+        result = build_board_states(
+            minute.df, daily.df, symbol=symbol, start=start, end=end
+        )
+        if result.unassigned_bars:
+            print(
+                f"警告：{symbol} 有 {result.unassigned_bars} 根 K 线时间在 15:00–20:59，"
+                "不属于任何交易窗口，已排除（请确认数据时段是否预期）",
+                file=sys.stderr,
+            )
+        for note in result.skipped_days:
+            print(f"警告：{symbol} 跳过交易日 {note}", file=sys.stderr)
+        path = save_board_states(
+            result,
+            symbol=symbol,
+            period=BOARD_STATE_PERIOD,
+            output_dir=base_dir,
+            minute_path=minute.path,
+            daily_path=daily.path,
+        )
+        print(
+            f"已生成盘面状态：{path}（{len(result.df)} 行，"
+            f"{len(result.trade_days)} 个交易日）"
+        )
+    return EXIT_OK
+
+
 def _run(
     args: argparse.Namespace, *, api_factory: Callable[[DatasetConfig], Any] | None
 ) -> int:
@@ -299,6 +407,9 @@ def _run(
     if args.command == COMMAND_EPISODE_GENERATE:
         # 该子命令不涉及天勤凭证与窗口参数，先于周期/窗口校验分发
         return _run_episode_generate(args)
+    if args.command == COMMAND_BOARD_STATE:
+        # 该子命令不涉及天勤凭证，先于周期/窗口校验分发
+        return _run_board_state(args)
     resolve_duration_seconds(args.period)  # 未知周期 → UnknownPeriodError（含支持列表）
     if args.command == COMMAND_TURNING_POINTS:  # 离线路径无窗口参数
         bars: int | None = None

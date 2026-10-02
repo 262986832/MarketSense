@@ -36,9 +36,10 @@ python -m dataset fetch          --symbol S [--symbol S2 ...] --period P (--bars
 python -m dataset turning-points --symbol S [--symbol S2 ...] --period P [--initial-direction auto|up|down] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 python -m dataset prepare        --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--initial-direction ...] [--output-dir DIR] [--config FILE]
 python -m dataset episode-generate --segments FILE [--output-dir DIR] [--config FILE]
+python -m dataset board-state    --symbol S [--symbol S2 ...] [--period 1m] [--start DATE --end DATE] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 ```
 
-- `--period` 必填，仅支持 `1m, 5m, 15m, 1h, 1d`；非法值 stderr 输出支持列表并非 0 退出。
+- `--period` 必填，仅支持 `1m, 5m, 15m, 1h, 1d`（`board-state` 例外：可选，仅支持 `1m`）；非法值 stderr 输出支持列表并非 0 退出。
 - `--bars` 与 `--start/--end` **互斥**，且必须给其一；`--bars` 取值范围 `1..8964`。
   实现上会向天勤多取 1 根以凑满 N 根**已收盘** K 线；取上限 `8964` 时无法多取，
   末根未收盘被剔除后实际至多返回 `8963` 根 —— 此时 CLI 会在 stderr 输出告警（不静默）。
@@ -64,6 +65,41 @@ python -m dataset prepare --symbol DCE.v2701 --period 1d --bars 200
 # episode 训练数据生成（离线；需片段清单 + symbols.local.yaml 的 tick_size）
 python -m dataset episode-generate --segments data/segments/my_segments.jsonl
 ```
+
+# episode 训练数据生成（离线；需片段清单 + symbols.local.yaml 的 tick_size）
+python -m dataset episode-generate --segments data/segments/my_segments.jsonl
+
+# 盘面状态读取（离线；需已落盘 1m + 1d K 线）
+python -m dataset board-state --symbol DCE.v2701 --start 2026-09-01 --end 2026-09-30
+```
+
+### `board-state`：盘面状态读取
+
+离线读取已落盘 1 分钟 + 日线 K 线，按交易日窗口逐根维护盘面状态（研究 building block，
+**非最终模型输入格式**）：
+
+- **窗口**：交易日 `T` 的窗口 = 归属 `T` 的夜盘 K 线 + `T` 的日盘 K 线；夜盘 K 线
+  （time-of-day ≥ 21:00）归属其日历日之后的**下一个交易日**（周五夜盘 → 周一）；
+  交易日 = 存在日盘 K 线（< 15:00）的日历日。与片段清单（`sep2026.jsonl`）同口径。
+- **固定状态**：`prev_day_high` / `prev_day_low` / `prev_day_close`（上一交易日日线 OHLC，
+  来源 1d 落盘文件）与 `today_open`（窗口首根开盘价 = 日线开盘口径）。
+- **动态状态**：`today_high` / `today_low` = 已处理 K 线高/低点的累计 max/min
+  （`State(T)` 只用 ≤ T 的 K 线，无未来泄漏）。
+- **相对价**：六个价格字段一律 = 值 / `today_open`（6 位小数），`today_open` 恒为 `1.000000`；
+  绝对 OHLC 只留在 `data/ohlcv/` 原始层。
+
+输出：`data/board_state/{symbol}_board_state.csv` + sidecar
+（列：`trade_date, timestamp, bar_index, prev_day_high, prev_day_low, prev_day_close, today_open, today_high, today_low`；
+每根 K 线一行，sidecar 含语义说明与 1m/1d 来源指纹，无墙钟，同输入 → 同字节输出）。
+
+前置与边界：
+
+- 需先 `fetch --period 1m` 与 `fetch --period 1d` 落盘；缺日线报错（exit 1）。
+- 1m 数据起点的首个交易日无前置交易日 → 跳过 → stderr 告警（不静默）。
+- 上一交易日在 1m 序列中存在但日线缺该日 → 报错（1m/1d 数据不一致，请重新落盘日线）。
+- 2026-10-01 实测：DCE.v2701 2026-09 全月 21 个交易日 7125 行；每日末行
+  `today_high`/`today_low` 与当日日线高/低（比值）一致、`prev_day_*` 与上一交易日日线一致、
+  `today_open` 恒为 1；两次运行 CSV+sidecar 字节一致。
 
 ### `episode-generate`：episode 训练数据生成
 
@@ -101,7 +137,9 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 - **空 split 不报错**：某 split 为空时对应 `.jsonl` 为 0 字节且 CLI 仍以 0 退出；NanoJev trainer
   要求 `train`/`dev`/`test` 非空（`NanoJev/scripts/train_pipeline_decisions.py:477-479`），
   其 `--validate-only` 也不会拦空目录（`:423-424`）——生成后需自行确认非空。
-- 本流水线**尚未**在真实片段上端到端运行（等用户交付片段清单与 1 分钟数据）。
+- 本流水线已在真实片段上端到端运行（2026-10-01，DCE.v2701 2026-09 全月，
+  `run-c1cb097177a3`，train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only` 通过；
+  见主 README §5「首轮真实数据」）。
 
 契约硬门（只读执行第三方脚本）：
 
@@ -211,7 +249,10 @@ from dataset import (
 
 - 历史区间模式（`--start/--end`）依赖 `get_kline_data_series`，需天勤专业版权限；
   本机权限**未验证**（`U-1`）。无权限时应改用 `--bars`。
-- 本包不做实时订阅、不做模型/特征/状态/决策，也不定义最终模型输入格式（非目标）。
+- 本包不做实时订阅、不做模型/决策，也不定义最终模型输入格式（非目标）；
+  `board-state`（盘面状态读取）是首个状态 building block（研究 building block，非最终格式）。
+- episode 训练数据生成已在真实片段上端到端运行（2026-10-01，`run-c1cb097177a3`；
+  详细结果见主 README §5「首轮真实数据」）。
 - K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
   新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。
 - 转折点发射语义于 2026-09-26 变更（甲口径：`up`/`down` 点 `timestamp`/`bar_index` =

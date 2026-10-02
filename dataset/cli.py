@@ -185,6 +185,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="产物根目录（默认取配置 episode.output_dir，产物落在 <DIR>/<run_id>/）",
     )
+    episode.add_argument(
+        "--daily-turning-points-dir",
+        dest="daily_turning_points_dir",
+        metavar="DIR",
+        help="日线折点目录（v5 日线行 trend 四值数据源；默认 <data_dir>/../turning_points）",
+    )
     episode.add_argument("--config", dest="config", metavar="FILE", help="配置文件（YAML）")
 
     board = subparsers.add_parser(
@@ -329,12 +335,20 @@ def _run_episode_generate(args: argparse.Namespace) -> int:
     segments = load_segments(Path(args.segments))
     symbols = load_symbols_config(config.symbols_path)
     output_dir = Path(args.output_dir) if args.output_dir else config.output_dir
+    # v5 日线折点目录：显式参数优先，否则取 <data_dir>/../turning_points
+    # （turning-points 子命令落盘布局； episode data_dir 默认 <base>/ohlcv）
+    daily_turning_points_dir = (
+        Path(args.daily_turning_points_dir)
+        if args.daily_turning_points_dir
+        else turning_points_dir(Path(config.data_dir).parent)
+    )
     result = generate_dataset(
         segments,
         symbols=symbols,
         data_dir=config.data_dir,
         params=config.params,
         output_dir=output_dir,
+        daily_turning_points_dir=daily_turning_points_dir,
     )
     counts = ", ".join(
         f"{split}={result.record_counts[split]}" for split in SPLIT_ROLES
@@ -344,6 +358,14 @@ def _run_episode_generate(args: argparse.Namespace) -> int:
     if result.board_state_skipped:
         print(
             f"共跳过 {len(result.board_state_skipped)} 个片段（缺上一交易日日线，详见 stderr）",
+            file=sys.stderr,
+        )
+    for segment_id, reason in sorted(result.trend_extreme_skipped.items()):
+        print(f"[trend-extreme 跳过片段] {segment_id}: {reason}", file=sys.stderr)
+    if result.trend_extreme_skipped:
+        print(
+            f"共跳过 {len(result.trend_extreme_skipped)} 个片段"
+            "（缺可用日线转折点，详见 stderr）",
             file=sys.stderr,
         )
     print(f"已生成 episode 训练数据：{result.run_dir}（记录数 {counts}）")

@@ -134,7 +134,7 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 | K 线数据 | `dataset fetch`（天勤取数 → CSV + 来源指纹） | 已实现 |
 | 转折点数据 | `dataset turning-points`（离线提取 → CSV） | 已实现 |
 | 价格折线数据 | 转折点 `price` 序列（`data/turning_points/*.csv`）及其折线图（`scripts/plot_price_line.py` → PNG） | 已实现 |
-| episode 训练数据（首轮） | `dataset episode-generate`（用户片段清单 → 确定性回放 → 盈亏比规则真值标签 → 按 split 的 NanoJev JSONL + 审计；用法见 §7.2） | 已实现，并已在真实片段上端到端生成通过契约校验（首轮 2026-10-01；v2/v3 含盘面状态 2026-10-02，见下方「首轮真实数据」） |
+| episode 训练数据（首轮） | `dataset episode-generate`（用户片段清单 → 确定性回放 → 盈亏比规则真值标签 → 按 split 的 NanoJev JSONL + 审计；用法见 §7.2） | 已实现，并已在真实片段上端到端生成通过契约校验（首轮 2026-10-01；状态模板 v2~v5 + 候选文案精简 2026-10-02，见下方「首轮真实数据」） |
 | 盘面状态数据 | `dataset board-state`（离线：固定的前日高/低/收 + 今日开盘，动态的今日最高/最低逐根更新，全部以今日开盘价为基准的相对价；用法见 §7.2） | 已实现，并已在真实数据上运行与交叉核对（2026-10-01） |
 
 首轮 episode 训练数据流水线的语义已在 `artifacts/nanojev-training-data/01-requirement/requirement-report.md`
@@ -144,16 +144,19 @@ MarketSense 想研究"K 线能否被转成机器可理解的结构化市场描�
 2026-10-02 用户拍板方案 A：状态模板升为 **v2**（`render_state` 新增 board_state 行，
 昨日高/低/收与今日高/低随状态文本进入训练记录）。
 
-**首轮真实数据（2026-10-01 生成；2026-10-02 v2/v3/v4 状态模板 + 候选文案精简，均通过契约校验）**：
+**首轮真实数据（2026-10-01 生成；2026-10-02 v2~v5 状态模板 + 候选文案精简，均通过契约校验）**：
 DCE.v2701（PVC）2026-09 全月 21 个交易日片段（`data/segments/sep2026.jsonl`：
 train 9-1~9-18 / dev 9-21~9-24 / test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
-当前产物 `data/nanojev_dataset/run-3db1bf63afc2/`（模板 v4 + 精简候选文案，
-**train 4188 / dev 886 / test 655**，7125 决策点，全部非空；state 文本为 v4 六部分
-中文标签结构（账户/联动/日线/日内/现价/盘口），数值语义与 v3 逐项等价，board_state
-值已与 `dataset board-state` CSV 全量交叉核对一致，确定性双跑 sha256 一致）；
-历史 `run-36b037252a62/`（模板 v3）、`run-b25cfd1ff370/`（v2 状态 + 精简文案）、
+当前产物 `data/nanojev_dataset/run-7cbd6516d46f/`（模板 v5 + 精简候选文案；
+「日线」行新增 `trend_up/trend_up_len/trend_dn/trend_dn_len` 4 键 = 最近可确认 up/down
+折点的段内极值价（来源日线折点 CSV，确认根日期 < 决策交易日）÷ 片段首根开盘 + 对应段长；
+9 个 train 片段（9-1~9-11）因缺 up 折点被跳过并告警，**train 1392 / dev 886 / test 655**
+（2933 条记录），全部非空；`prev_*`/board_state 数值与 v4 逐项等价，trend 四值与日线折点
+CSV 独立重算一致，确定性双跑 sha256 一致）；
+历史 `run-3db1bf63afc2/`（模板 v4，train 4188）、`run-36b037252a62/`（模板 v3）、
+`run-b25cfd1ff370/`（v2 状态 + 精简文案）、
 `run-13aff088b982/`（v2 状态、候选文案含价位括号）与首轮 `run-c1cb097177a3/`（模板 v1，
-无 board_state）保留。五者 NanoJev 原生 `--validate-only` 契约硬门均通过。
+无 board_state）保留。六者 NanoJev 原生 `--validate-only` 契约硬门均通过。
 2026-10-02 用户拍板：候选文案精简为动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
 成交价位由执行程序与滑点决定，不进模型输入（`QUESTION_SCHEMA = marketsense.episode_question.v1`）。
 `tick_size = 5` 为**用户确认值**
@@ -260,7 +263,7 @@ cp dataset/config/tianqin.example.yaml dataset/config/tianqin.local.yaml
 python -m dataset fetch          --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--output-dir DIR] [--config FILE]
 python -m dataset turning-points --symbol S [--symbol S2 ...] --period P [--initial-direction auto|up|down] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 python -m dataset prepare        --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--initial-direction ...] [--output-dir DIR] [--config FILE]
-python -m dataset episode-generate --segments FILE [--output-dir DIR] [--config FILE]
+python -m dataset episode-generate --segments FILE [--daily-turning-points-dir DIR] [--output-dir DIR] [--config FILE]
 python -m dataset board-state    --symbol S [--symbol S2 ...] [--period 1m] [--start DATE --end DATE] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 ```
 
@@ -269,7 +272,7 @@ python -m dataset board-state    --symbol S [--symbol S2 ...] [--period 1m] [--s
 | `fetch` | 是 | 取 K 线 → 校验 → 落盘 |
 | `turning-points` | 否 | 读取已落盘 K 线 → 提取并落盘转折点 |
 | `prepare` | 是 | `fetch` + 转折点，一步完成 |
-| `episode-generate` | 否 | 片段清单 + 已落盘 1 分钟 K 线及日线 → 按 split 的 NanoJev JSONL + 审计 |
+| `episode-generate` | 否 | 片段清单 + 已落盘 1 分钟 K 线、日线及日线折点 → 按 split 的 NanoJev JSONL + 审计 |
 | `board-state` | 否 | 读取已落盘 1m/1d K 线 → 盘面状态 CSV + sidecar |
 
 参数要点：
@@ -388,6 +391,8 @@ up 点 = 段内实际最高、down 点 = 段内实际最低，平局取最早 ba
 # 1) 1 分钟 K 线与日线必须已落盘（日线供 board_state 行的上一交易日值；流水线只读消费，不取数）
 python -m dataset fetch --symbol DCE.v2701 --period 1m --bars 800
 python -m dataset fetch --symbol DCE.v2701 --period 1d
+#    日线折点 CSV 也必须已落盘（v5 日线行 trend 四值数据源）
+python -m dataset turning-points --symbol DCE.v2701 --period 1d
 
 # 2) 品种配置：复制模板并填 tick_size（symbols.local.yaml 已被 .gitignore 覆盖）
 cp dataset/config/symbols.example.yaml dataset/config/symbols.local.yaml
@@ -407,6 +412,7 @@ python -m dataset episode-generate --segments data/segments/my_segments.jsonl \
 | 参数 | 说明 |
 |---|---|
 | `--segments FILE` | 必填。片段清单 JSONL（每行一个片段 = 一个 episode） |
+| `--daily-turning-points-dir DIR` | 日线折点输入目录（v5 日线行 trend 四值数据源；默认 `<data_dir>/../turning_points`，与 `turning-points` 子命令落盘布局一致；目录内缺 `{symbol}_1d.csv` 报错退出 1） |
 | `--output-dir DIR` | 产物根目录（默认取配置 `episode.output_dir`，否则 `data/nanojev_dataset`） |
 | `--config FILE` | 配置文件（YAML；未给时依次取 `MARKETSENSE_DATASET_CONFIG`、`dataset/config/tianqin.local.yaml`，再退回内置默认值） |
 
@@ -444,15 +450,22 @@ episode:
 ```
 
 - 模型可见价格一律为**比值**（分母 = 片段首根开盘价，6 位小数）；绝对 OHLC 只留在 `data/ohlcv/` 原始层。
-- **状态文本（模板 v4）**：7 行（`账户:`/`联动:`/`日线:`/`日内:`含 `bar=`/`现价:`/`盘口:` na 占位）；
+- **状态文本（模板 v5）**：7 行（`账户:`/`联动:`/`日线:`/`日内:`含 `bar=`/`现价:`/`盘口:` na 占位）；
   `账户: 持仓=<空仓|持多|持空>[ entry=<..> stop=<..>] 回撤=<..>`（v4 拍板：持仓值中文标签，
   持仓非空时 entry/stop 在 回撤 前）；
-  **日线行（v4 起由原 board_state 行拆出）**：`prev_h/prev_l/prev_c` = 上一交易日日线高/低/收
-  （来源 `{symbol}_1d.csv`，取严格早于片段交易日的最后一行）÷ 片段首根开盘价；
+  **日线行（v4 起由原 board_state 行拆出；v5 起追加 trend 四键）**：`prev_h/prev_l/prev_c` =
+  上一交易日日线高/低/收（来源 `{symbol}_1d.csv`，取严格早于片段交易日的最后一行）÷ 片段首根
+  开盘价；`trend_up/trend_dn` = 最近**可确认** up/down 折点的段内实际最高/最低价
+  （`trend_extreme_price`，来源日线折点 CSV `data/turning_points/{symbol}_1d.csv`）÷ 片段首根
+  开盘价，`trend_up_len/trend_dn_len` = 对应趋势段长（整数）；「可确认」口径 = 折点确认根日期
+  **严格早于**该 bar 的**决策交易日**（State(T) 不引用 T 日及之后确认的折点，无未来泄漏）；
+  逐决策点各自取其决策交易日的可用最近折点；决策交易日归属与 `dataset board-state` 夜盘规则
+  同口径（日盘 bar → 日历日；夜盘 bar ≥ 21:00 → 下一交易日）；
   **日内行（同上拆出，行首含 `bar=` 片段内序号）**：`today_h/today_l` = 片段首根至决策 K 线
   （含）的 1m 高/低累计极值 ÷ 片段首根开盘价（State(T) 只用 ≤ 决策 K 线数据，无未来泄漏）；
   价格分母与现价行一致；`盘口: na` 为占位（真实 bid/ask 未接，非目标）；
-  片段无上一交易日日线 → 跳过该片段（审计 `board_state.skipped_segments` + stderr 告警），
+  片段无上一交易日日线，或任一入选决策点的可用 up/down 折点单侧缺失 → 跳过该片段
+  （审计 `board_state.skipped_segments` / `trend_extremes.skipped_segments` + stderr 告警），
   全部片段被跳过则硬报错；与 `dataset board-state` 同口径。
 - **questions/candidates 文案（2026-10-02 拍板精简）**：唯一 choice 题 `next_action`，
   候选文案只留动作语义——空仓 `open_long=买入开仓 / open_short=卖出开仓 / stay_flat=继续空仓`，
@@ -477,7 +490,10 @@ episode:
   2026-10-02 模板 v2（含 board_state 行）重生成 `run-13aff088b982`；同日候选文案精简
   生成 `run-b25cfd1ff370`；同日状态模板 v3（行间换行符前后加空格）生成 `run-36b037252a62`；
   同日状态模板 v4（六部分中文标签重排：账户/联动/日线/日内/现价/盘口，`bar=` 归入日内行，
-  盘口 `na` 占位）生成**当前产物** `run-3db1bf63afc2`，train 4188 / dev 886 / test 655
+  盘口 `na` 占位）生成 `run-3db1bf63afc2`（train 4188 / dev 886 / test 655）；
+  同日状态模板 v5（「日线」行追加 `trend_up/trend_up_len/trend_dn/trend_dn_len` 4 键，
+  数据源 = 日线折点 CSV，确认根日期 < 决策交易日；9 个 train 片段 9-1~9-11 因缺 up 折点
+  跳过并告警）生成**当前产物** `run-7cbd6516d46f`，train 1392 / dev 886 / test 655
   全部非空，NanoJev `--validate-only` 通过；
   v2/v3/v4 run 的 board_state 值与 `dataset board-state` CSV 全量交叉核对一致；
   「生成后自行确认非空」的提醒仍适用于任何新清单。

@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from dataset.errors import DatasetError
@@ -27,7 +28,7 @@ from dataset.market_episode.nanojev_records import (
     generate_dataset,
     render_state,
 )
-from dataset.market_episode.replay import load_segment_bars
+from dataset.market_episode.replay import bars_from_frame, load_segment_bars
 from dataset.market_episode.segments import (
     SPLIT_ROLES,
     EpisodeParams,
@@ -36,9 +37,12 @@ from dataset.market_episode.segments import (
 )
 from dataset.storage import save_ohlcv
 from dataset.tests.market_episode_fixtures import (
+    DAILY_TP_DOWN,
+    DAILY_TP_UP,
     SYMBOL,
     bars,
     build_workspace,
+    daily_trend_points_map,
     frame,
     prev_daily_map,
 )
@@ -83,6 +87,11 @@ def _workspace_and_records(tmp_path: Path):
     return workspace, segments, symbols, params, result, records, bars_by_segment
 
 
+def _symbols_by_segment(workspace) -> dict[str, str]:
+    """segment_id → symbol（``check_state_leakage`` 新必参；从片段清单确定性派生）。"""
+    return {segment.segment_id: segment.symbol for segment in load_segments(workspace.manifest)}
+
+
 def test_parse_state_id_round_trip_and_rejects_bad_format() -> None:
     assert parse_state_id("seg-1:12") == ("seg-1", 12)
 
@@ -103,6 +112,8 @@ def test_generated_records_pass_all_audit_checks(tmp_path: Path) -> None:
         bars_by_segment=bars_by_segment,
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
+        trend_points_by_symbol=daily_trend_points_map(workspace),
+        symbols_by_segment=_symbols_by_segment(workspace),
     )
     check_audit_consistency(result.audit, _records_by_split(result))
     assert all(row["split"] in SPLIT_ROLES for row in records)
@@ -146,6 +157,8 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
         bars_by_segment=bars_by_segment,
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
+        trend_points_by_symbol=daily_trend_points_map(workspace),
+        symbols_by_segment=_symbols_by_segment(workspace),
     )
 
     # 人为把某条记录的状态换成分片内"下一根"的比值行 → 必须被检出
@@ -168,6 +181,8 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
             today_high=max(bar.high for bar in segment_bars[: bar_index + 2]),
             today_low=min(bar.low for bar in segment_bars[: bar_index + 2]),
         ),
+        trend_up_extreme=DAILY_TP_UP,
+        trend_dn_extreme=DAILY_TP_DOWN,
     )
 
     with pytest.raises(DatasetError, match="与决策 K 线不一致"):
@@ -176,6 +191,8 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
             bars_by_segment=bars_by_segment,
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
+            trend_points_by_symbol=daily_trend_points_map(workspace),
+            symbols_by_segment=_symbols_by_segment(workspace),
         )
 
 
@@ -202,6 +219,8 @@ def test_state_leakage_detects_absolute_price_in_state(tmp_path: Path) -> None:
             bars_by_segment=bars_by_segment,
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
+            trend_points_by_symbol=daily_trend_points_map(workspace),
+            symbols_by_segment=_symbols_by_segment(workspace),
         )
 
 
@@ -213,6 +232,8 @@ def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
         bars_by_segment=bars_by_segment,
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
+        trend_points_by_symbol=daily_trend_points_map(workspace),
+        symbols_by_segment=_symbols_by_segment(workspace),
     )
 
     tampered = [copy.deepcopy(record) for record in records]
@@ -228,6 +249,8 @@ def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
             bars_by_segment=bars_by_segment,
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
+            trend_points_by_symbol=daily_trend_points_map(workspace),
+            symbols_by_segment=_symbols_by_segment(workspace),
         )
 
 
@@ -246,6 +269,8 @@ def test_state_leakage_detects_prev_daily_absolute_price(tmp_path: Path) -> None
             bars_by_segment=bars_by_segment,
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
+            trend_points_by_symbol=daily_trend_points_map(workspace),
+            symbols_by_segment=_symbols_by_segment(workspace),
         )
 
 
@@ -371,6 +396,8 @@ def test_state_of_flat_minute_uses_bars_up_to_its_own_index() -> None:
         price_precision=6,
         board_state=BoardStateValues(prev_day_high=2010.0, prev_day_low=1980.0,
                                      prev_day_close=1990.0, today_high=1012.0, today_low=990.0),
+        trend_up_extreme=DAILY_TP_UP,
+        trend_dn_extreme=DAILY_TP_DOWN,
     )
 
     assert "现价: o=1.009000 h=1.012000 l=0.990000 c=0.992000" in state
@@ -416,3 +443,84 @@ def test_audit_records_source_data_version_per_segment(tmp_path: Path) -> None:
     assert set(after) == set(before)
     assert after != before  # 数据身份变化必须反映在审计里
     assert second.audit["input"]["segments_sha256"] == first.audit["input"]["segments_sha256"]
+
+
+def test_state_leakage_detects_wrong_trend_line(tmp_path: Path) -> None:
+    """v5 日线行 trend 篡改 → 独立重算不一致（日线行与决策 K 线不一致）→ 必须被检出。"""
+    import re as _re
+
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
+    check_state_leakage(
+        records,
+        bars_by_segment=bars_by_segment,
+        price_precision=params.price_precision,
+        prev_daily_by_segment=prev_daily_map(workspace),
+        trend_points_by_symbol=daily_trend_points_map(workspace),
+        symbols_by_segment=_symbols_by_segment(workspace),
+    )
+
+    tampered = [copy.deepcopy(record) for record in records]
+    assert "trend_up=" in tampered[0]["state"]
+    tampered[0]["state"] = _re.sub(
+        r"trend_up=[\d.]+", "trend_up=9.999999", tampered[0]["state"], count=1
+    )
+
+    with pytest.raises(DatasetError, match="日线行与决策 K 线不一致"):
+        check_state_leakage(
+            tampered,
+            bars_by_segment=bars_by_segment,
+            price_precision=params.price_precision,
+            prev_daily_by_segment=prev_daily_map(workspace),
+            trend_points_by_symbol=daily_trend_points_map(workspace),
+            symbols_by_segment=_symbols_by_segment(workspace),
+        )
+
+
+def test_state_leakage_detects_trend_extreme_absolute_price(tmp_path: Path) -> None:
+    """可用折点的绝对极值价不得出现在状态文本（与 prev_daily 绝对价同型硬门）。"""
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
+
+    tampered = [copy.deepcopy(record) for record in records]
+    tampered[0]["state"] = tampered[0]["state"] + "\ntrend_raw: 4020.000000"
+    with pytest.raises(DatasetError, match="可用折点绝对极值价"):
+        check_state_leakage(
+            tampered,
+            bars_by_segment=bars_by_segment,
+            price_precision=params.price_precision,
+            prev_daily_by_segment=prev_daily_map(workspace),
+            trend_points_by_symbol=daily_trend_points_map(workspace),
+            symbols_by_segment=_symbols_by_segment(workspace),
+        )
+
+
+def test_audit_payload_has_trend_extremes_section(tmp_path: Path) -> None:
+    """审计新增 trend_extremes 段：skipped_segments / source_versions（sha256 指纹）。"""
+    from dataset.market_episode.audit import FROZEN_DECISIONS
+
+    _, _, _, _, result, _, _ = _workspace_and_records(tmp_path)
+    section = result.audit["trend_extremes"]
+    assert section["skipped_segments"] == []
+    assert set(section["source_versions"]) == {SYMBOL}
+    assert section["source_versions"][SYMBOL].startswith("sha256=")
+    assert (
+        result.audit["frozen_decisions"]["state_template"]
+        == FROZEN_DECISIONS["state_template"]
+    )
+    assert (
+        result.audit["frozen_decisions"]["daily_trend_extremes"]
+        == FROZEN_DECISIONS["daily_trend_extremes"]
+    )
+
+
+def test_independent_bar_trade_date_night_attribution() -> None:
+    """审计侧独立交易日归属与序列化侧同口径：21:00+ bar → 下一交易日。"""
+    from dataset.market_episode.audit import _independent_bar_trade_date
+
+    night = frame(_HOLDING_PATTERN, start="2024-01-01 21:00:00")
+    day = frame(_HOLDING_PATTERN, start="2024-01-02 09:00:00")
+    bar_list = bars_from_frame(pd.concat([night, day]).reset_index(drop=True))
+
+    # 夜盘 bar（历日 01-01 21:00）→ 下一个交易日 01-02
+    assert _independent_bar_trade_date(bar_list, bar_list[0]) == pd.Timestamp("2024-01-02").date()
+    # 日盘 bar → 其日历日
+    assert _independent_bar_trade_date(bar_list, bar_list[2]) == pd.Timestamp("2024-01-02").date()

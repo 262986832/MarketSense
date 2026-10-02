@@ -5,27 +5,33 @@
 * :func:`check_split_isolation` 镜像 NanoJev
   ``train_pipeline_decisions.read_training_records`` 的 state/source_group 跨 split
   检查口径（同一 ``state_id``／``metadata.source_group_id`` 只能属于一个 split）；
-* :func:`check_state_leakage` **独立重算**决策 K 线的现价/联动/日线/日内四行（v4），并与
-  记录内的状态文本比对（不调用状态序列化实现，避免自证），同时拒绝状态里出现
-  绝对价格/量（含上一交易日日线绝对值）；
+* :func:`check_state_leakage` **独立重算**决策 K 线的现价/联动/日线/日内四行（v5 日线行含
+  日线折点趋势极值），并与记录内的状态文本比对（不调用状态序列化实现，避免自证），
+  同时拒绝状态里出现绝对价格/量（含上一交易日日线绝对值与可用折点绝对极值价）；
 * :func:`verify_determinism` 同输入双跑并逐文件比对 sha256；
 * :func:`build_audit_payload` 汇总死亡/剔除/每 split 计数、输入指纹与生成参数。
 """
 
 from __future__ import annotations
 
+import bisect
+import datetime as dt
 import hashlib
 import json
 import re
 from pathlib import Path
 from typing import Any, Mapping
 
+import pandas as pd
+
+from dataset.board_state import DAY_END, NIGHT_START
 from dataset.errors import DatasetError
 from dataset.storage import file_sha256
 
 from dataset.market_episode.labels import SegmentOutcome
 from dataset.market_episode.replay import Bar, format_ratio_value, ratio_or_none
 from dataset.market_episode.segments import SPLIT_ROLES, EpisodeParams, Segment
+from dataset.turning_points import TrendExtreme, TurningPoint
 
 #: 审计文件 schema 标记
 AUDIT_SCHEMA = "marketsense.episode_audit.v1"
@@ -43,10 +49,12 @@ GOLD_LABEL_KINDS = frozenset(
     }
 )
 
-#: 本轮实现的冻结口径（写入审计文件，便于复算时对照；v2 起新增 board_state）
+#: 本轮实现的冻结口径（写入审计文件，便于复算时对照；v2 起新增 board_state；
+#: v5 起新增日线折点趋势极值，AUDIT_SCHEMA 保持 v1：payload 为纯增量变更，
+#: v5 演进标记由 state_template 承载）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v4:decision_bar_only+board_state",
+    "state_template": "marketsense.episode_state.v5:decision_bar_only+board_state+daily_trend_extremes",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "ratio_units:initial_equity=1.0,1_lot=1_notional,no_multiplier,no_fees",
@@ -55,6 +63,7 @@ FROZEN_DECISIONS: Mapping[str, str] = {
     "reversal_condition_2": "stop_reached_first_or_scan_end_without_exceeding_current_bar",
     "board_state_prev_day": "daily_file_1d_prev_trading_day_over_segment_first_open",
     "board_state_today": "segment_bars_cumulative_extrema_through_decision_bar",
+    "daily_trend_extremes": "daily_tp_csv_confirmed_date_lt_trade_date__recent_1up_1down_over_segment_first_open",
     "question_template": "marketsense.episode_question.v1:concise_action_labels",
 }
 
@@ -234,19 +243,119 @@ def _independent_vol_line(bar: Bar, reference: Bar, precision: int) -> str:
     return f"联动: v={values[0]} oi_open={values[1]} oi_close={values[2]}"
 
 
+def _independent_daily_line(
+    prev_daily: tuple[float, float, float],
+    reference: Bar,
+    precision: int,
+    trend_up_extreme: TrendExtreme,
+    trend_dn_extreme: TrendExtreme,
+) -> str:
+    """独立重算日线行（v5：prev = 上一交易日日线值 ÷ 片段首根开盘；
+    trend = 可用折点段极值 ÷ 片段首根开盘 + 段长整数直出）。"""
+    prev_high, prev_low, prev_close = prev_daily
+    return (
+        "日线: "
+        f"prev_h={format_ratio_value(ratio_or_none(prev_high, reference.open), precision)}"
+        f" prev_l={format_ratio_value(ratio_or_none(prev_low, reference.open), precision)}"
+        f" prev_c={format_ratio_value(ratio_or_none(prev_close, reference.open), precision)}"
+        f" trend_up={format_ratio_value(ratio_or_none(trend_up_extreme.trend_extreme_price, reference.open), precision)}"
+        f" trend_up_len={trend_up_extreme.segment_length}"
+        f" trend_dn={format_ratio_value(ratio_or_none(trend_dn_extreme.trend_extreme_price, reference.open), precision)}"
+        f" trend_dn_len={trend_dn_extreme.segment_length}"
+    )
+
+
+def _independent_bar_trade_date(bars: tuple[Bar, ...], bar: Bar) -> dt.date:
+    """独立实现的决策交易日归属（与序列化侧同口径但**不调用其 helper**，防自证）。
+
+    夜盘归属规则与 ``board_state.attribute_windows`` 同口径：日盘 bar（tod < 15:00）
+    → 日历日；夜盘 bar（tod ≥ 21:00）→ 片段日盘日历日集合（升序）中其后的下一个
+    交易日；``[15:00, 21:00)`` 或夜盘无下一交易日 → ``DatasetError``。
+    """
+    stamp = pd.Timestamp(bar.timestamp)
+    time_of_day = stamp.time()
+    if time_of_day < DAY_END:
+        return stamp.date()
+    trading_days = sorted(
+        {
+            pd.Timestamp(item.timestamp).date()
+            for item in bars
+            if pd.Timestamp(item.timestamp).time() < DAY_END
+        }
+    )
+    if time_of_day < NIGHT_START:
+        raise DatasetError(
+            f"审计：决策 K 线 time-of-day 在 15:00–20:59，无法归属交易日: {bar.timestamp!r}"
+        )
+    position = bisect.bisect_right(trading_days, stamp.date())
+    if position >= len(trading_days):
+        raise DatasetError(
+            f"审计：夜盘决策 K 线在片段内找不到后续交易日: {bar.timestamp!r}"
+        )
+    return trading_days[position]
+
+
+def _independent_trend_extremes(
+    points: tuple[TurningPoint, ...], trade_date: dt.date
+) -> tuple[TrendExtreme, TrendExtreme] | None:
+    """独立实现的可用折点选择（归属/过滤/选择均不调用序列化侧与数据层选择函数，防自证）。
+
+    过滤确认根日期严格早于 ``trade_date`` 的 up/down 点（任一侧缺失 → ``None``，
+    调用方报不一致）；选择 = 过滤后时间序**最后一个** up/down；段长由点序列推导
+    （up/down 点的段起点 = 序列中上一个 up/down 点的触发根，无前序 → 0；过滤后
+    为前缀，与全序列推导一致）。
+    """
+    usable = tuple(
+        point
+        for point in points
+        if point.kind in ("up", "down") and point.timestamp.date() < trade_date
+    )
+    if not any(point.kind == "up" for point in usable) or not any(
+        point.kind == "down" for point in usable
+    ):
+        return None
+    last_up: TrendExtreme | None = None
+    last_down: TrendExtreme | None = None
+    previous_trigger: int | None = None
+    for point in usable:
+        if point.trend_extreme_price is None or point.trend_extreme_bar_index is None:
+            raise DatasetError(
+                f"审计：可用 up/down 折点缺当次趋势极值字段（kind={point.kind}, "
+                f"bar_index={point.bar_index}）"
+            )
+        segment_start = 0 if previous_trigger is None else previous_trigger
+        extreme = TrendExtreme(
+            kind=point.kind,
+            trend_extreme_price=point.trend_extreme_price,
+            trend_extreme_bar_index=point.trend_extreme_bar_index,
+            segment_length=point.bar_index - segment_start,
+        )
+        if point.kind == "up":
+            last_up = extreme
+        else:
+            last_down = extreme
+        previous_trigger = point.bar_index
+    assert last_up is not None and last_down is not None
+    return last_up, last_down
+
+
 def check_state_leakage(
     records: list[dict[str, Any]],
     *,
     bars_by_segment: Mapping[str, tuple[Bar, ...]],
     price_precision: int,
     prev_daily_by_segment: Mapping[str, tuple[float, float, float]],
+    trend_points_by_symbol: Mapping[str, tuple[TurningPoint, ...]],
+    symbols_by_segment: Mapping[str, str],
 ) -> None:
-    """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的 bar 计算。
+    """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的数据计算。
 
     * 记录里的现价/联动/日线/日内四行必须等于按 ≤ 决策 K 线的数据
       **独立重算**的结果 → 状态若误用下一根/其它根会失败；
+    * 日线行 trend 四值必须等于按「确认根日期严格早于决策交易日」过滤后的
+      最近 1 up + 1 down 折点独立重算（T 日及之后确认的折点若被误用即被检出）；
     * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量，也不得出现上一交易日
-      日线的绝对价格（它们只能以比值出现）。
+      日线的绝对价格与该记录可用折点的绝对极值价（它们只能以比值出现）。
     """
     for record in records:
         segment_id, bar_index = parse_state_id(record["state_id"])
@@ -266,10 +375,36 @@ def check_state_leakage(
             f"审计缺少片段 {segment_id!r} 的上一交易日日线（日线行无法独立重算）",
         )
         assert prev_daily is not None
+        symbol = symbols_by_segment.get(segment_id)
+        _require(symbol is not None, f"审计缺少片段 {segment_id!r} 的 symbol")
+        points = trend_points_by_symbol.get(symbol)
+        _require(
+            points is not None,
+            f"审计缺少 symbol {symbol!r} 的日线转折点（日线行 trend 四值无法独立重算）",
+        )
+        assert points is not None
+        trade_date = _independent_bar_trade_date(bars, bar)
+        extremes = _independent_trend_extremes(points, trade_date)
+        _require(
+            extremes is not None,
+            f"审计缺少片段 {segment_id!r} 决策交易日 {trade_date} 的可用日线折点"
+            "（确认日早于该交易日的 up/down 需各 ≥1）",
+        )
+        assert extremes is not None
+        trend_up_extreme, trend_dn_extreme = extremes
         expected_lines = (
             ("现价", _independent_px_line(bar, reference, price_precision)),
             ("联动", _independent_vol_line(bar, reference, price_precision)),
-            ("日线", _independent_daily_line(prev_daily, reference, price_precision)),
+            (
+                "日线",
+                _independent_daily_line(
+                    prev_daily,
+                    reference,
+                    price_precision,
+                    trend_up_extreme,
+                    trend_dn_extreme,
+                ),
+            ),
             ("日内", _independent_intraday_line(prefix, bar_index, reference, price_precision)),
         )
         for line_label, expected in expected_lines:
@@ -287,6 +422,22 @@ def check_state_leakage(
                     f"记录 {record['id']} 状态出现上一交易日绝对价格 {token!r}"
                     "（绝对数不得进入模型输入）"
                 )
+        usable = tuple(
+            point
+            for point in points
+            if point.kind in ("up", "down") and point.timestamp.date() < trade_date
+        )
+        extreme_prices = [
+            point.trend_extreme_price
+            for point in usable
+            if point.trend_extreme_price is not None
+        ]
+        for token in sorted(_absolute_price_tokens(extreme_prices, price_precision)):
+            if re.search(rf"(?<![\d.]){re.escape(token)}(?![\d.])", state_text):
+                raise DatasetError(
+                    f"记录 {record['id']} 状态出现可用折点绝对极值价 {token!r}"
+                    "（绝对数不得进入模型输入）"
+                )
 
 
 def _absolute_price_tokens(values, precision: int) -> set[str]:
@@ -296,21 +447,6 @@ def _absolute_price_tokens(values, precision: int) -> set[str]:
         tokens.add(f"{price:.{precision}f}")
         tokens.add(repr(float(price)))
     return tokens
-
-
-def _independent_daily_line(
-    prev_daily: tuple[float, float, float],
-    reference: Bar,
-    precision: int,
-) -> str:
-    """独立重算日线行（prev = 上一交易日日线值 ÷ 片段首根开盘）。"""
-    prev_high, prev_low, prev_close = prev_daily
-    return (
-        "日线: "
-        f"prev_h={format_ratio_value(ratio_or_none(prev_high, reference.open), precision)}"
-        f" prev_l={format_ratio_value(ratio_or_none(prev_low, reference.open), precision)}"
-        f" prev_c={format_ratio_value(ratio_or_none(prev_close, reference.open), precision)}"
-    )
 
 
 def _independent_intraday_line(
@@ -354,14 +490,22 @@ def build_audit_payload(
     split_digests: Mapping[str, str],
     input_hashes: Mapping[str, str],
     board_state_skipped: Mapping[str, str] | None = None,
+    trend_extreme_skipped: Mapping[str, str] | None = None,
+    trend_source_versions: Mapping[str, str] | None = None,
     daily_source_versions: Mapping[str, str | None] | None = None,
 ) -> dict[str, Any]:
-    """构造审计文件内容（不含墙钟时间，保证双跑逐字节一致）。"""
+    """构造审计文件内容（不含墙钟时间，保证双跑逐字节一致）。
+
+    v5 起：新增顶层 section ``trend_extremes``（缺折点跳过清单 + 1d 转折点 CSV 版本），
+    ``AUDIT_SCHEMA`` 保持 v1（payload 为纯增量变更；v5 演进标记由
+    ``frozen_decisions.state_template`` 承载）。
+    """
     per_segment: list[dict[str, Any]] = []
     for segment in segments:
         outcome = outcomes.get(segment.segment_id)
         if outcome is None:
-            # board_state 跳过的片段不产出 per_segment 审计（在 board_state.skipped_segments 记录）
+            # board_state / 日线折点跳过的片段不产出 per_segment 审计（分别在
+            # board_state.skipped_segments 与 trend_extremes.skipped_segments 记录）
             continue
         per_segment.append(
             {
@@ -433,6 +577,13 @@ def build_audit_payload(
                 for key, value in sorted((board_state_skipped or {}).items())
             ],
             "daily_source_versions": dict(sorted((daily_source_versions or {}).items())),
+        },
+        "trend_extremes": {
+            "skipped_segments": [
+                {"segment_id": key, "reason": value}
+                for key, value in sorted((trend_extreme_skipped or {}).items())
+            ],
+            "source_versions": dict(sorted((trend_source_versions or {}).items())),
         },
     }
 

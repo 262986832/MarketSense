@@ -35,7 +35,7 @@ cd /Users/jiangdianjing/agentspace/MarketSense
 python -m dataset fetch          --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--output-dir DIR] [--config FILE]
 python -m dataset turning-points --symbol S [--symbol S2 ...] --period P [--initial-direction auto|up|down] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 python -m dataset prepare        --symbol S [--symbol S2 ...] --period P (--bars N | --start ISO --end ISO) [--initial-direction ...] [--output-dir DIR] [--config FILE]
-python -m dataset episode-generate --segments FILE [--output-dir DIR] [--config FILE]
+python -m dataset episode-generate --segments FILE [--daily-turning-points-dir DIR] [--output-dir DIR] [--config FILE]
 python -m dataset board-state    --symbol S [--symbol S2 ...] [--period 1m] [--start DATE --end DATE] [--data-dir DIR] [--output-dir DIR] [--config FILE]
 ```
 
@@ -113,8 +113,11 @@ python -m dataset board-state --symbol DCE.v2701 --start 2026-09-01 --end 2026-0
 跨 split 隔离、泄漏抽查、计数汇总）。
 
 前置与用法：先 `dataset fetch --period 1m` 与 `dataset fetch --period 1d` 落盘 K 线（缺日线
-硬报错不静默），再把 `dataset/config/symbols.example.yaml` 复制为 `symbols.local.yaml` 并填
-`tick_size`，然后用 `--segments` 指向片段清单（详细步骤与配置项见 `README.md` §7.2 小节 7）：
+硬报错不静默），并 `dataset turning-points --period 1d` 落盘日线折点（v5 日线行 trend 四值
+数据源；默认取 `<data_dir>/../turning_points`，`--daily-turning-points-dir` 可覆盖；文件
+缺失/损坏 → `DataLoadError` 硬报错 exit 1，不静默），再把 `dataset/config/symbols.example.yaml`
+复制为 `symbols.local.yaml` 并填 `tick_size`，然后用 `--segments` 指向片段清单
+（详细步骤与配置项见 `README.md` §7.2 小节 7）：
 
 ```bash
 python -m dataset episode-generate --segments data/segments/my_segments.jsonl
@@ -131,24 +134,33 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 
 - 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
   同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
-- **状态文本模板（v4）**：`marketsense.episode_state.v4`，7 行：`账户:`、`联动:`、`日线:`、
+- **状态文本模板（v5）**：`marketsense.episode_state.v5`，7 行：`账户:`、`联动:`、`日线:`、
   `日内:`（行首含 `bar=` 序号）、`现价:`、`盘口:`（na 占位）；
   行间用 `" \n "` 连接（换行符前后各一个空格，v3 起生效，转义后的 JSON 文本更易读）。
   - `账户: 持仓=<空仓|持多|持空>[ entry=<..> stop=<..>] 回撤=<..>`：持仓值中文标签
     （v4 拍板：空仓/持多/持空，未知方向报错不静默）；持仓非空时 `entry/stop` 在 `回撤` 前；
   - `联动: v=<..> oi_open=<..> oi_close=<..>`：成交量/持仓量归一化比值
     （分母 = 片段首根同名列）；
-  - `日线: prev_h=<..> prev_l=<..> prev_c=<..>`（v4 起由原 board_state 行拆出）：
+  - `日线: prev_h=<..> prev_l=<..> prev_c=<..> trend_up=<..> trend_up_len=<n> trend_dn=<..> trend_dn_len=<n>`
+    （v4 起由原 board_state 行拆出，v5 起追加 trend 四键）：
     `prev_*` = **上一交易日**日线高/低/收（来源 `{symbol}_1d.csv`，取日线文件中严格早于片段
     交易日的最后一行）÷ 片段首根开盘价；
+    `trend_up`/`trend_dn` = 最近**可确认** up/down 折点的段内实际最高/最低价
+    （`trend_extreme_price`，来源日线折点 CSV `data/turning_points/{symbol}_1d.csv`）÷
+    片段首根开盘价，`trend_up_len`/`trend_dn_len` = 对应趋势段长（整数，由点序列确定性推导）；
+    「可确认」口径：折点确认根日期**严格早于**该 bar 的**决策交易日**（State(T) 不得引用
+    T 日及之后确认的折点，无未来泄漏）；决策交易日归属与 `dataset board-state` 夜盘规则
+    同口径（日盘 bar → 其日历日；夜盘 bar ≥ 21:00 → 其后下一个交易日）；逐决策点各自取
+    其决策交易日的可用最近折点（多日片段的后段决策点能看到后确认的折点）；
   - `日内: bar=<片段内 0 基序号> today_h=<..> today_l=<..>`（v4 起由原 board_state 行拆出）：
     `today_*` = 片段首根至决策 K 线（含）的 1m 高/低**累计极值** ÷ 片段首根开盘价
     （State(T) 只用 ≤ 决策 K 线的数据，无未来泄漏）；
   - `现价: o=<..> h=<..> l=<..> c=<..>`：决策 K 线 OHLC 比值；价格分母 = 片段首根开盘价
     （全交易日片段下片段首根 = 交易日窗口首根 = 今日开盘，与 `dataset board-state` 同口径）；
     今日开盘价不写（比值恒为 1.000000，纯冗余 token）；分母 ≤ 0 时逐值写 `na`（不产生 `inf`）；
-  - 片段无上一交易日日线 → **跳过该片段**（不产出记录），记入审计
-    `board_state.skipped_segments` 与 stderr 告警；全部片段被跳过则硬报错不写出产物。
+  - 片段无上一交易日日线，或任一入选决策点的可用 up/down 折点单侧缺失 → **跳过该片段**
+    （不产出记录），记入审计（`board_state.skipped_segments` / `trend_extremes.skipped_segments`）
+    与 stderr 告警（不静默）；全部片段被跳过则硬报错不写出产物。
 - **questions/candidates 文案（2026-10-02 用户拍板精简）**：唯一 choice 题 `next_action`，候选文案只留动作语义——空仓 `open_long=买入开仓 / open_short=卖出开仓 / stay_flat=继续空仓`，持仓 `close=平仓 / hold=继续持有 / reverse=反手`；成交价位由执行程序与滑点决定，不进模型输入。questions 文本由 `QUESTION_SCHEMA = marketsense.episode_question.v1` 标记（首次建立），纳入审计 `input.question_schema_sha256` 与 `run_id` 哈希；文案再演进必须换标记（产生新 run）。
 - 确定性：无墙钟/随机；同输入双跑输出 sha256 一致。
 - `run_id` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记 + questions schema 标记) 的前 12 位；**状态/候选文案变更产生新 run**（旧 run 保留不覆盖）；
@@ -161,10 +173,12 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   `run-c1cb097177a3`；v2（含 board_state 行，2026-10-02）`run-13aff088b982`；
   同日候选文案精简 `run-b25cfd1ff370`；同日状态模板 v3（换行符前后加空格）
   `run-36b037252a62`；同日状态模板 v4（六部分中文标签重排：账户/联动/日线/日内/现价/盘口，
-  `bar=` 归入日内行，盘口 `na` 占位）**当前产物** `run-3db1bf63afc2`
-  （DCE.v2701 2026-09 全月，train 4188 / dev 886 / test 655 全部非空，NanoJev `--validate-only`
-  通过；state 文本为 v4 六部分结构，数值语义与 v3 逐项等价，
-  真实数据双跑 sha256 一致；见主 README §5「首轮真实数据」）。
+  `bar=` 归入日内行，盘口 `na` 占位）`run-3db1bf63afc2`；同日状态模板 v5（「日线」行新增
+  `trend_up/trend_up_len/trend_dn/trend_dn_len` 4 键，数据源 = 日线折点 CSV；9 个 train 片段
+  9-1~9-11 因缺 up 折点跳过并告警）**当前产物** `run-7cbd6516d46f`
+  （DCE.v2701 2026-09 全月，train 1392 / dev 886 / test 655 全部非空，NanoJev `--validate-only`
+  通过；state 文本为 v5 六部分结构，`prev_*`/board_state 数值与 v4 逐项等价，
+  trend 四值与日线折点 CSV 独立重算一致，真实数据双跑 sha256 一致；见主 README §5「首轮真实数据」）。
   v2/v3/v4 run 的 5729 条记录 board_state 值均与 `dataset board-state` CSV 全量交叉核对一致。
 
 契约硬门（只读执行第三方脚本）：
@@ -282,6 +296,7 @@ highs, lows = recent_trend_extremes(loaded.points, n=1)
 - 2026-09-26 实测：`168 passed`（两次运行 9.72s / 10.80s）。
 - 2026-09-30 实测（含 episode 流水线测试）：`277 passed`（11.64s）。
 - 2026-10-02 实测（含当次趋势极值用例）：`320 passed, 1 xfailed`（11.95s；转折点用例 45 个）。
+- 2026-10-02 实测（含日线折点极值用例，v5）：`338 passed, 1 xfailed`（15.43s；转折点用例 45 个）。
 
 ## 已知边界（未验证项）
 
@@ -290,7 +305,8 @@ highs, lows = recent_trend_extremes(loaded.points, n=1)
 - 本包不做实时订阅、不做模型/决策，也不定义最终模型输入格式（非目标）；
   `board-state`（盘面状态读取）是首个状态 building block（研究 building block，非最终格式）。
 - episode 训练数据生成已在真实片段上端到端运行（2026-10-01 首轮 `run-c1cb097177a3`；
-  当前产物 `run-3db1bf63afc2`（v4 状态 + 候选文案精简）；详细结果见主 README §5「首轮真实数据」）。
+  当前产物 `run-7cbd6516d46f`（v5 状态 + 候选文案精简，日线行含折点趋势项）；
+  详细结果见主 README §5「首轮真实数据」）。
 - K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
   新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。
 - 转折点发射语义于 2026-09-26 变更（甲口径：`up`/`down` 点 `timestamp`/`bar_index` =

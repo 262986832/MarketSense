@@ -7,9 +7,9 @@
 * ``family_id`` = ``metadata.source_group_id`` = ``segment_id``（一个片段 = 一个 episode，
   直接复用 NanoJev 的 state/source_group 跨 split 泄漏检查）；
 * ``split`` = 片段的 ``split_role``；
-* ``state`` = 确定性文本序列化的**相对比值**状态（v4 六部分：账户（仓位 + 回撤）/
-  联动（量/持仓量）/ 日线（上一交易日高/低/收）/ 日内（``bar=`` 序号 + 今日高/低）/
-  现价（决策 K 线 OHLC）/ 盘口（na 占位））；
+* ``state`` = 确定性文本序列化的**相对比值**状态（v5 六部分：账户（仓位 + 回撤）/
+  联动（量/持仓量）/ 日线（上一交易日高/低/收 + 日线折点趋势极值）/ 日内
+  （``bar=`` 序号 + 今日高/低）/ 现价（决策 K 线 OHLC）/ 盘口（na 占位））；
 * ``questions`` 恰好一个 choice 题 ``next_action``：空仓
   ``{open_long, open_short, stay_flat}`` / 持仓 ``{close, hold, reverse}``；
   候选文案只留动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
@@ -20,13 +20,14 @@
 **状态序列化模板（实现阶段冻结项 2；v2 起新增盘面状态行，2026-10-02 用户拍板方案 A；
 v3 起行间换行符前后加空格，转义后的 JSON 文本更易读，同日拍板；v4 起行重排为宏观→微观
 六部分（账户/联动/日线/日内/现价/盘口），持仓值中文化（空仓/持多/持空）+ 盘口 ``na``
-占位，数值语义与 v3 逐项等价，同日用户拍板）**
+占位，数值语义与 v3 逐项等价，同日用户拍板；v5 起「日线」行新增 4 个 trend 键
+（最近可确认 up/down 折点的段极值 + 段长，2026-10-02 用户拍板））**
 
 ```text
-marketsense.episode_state.v4
+marketsense.episode_state.v5
 账户: 持仓=空仓 回撤=<..>
 联动: v=<..> oi_open=<..> oi_close=<..>
-日线: prev_h=<..> prev_l=<..> prev_c=<..>
+日线: prev_h=<..> prev_l=<..> prev_c=<..> trend_up=<..> trend_up_len=<n> trend_dn=<..> trend_dn_len=<n>
 日内: bar=<片段内 0 基序号> today_h=<..> today_l=<..>
 现价: o=<..> h=<..> l=<..> c=<..>
 盘口: na
@@ -38,12 +39,24 @@ marketsense.episode_state.v4
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
 * **无历史窗口**：状态只含决策 K 线单根 + 仓位 + 回撤 + 盘面状态（v4 拆「日线」「日内」
-  两行），绝对价格不进入模型输入；「盘口」行为 ``na`` 常量占位（真实 bid/ask 未接，非目标）；
+  两行，v5 在日线行追加折点趋势项），绝对价格不进入模型输入；「盘口」行为 ``na`` 常量占位
+  （真实 bid/ask 未接，非目标）；
 * **账户行**（v4）：持仓值中文标签（空仓/持多/持空，未知方向抛 ``DatasetError`` 不静默）；
   持仓非空时 ``entry/stop`` 在 ``回撤`` 前（沿用 v3 的 position→drawdown 相对顺序，仅合并为一行）；
-* **日线行**（原 v2 board_state 行 prev 部分，v4 拆出；与 ``dataset/board_state.py`` 同口径）：
-  ``prev_h/prev_l/prev_c`` = **上一交易日**日线高/低/收（来源 ``{symbol}_1d.csv``，
-  取日线文件中严格早于片段交易日的最后一行）÷ 片段首根开盘价；
+* **日线行**（原 v2 board_state 行 prev 部分，v4 拆出，v5 追加 trend 四值；prev 与
+  ``dataset/board_state.py`` 同口径）：
+  - ``prev_h/prev_l/prev_c`` = **上一交易日**日线高/低/收（来源 ``{symbol}_1d.csv``，
+    取日线文件中严格早于片段交易日的最后一行）÷ 片段首根开盘价；
+  - ``trend_up``/``trend_dn`` = 最近**可确认** up/down 折点的段内实际最高/最低价
+    （``trend_extreme_price``，来源 ``data/turning_points/{symbol}_1d.csv``）÷ 片段首根开盘价；
+    ``trend_up_len``/``trend_dn_len`` = 对应趋势段长（整数 K 线数量，由点序列确定性推导）；
+  - 「可确认」口径：折点确认根日期**严格早于**该 bar 的**决策交易日**（State(T) 不得引用
+    T 日及之后确认的折点，无未来泄漏）；决策交易日归属与 ``board_state.attribute_windows``
+    夜盘规则同口径（日盘 bar → 其日历日；夜盘 bar（≥ 21:00）→ 其后下一个交易日；
+    ``[15:00, 21:00)`` 或夜盘无下一交易日 → ``DatasetError`` 不静默）；
+  - 逐决策点各自取其决策交易日的可用最近折点（多日片段的后段决策点能看到后确认的折点）；
+  - 任一入选决策点的可用 up/down 折点单侧缺失 → **跳过整个片段**（不产出记录），记入审计
+    ``trend_extremes.skipped_segments`` 与 stderr 告警（不静默）；全部片段被跳过 → 硬错误；
 * **日内行**（原 v2 board_state 行 today 部分 + ``bar=`` 序号，v4 拆出）：
   - ``today_h/today_l`` = 片段首根至决策 K 线（**含**）的 1m 高/低**累计极值** ÷ 片段首根开盘价
     （State(T) 只用 ≤ 决策 K 线的数据，无未来泄漏）；
@@ -51,12 +64,17 @@ marketsense.episode_state.v4
     见 ``artifacts/nanojev-integration-alignment/01-requirement/requirement-report.md``）；
   - 今日开盘价不写（它是分母本身，比值恒为 1.000000，写入是纯冗余 token）；
   - 片段无上一交易日日线 → **跳过该片段**（不产出记录），记入审计与 stderr 告警（不静默）。
+* **输入目录**：日线折点默认取 ``<data_dir>/../turning_points``（与 turning-points 子命令
+  落盘布局一致；``--daily-turning-points-dir`` 可覆盖）；文件缺失/损坏 → ``DataLoadError``
+  硬报错（文件缺失 ≠ 折点缺失：文件在但无可用折点 → 跳过片段）。
 * 输出按 ``run`` 目录隔离（``<output_dir>/<run_id>``，``run_id`` 由输入指纹确定性派生，
   同输入同目录同字节，不覆盖其它输入的产物）。
 """
 
 from __future__ import annotations
 
+import bisect
+import datetime as dt
 import hashlib
 import json
 import math
@@ -69,8 +87,14 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from dataset.board_state import DAY_END, NIGHT_START
 from dataset.errors import DatasetError
 from dataset.storage import file_sha256, load_ohlcv
+from dataset.turning_points import (
+    TrendExtreme,
+    load_turning_points,
+    recent_trend_extremes,
+)
 
 from dataset.market_episode.audit import (
     build_audit_payload,
@@ -109,8 +133,10 @@ from dataset.market_episode.segments import (
 
 #: 状态文本的 schema 版本标记（格式演进必须换标记；v2 新增盘面状态行；v3 行间换行符
 #: 前后加空格——转义后的 JSON 文本更易读；v4 行重排为宏观→微观六部分（账户/联动/日线/
-#: 日内/现价/盘口）+ 持仓值中文化 + 盘口 na 占位，数值语义与 v3 逐项等价，2026-10-02 用户拍板）
-STATE_SCHEMA = "marketsense.episode_state.v4"
+#: 日内/现价/盘口）+ 持仓值中文化 + 盘口 na 占位，数值语义与 v3 逐项等价，2026-10-02 用户拍板；
+#: v5 日线行新增日线折点趋势极值项 trend_up/trend_up_len/trend_dn/trend_dn_len
+#: （确认根日期严格早于决策交易日的最近 up/down 折点段极值 + 段长，2026-10-02 用户拍板）
+STATE_SCHEMA = "marketsense.episode_state.v5"
 #: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
 QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
@@ -153,6 +179,7 @@ class GenerationResult:
     output_sha256: Mapping[str, str]
     audit: Mapping[str, Any]
     board_state_skipped: Mapping[str, str]
+    trend_extreme_skipped: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -170,17 +197,94 @@ class BoardStateValues:
     today_low: float
 
 
+def _bar_trade_date(bars: tuple[Bar, ...], bar: Bar) -> dt.date:
+    """决策 K 线的**决策交易日**归属（与 ``board_state.attribute_windows`` 夜盘归属同口径）。
+
+    * 日盘 bar（time-of-day < 15:00）→ 其日历日；
+    * 夜盘 bar（time-of-day ≥ 21:00）→ 片段交易日集合（片段内日盘 bar 的日历日，升序）
+      中该日历日之后的**下一个交易日**；
+    * ``[15:00, 21:00)`` 或夜盘无下一交易日 → 片段窗口内不应出现，出现即清单/数据异常 →
+      ``DatasetError``（不静默，与「混序数据必须报错」同风格）。
+    """
+    stamp = pd.Timestamp(bar.timestamp)
+    calendar_day = stamp.date()
+    time_of_day = stamp.time()
+    if time_of_day < DAY_END:
+        return calendar_day
+    if time_of_day < NIGHT_START:
+        raise DatasetError(
+            f"决策 K 线 time-of-day 在 15:00–20:59，无法归属交易日: {bar.timestamp!r}"
+        )
+    trading_days = sorted(
+        {
+            pd.Timestamp(item.timestamp).date()
+            for item in bars
+            if pd.Timestamp(item.timestamp).time() < DAY_END
+        }
+    )
+    position = bisect.bisect_right(trading_days, calendar_day)
+    if position >= len(trading_days):
+        raise DatasetError(
+            f"夜盘决策 K 线在片段内找不到后续交易日，无法归属交易日: {bar.timestamp!r}"
+        )
+    return trading_days[position]
+
+
+def _usable_trend_extremes(
+    points: tuple[TurningPoint, ...], trade_date: dt.date
+) -> tuple[TrendExtreme, TrendExtreme] | None:
+    """决策交易日 ``trade_date`` 可用的最近 1 个 up + 1 个 down 折点段极值。
+
+    「可用」= 确认根日期（``timestamp`` 日历日）**严格早于** ``trade_date``（State(T)
+    不得引用 T 日及之后确认的折点，无未来泄漏）。先过滤后检查：up/down 任一侧缺失
+    是**正常边界**（调用方走跳过路径），返回 ``None`` 而不抛异常；两侧齐全时复用
+    :func:`recent_trend_extremes`（语义同源：段闭区间、平局取最早、时间倒序、段长
+    由点序列推导）。过滤后序列为 up/down 前缀，段长推导与全序列一致。
+
+    :raises DatasetError: 可用 up/down 点缺极值字段（文件损坏，硬错误不静默）
+    """
+    usable = tuple(
+        point
+        for point in points
+        if point.kind in ("up", "down") and point.timestamp.date() < trade_date
+    )
+    if not any(point.kind == "up" for point in usable):
+        return None
+    if not any(point.kind == "down" for point in usable):
+        return None
+    highs, lows = recent_trend_extremes(usable, n=1)
+    return highs[0], lows[0]
+
+
+def _default_daily_turning_points_dir(data_dir: str | Path) -> Path:
+    """日线折点默认目录：``<data_dir>/../turning_points``。
+
+    与 ``cli.turning_points_dir`` 落盘布局一致（episode ``data_dir`` 默认
+    ``<base_output>/ohlcv``，父目录即 base_output）；延迟导入避免模块级循环依赖。
+    """
+    from dataset.cli import turning_points_dir  # 延迟导入：cli 在模块层依赖本包
+
+    return turning_points_dir(Path(data_dir).parent)
+
+
 def _daily_line(
     board_state: BoardStateValues,
     reference_bar: Bar,
     price_precision: int,
+    trend_up_extreme: TrendExtreme,
+    trend_dn_extreme: TrendExtreme,
 ) -> str:
-    """日线行：上一交易日高/低/收的比值（分母 = 片段首根开盘价；分母 ≤ 0 时逐值写 ``na``）。"""
+    """日线行（v5）：上一交易日高/低/收 + 日线折点趋势极值的比值
+    （分母 = 片段首根开盘价；分母 ≤ 0 时逐值写 ``na``；段长为整数，不入比值口径）。"""
     return (
         "日线: "
         f"prev_h={format_ratio_value(ratio_or_none(board_state.prev_day_high, reference_bar.open), price_precision)}"
         f" prev_l={format_ratio_value(ratio_or_none(board_state.prev_day_low, reference_bar.open), price_precision)}"
         f" prev_c={format_ratio_value(ratio_or_none(board_state.prev_day_close, reference_bar.open), price_precision)}"
+        f" trend_up={format_ratio_value(ratio_or_none(trend_up_extreme.trend_extreme_price, reference_bar.open), price_precision)}"
+        f" trend_up_len={trend_up_extreme.segment_length}"
+        f" trend_dn={format_ratio_value(ratio_or_none(trend_dn_extreme.trend_extreme_price, reference_bar.open), price_precision)}"
+        f" trend_dn_len={trend_dn_extreme.segment_length}"
     )
 
 
@@ -206,12 +310,15 @@ def render_state(
     drawdown: float,
     price_precision: int,
     board_state: BoardStateValues,
+    trend_up_extreme: TrendExtreme,
+    trend_dn_extreme: TrendExtreme,
 ) -> str:
-    """确定性状态文本（v4 六部分：账户/联动/日线/日内/现价/盘口；模板见模块 docstring）。
+    """确定性状态文本（v5 六部分：账户/联动/日线/日内/现价/盘口；模板见模块 docstring）。
 
-    只做「决策 K 线单根 + 仓位 + 回撤 + 盘面状态」的序列化：函数签名决定它无法访问
-    决策 K 线之后的任何 bar（``board_state`` 的今日值由调用方只用 ≤ 决策 K 线的数据算好
-    传入，无未来数据泄漏在构造层面成立）。
+    只做「决策 K 线单根 + 仓位 + 回撤 + 盘面状态 + 日线折点极值」的序列化：函数签名
+    决定它无法访问决策 K 线之后的任何 bar（``board_state`` 的今日值由调用方只用
+    ≤ 决策 K 线的数据算好传入；折点极值由调用方按确认日 < 决策交易日过滤后传入，
+    无未来数据泄漏在构造层面成立）。
     """
     if position is None:
         held_text = POSITION_LABELS[None]
@@ -228,7 +335,13 @@ def render_state(
             STATE_SCHEMA,
             f"账户: 持仓={held_text} 回撤={format_ratio_value(drawdown, price_precision)}",
             vol_ratio_line(bar, reference_bar, price_precision),
-            _daily_line(board_state, reference_bar, price_precision),
+            _daily_line(
+                board_state,
+                reference_bar,
+                price_precision,
+                trend_up_extreme,
+                trend_dn_extreme,
+            ),
             _intraday_line(bar, board_state, reference_bar, price_precision),
             px_ratio_line(bar, reference_bar, price_precision),
             "盘口: na",
@@ -243,10 +356,14 @@ def build_record(
     point: DecisionPoint,
     price_precision: int,
     prev_day_ohlc: tuple[float, float, float],
+    trend_up_extreme: TrendExtreme,
+    trend_dn_extreme: TrendExtreme,
 ) -> dict[str, Any]:
     """把一个入选决策点映射为 NanoJev 训练记录。
 
     ``prev_day_ohlc`` = 上一交易日日线 (高, 低, 收)（来源 1d 文件，绝对价格层）；
+    ``trend_up_extreme``/``trend_dn_extreme`` = 该决策交易日可用的最近 up/down 折点段极值
+    （调用方按确认日 < 决策交易日过滤后传入，无未来数据泄漏）；
     ``today_high/today_low`` 只由 ``bars[: point.bar_index + 1]``（≤ 决策 K 线）累计，
     无未来数据泄漏。
     """
@@ -265,6 +382,8 @@ def build_record(
             today_high=max(item.high for item in prefix),
             today_low=min(item.low for item in prefix),
         ),
+        trend_up_extreme=trend_up_extreme,
+        trend_dn_extreme=trend_dn_extreme,
     )
     criteria = FLAT_CRITERIA if point.position is None else HELD_CRITERIA
     if point.action not in criteria:
@@ -380,20 +499,35 @@ def generate_dataset(
     data_dir: str | Path,
     params: EpisodeParams,
     output_dir: str | Path,
+    daily_turning_points_dir: str | Path | None = None,
 ) -> GenerationResult:
     """确定性地生成按 split 的 NanoJev JSONL 训练集与审计文件。
 
-    流程：清单/数据校验 → 逐片段回放 + 标签 → 记录映射 → 自检（结构、隔离、泄漏、
-    计数一致）→ 原子落盘到 ``<output_dir>/<run_id>``。
+    流程：清单/数据校验 → 逐片段回放 + 标签 → 逐入选决策点取可用日线折点极值（v5）
+    → 记录映射 → 自检（结构、隔离、泄漏、计数一致）→ 原子落盘到
+    ``<output_dir>/<run_id>``。
 
     v2 起：每个片段需在 ``{symbol}_1d.csv`` 中找到严格早于片段交易日的上一交易日
     日线（供 board_state 行）；找不到的片段被跳过（记入审计与结果，不静默），
     全部片段被跳过则硬错误（不写出任何产物）。
 
+    v5 起：每个片段还需在日线转折点文件（``{symbol}_1d.csv``，默认
+    ``<data_dir>/../turning_points``，``daily_turning_points_dir`` 可覆盖）中找到
+    确认日严格早于各入选决策交易日的 up/down 折点各 ≥1；文件缺失 → ``DataLoadError``
+    硬报错；任一入选决策点折点单侧/双侧缺失 → 跳过整个片段（记入审计与结果，
+    不静默）；全部片段被跳过则硬错误（不写出任何产物）。
+
     :raises DatasetError: 校验失败或自检不通过（不写出任何产物）
+    :raises DataLoadError: 日线/日线折点文件缺失或损坏（硬错误，不静默）
     """
     segments = tuple(segments)
     validate_segments(segments, data_dir=data_dir, symbols=symbols)
+
+    tp_dir = (
+        Path(daily_turning_points_dir)
+        if daily_turning_points_dir is not None
+        else _default_daily_turning_points_dir(data_dir)
+    )
 
     outcomes: dict[str, SegmentOutcome] = {}
     bars_by_segment: dict[str, tuple[Bar, ...]] = {}
@@ -401,6 +535,9 @@ def generate_dataset(
     daily_loaded_by_symbol: dict[str, Any] = {}
     prev_daily_by_segment: dict[str, tuple[float, float, float]] = {}
     board_state_skipped: dict[str, str] = {}
+    trend_points_by_symbol: dict[str, tuple[TurningPoint, ...]] = {}
+    trend_source_versions: dict[str, str] = {}
+    trend_extreme_skipped: dict[str, str] = {}
 
     for segment in segments:
         loaded = daily_loaded_by_symbol.get(segment.symbol)
@@ -423,9 +560,36 @@ def generate_dataset(
             params=params,
             source_data_version=source_version,
         )
+        # v5：逐入选决策点取其决策交易日的可用日线折点极值（确认日 < 决策交易日；
+        # 片段内按 trade_date 缓存，单交易日片段只算一次）
+        tp_points = trend_points_by_symbol.get(segment.symbol)
+        if tp_points is None:
+            loaded_points = load_turning_points(segment.symbol, "1d", data_dir=tp_dir)
+            tp_points = loaded_points.points
+            trend_points_by_symbol[segment.symbol] = tp_points
+            trend_source_versions[segment.symbol] = f"sha256={file_sha256(loaded_points.path)}"
+        extremes_by_trade_date: dict[dt.date, tuple[TrendExtreme, TrendExtreme]] = {}
+        prepared: list[tuple[DecisionPoint, TrendExtreme, TrendExtreme]] = []
+        missing_trade_date: dt.date | None = None
+        for point in outcome.selected:
+            trade_date = _bar_trade_date(bars, bars[point.bar_index])
+            if trade_date not in extremes_by_trade_date:
+                extremes = _usable_trend_extremes(tp_points, trade_date)
+                if extremes is None:
+                    missing_trade_date = trade_date
+                    break
+                extremes_by_trade_date[trade_date] = extremes
+            trend_up, trend_dn = extremes_by_trade_date[trade_date]
+            prepared.append((point, trend_up, trend_dn))
+        if missing_trade_date is not None:
+            trend_extreme_skipped[segment.segment_id] = (
+                f"trade_date={missing_trade_date} 缺日线转折点"
+                "（需确认日严格早于该交易日的 up/down 折点各 ≥1，1d 转折点文件）"
+            )
+            continue
         outcomes[segment.segment_id] = outcome
         bars_by_segment[segment.segment_id] = bars
-        for point in outcome.selected:
+        for point, trend_up, trend_dn in prepared:
             records_by_split[segment.split_role].append(
                 build_record(
                     segment=segment,
@@ -433,6 +597,8 @@ def generate_dataset(
                     point=point,
                     price_precision=params.price_precision,
                     prev_day_ohlc=prev,
+                    trend_up_extreme=trend_up,
+                    trend_dn_extreme=trend_dn,
                 )
             )
 
@@ -440,6 +606,11 @@ def generate_dataset(
         raise DatasetError(
             "所有片段都缺少上一交易日日线（1d 文件），无法生成 board_state 状态；"
             f"跳过明细: {dict(sorted(board_state_skipped.items()))}"
+        )
+    if not outcomes:
+        raise DatasetError(
+            "所有片段都缺少可用日线转折点（1d 转折点文件），无法生成 v5 日线行；"
+            f"跳过明细: {dict(sorted(trend_extreme_skipped.items()))}"
         )
 
     all_records = [
@@ -451,6 +622,8 @@ def generate_dataset(
         bars_by_segment=bars_by_segment,
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_by_segment,
+        trend_points_by_symbol=trend_points_by_symbol,
+        symbols_by_segment={segment.segment_id: segment.symbol for segment in segments},
     )
 
     segments_text = _dump_json([segment.canonical() for segment in segments])
@@ -488,6 +661,8 @@ def generate_dataset(
         split_digests=split_digests,
         input_hashes=input_hashes,
         board_state_skipped=board_state_skipped,
+        trend_extreme_skipped=trend_extreme_skipped,
+        trend_source_versions=trend_source_versions,
         daily_source_versions={
             symbol: loaded.source_data_version
             for symbol, loaded in daily_loaded_by_symbol.items()
@@ -507,6 +682,7 @@ def generate_dataset(
         output_sha256=digests,
         audit=payload,
         board_state_skipped=board_state_skipped,
+        trend_extreme_skipped=trend_extreme_skipped,
     )
 
 

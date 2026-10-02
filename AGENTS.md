@@ -77,17 +77,28 @@ MarketSense 是一个**研究型**项目，研究问题：
   持仓值中文化（空仓/持多/持空），数值语义与 v3 逐项等价
   （`STATE_SCHEMA = marketsense.episode_state.v4`；完整语义见
   `artifacts/state-template-four-parts/02-design/tech-design.md`）。
+  同日拍板状态模板升 v5（daily-extreme-state 任务）：「日线」行新增
+  `trend_up/trend_up_len/trend_dn/trend_dn_len` 4 键（最近可确认 up/down 折点的段内实际
+  极值价 ÷ 片段首根开盘价 + 对应段长；数据源 = 日线折点 CSV `data/turning_points/{symbol}_1d.csv`；
+  口径 = 折点确认根日期严格早于决策交易日、逐决策点各自取可用最近折点，决策交易日归属与
+  board_state 夜盘规则同口径；缺折点片段跳过并审计 + stderr 告警；`episode-generate` 新增
+  `--daily-turning-points-dir` 参数，默认 `<data_dir>/../turning_points`；
+  `STATE_SCHEMA = marketsense.episode_state.v5`；完整语义见
+  `artifacts/daily-extreme-state/02-design/tech-design.md`）。
   完整语义与实现阶段冻结项见 `artifacts/nanojev-training-data/02-design/tech-design.md`。
-- **首轮真实数据（2026-10-01 生成；2026-10-02 v2/v3/v4 状态模板 + 候选文案精简，均通过契约校验）**：
+- **首轮真实数据（2026-10-01 生成；2026-10-02 v2~v5 状态模板 + 候选文案精简，均通过契约校验）**：
   DCE.v2701（PVC）2026-09 全月 21 个交易日片段（`data/segments/sep2026.jsonl`：
   train 9-1~9-18 / dev 9-21~9-24 / test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
-  当前产物 `data/nanojev_dataset/run-3db1bf63afc2/`（模板 v4 + 精简候选文案，
-  **train 4188 / dev 886 / test 655**，全部非空；state 文本为 v4 六部分中文标签结构
-  （账户/联动/日线/日内/现价/盘口），数值语义与 v3 逐项等价，board_state 值已与
-  board-state CSV 全量交叉核对一致；当前 run 双跑 sha256 一致）；
-  历史 `run-36b037252a62/`（模板 v3）、`run-b25cfd1ff370/`（v2 状态 + 精简文案）、
+  当前产物 `data/nanojev_dataset/run-7cbd6516d46f/`（模板 v5 + 精简候选文案，
+  **train 1392 / dev 886 / test 655**，全部非空；state 文本为 v5 六部分中文标签结构
+  （账户/联动/日线/日内/现价/盘口），「日线」行含 trend 四键（数据源 = 日线折点 CSV，
+  确认根日期 < 决策交易日）；9 个 train 片段（9-1~9-11）因缺 up 折点跳过并告警；
+  board_state 值已与 board-state CSV 全量交叉核对一致，trend 四值与日线折点 CSV
+  独立重算一致；当前 run 双跑 sha256 一致）；
+  历史 `run-3db1bf63afc2/`（模板 v4，train 4188）、`run-36b037252a62/`（模板 v3）、
+  `run-b25cfd1ff370/`（v2 状态 + 精简文案）、
   `run-13aff088b982/`（v2 状态、候选文案含价位括号）与首轮 `run-c1cb097177a3/`（模板 v1）保留。
-  五者 NanoJev 原生 `--validate-only` 契约硬门均通过。`tick_size = 5` 为**用户确认值**
+  六者 NanoJev 原生 `--validate-only` 契约硬门均通过。`tick_size = 5` 为**用户确认值**
   （公开资料记载最小变动价位 1 元/吨，按用户确认执行，见 `dataset/config/symbols.local.yaml`）。
   Mac Intel 16G（无 CUDA）已完成数据通路三级 CPU 冒烟（`--self-check` / tokenize / 前向，
   全部通过）；**训练与推理入口硬性要求 CUDA，本机不可训练**（详见 `README.md` §7.4）。

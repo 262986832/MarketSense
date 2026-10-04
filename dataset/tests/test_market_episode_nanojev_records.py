@@ -141,6 +141,8 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
         price_precision=6,
         board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
         trend_context=RENDER_TREND_CONTEXT,
+        # v10：传入截至决策 K 线（含）的首根切片 → 可用根数 1 < 2 → 突破动量 na
+        breakthrough_bars=bar_list[:1],
     )
 
     assert state == (
@@ -151,7 +153,7 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
         "跌势(-1, 最低=39.800000, 时长=5根) 跌势(-2, 最低=39.700000, 时长=2根) "
         "趋势=涨势中 时长=3根 \n "
         "日内: 今高=1.002000 今低=0.998000 \n "
-        "联动: na \n "
+        "联动: 突破=na \n "
         "现价: 开=1.000000 高=1.002000 低=0.998000 收=1.000000 bar=0 成交量比=1.000000 持仓量比=1.000000 \n "
         "盘口: na"
     )
@@ -170,6 +172,10 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
         price_precision=6,
         board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
         trend_context=RENDER_TREND_CONTEXT,
+        # v10：传入截至决策 K 线（含）的 2 根切片，手算突破动量：
+        # bar1(高=1010, 收=1008) vs bar0(高=1000.5, 收=1000)：高↑且收↑ → 信号 +1；
+        # n=2 → 单信号权重 1 → momentum = 1·(+1)/1 = 1.0 → 突破=1.000000
+        breakthrough_bars=bar_list,
     )
 
     assert state == (
@@ -180,7 +186,7 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
         "跌势(-1, 最低=3.980000, 时长=5根) 跌势(-2, 最低=3.970000, 时长=2根) "
         "趋势=涨势中 时长=3根 \n "
         "日内: 今高=1.010000 今低=0.999500 \n "
-        "联动: na \n "
+        "联动: 突破=1.000000 \n "
         "现价: 开=1.000000 高=1.010000 低=1.000500 收=1.008000 bar=1 成交量比=1.000000 持仓量比=1.001996 \n "
         "盘口: na"
     )
@@ -217,7 +223,7 @@ def test_render_state_marks_undefined_denominators_as_na() -> None:
 
     assert "成交量比=na" in state  # v7：量比在现价行，volume=0 → na
     assert "持仓量比=na" in zero_oi_state  # v7：持仓量只保留收盘，close_oi=0 → na
-    assert "联动: na" in state
+    assert "联动: 突破=na" in state  # v10：缺省空序列（可用根数 < 2）→ na
     assert "日线: 昨日高=2.010000" in state  # 日线行不受分母影响（价格分母正常）
     assert "inf" not in state and "nan" not in state
 

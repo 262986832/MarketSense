@@ -42,8 +42,9 @@ from dataset.config import (
     ENV_CONFIG,
     ENV_DATA_DIR,
 )
-from dataset.errors import ConfigError, DatasetError
+from dataset.errors import ConfigError, DatasetError, UnknownPeriodError
 from dataset.ohlcv import TIMEZONE
+from dataset.periods import resolve_duration_seconds
 from dataset.storage import load_ohlcv
 
 #: 片段清单每行的显式 schema 标记
@@ -85,6 +86,8 @@ _EPISODE_KEYS: Final[tuple[str, ...]] = (
     "reward_risk_threshold",
     "price_precision",
     "flat_sample_band_minutes",
+    "breakthrough_window",
+    "breakthrough_period",
 )
 #: episode 参数在 ``episode`` 段中的键名
 _PARAM_KEYS: Final[tuple[str, ...]] = (
@@ -92,7 +95,13 @@ _PARAM_KEYS: Final[tuple[str, ...]] = (
     "reward_risk_threshold",
     "price_precision",
     "flat_sample_band_minutes",
+    "breakthrough_window",
+    "breakthrough_period",
 )
+
+#: 联动行突破动量允许的粒度（``1d`` 显式拒绝：片段窗口 < 1 个交易日，
+#: 聚合至多 1 桶，相邻对统计无意义；来源 linkage-breakthrough tech-design §方案 3）
+BREAKTHROUGH_PERIODS: Final[tuple[str, ...]] = ("1m", "5m", "15m", "1h")
 
 
 @dataclass(frozen=True)
@@ -157,6 +166,10 @@ class EpisodeParams:
     price_precision: int = 6
     #: (b) 采样带宽：机会分钟周边 ± N 个空仓分钟的"不做"样本
     flat_sample_band_minutes: int = 2
+    #: 联动行突破动量窗口（最近 N 根已收盘 K 线/桶的相邻对加权，默认 20）
+    breakthrough_window: int = 20
+    #: 联动行突破动量的 K 线粒度（1m 直接用决策序列；5m/15m/1h 重采样；1d 拒绝）
+    breakthrough_period: str = "1m"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +177,8 @@ class EpisodeParams:
             "reward_risk_threshold": self.reward_risk_threshold,
             "price_precision": self.price_precision,
             "flat_sample_band_minutes": self.flat_sample_band_minutes,
+            "breakthrough_window": self.breakthrough_window,
+            "breakthrough_period": self.breakthrough_period,
         }
 
 
@@ -466,11 +481,34 @@ def load_episode_params(section: Mapping[str, Any], *, where: str) -> EpisodePar
     band = defaults.flat_sample_band_minutes
     if "flat_sample_band_minutes" in section:
         band = _nonnegative_int(section, "flat_sample_band_minutes", where=where)
+    window = defaults.breakthrough_window
+    if "breakthrough_window" in section:
+        window = _nonnegative_int(section, "breakthrough_window", where=where)
+        if window < 1:
+            raise ConfigError(f"{where} 的 breakthrough_window 必须 ≥ 1")
+    period = defaults.breakthrough_period
+    if "breakthrough_period" in section:
+        period = _nonempty_str(section, "breakthrough_period", where=where)
+    allowed = ", ".join(BREAKTHROUGH_PERIODS)
+    if period not in BREAKTHROUGH_PERIODS:
+        raise ConfigError(
+            f"{where} 的 breakthrough_period 必须为 {allowed} 之一，实际: {period!r}"
+            f"（经 resolve_duration_seconds 校验；1d/未知周期不支持）"
+        )
+    try:
+        resolve_duration_seconds(period)
+    except UnknownPeriodError:
+        # 与白名单双保险：映射表未来若调整，这里兜底拒绝未登记周期
+        raise ConfigError(
+            f"{where} 的 breakthrough_period 必须为 {allowed} 之一，实际: {period!r}"
+        ) from None
     return EpisodeParams(
         drawdown_threshold=float(drawdown),
         reward_risk_threshold=float(reward_risk),
         price_precision=int(precision),
         flat_sample_band_minutes=int(band),
+        breakthrough_window=int(window),
+        breakthrough_period=str(period),
     )
 
 

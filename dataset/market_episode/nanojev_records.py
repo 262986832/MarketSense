@@ -41,11 +41,11 @@ up/down 折点各 ≥2 + 新增缺决策交易日日线行跳过原因），其�
 2026-10-03 用户拍板，见 ``artifacts/trend-state-v9/02-design/tech-design.md``）**
 
 ```text
-marketsense.episode_state.v9
+marketsense.episode_state.v10
 账户: 持仓=空仓 净值=<..> 今日=<..> 回撤=<..>
 日线: 昨日高=<..> 昨日低=<..> 昨日收=<..> 涨势(-1, 最高=<..>, 时长=<n>根) 涨势(-2, 最高=<..>, 时长=<n>根) 跌势(-1, 最低=<..>, 时长=<n>根) 跌势(-2, 最低=<..>, 时长=<n>根) 趋势=<涨势中|跌势中|震荡> 时长=<n>根
 日内: 今高=<..> 今低=<..>
-联动: na
+联动: 突破=<momentum|na>
 现价: 开=<..> 高=<..> 低=<..> 收=<..> bar=<片段内 0 基序号> 成交量比=<..> 持仓量比=<..>
 盘口: na
 ```
@@ -53,14 +53,20 @@ marketsense.episode_state.v9
 （行与行之间用 ``" \n "`` 连接，即换行符前后各一个空格。持仓非空时账户行为：
 ``账户: 持仓=持多|持空 开仓价=<..> 止损价=<..> 净值=<..> 今日=<..> 回撤=<..>``。）
 
+v10：联动行升为突破动量（``联动: 突破=<momentum|na>``；momentum ∈ [-1, +1]，
+三态判据 + 权重 1..N-1 线性加权，只用已收盘 K 线/桶；首根/可用根数 < 2 → ``na``；
+窗口/周期 = ``EpisodeParams.breakthrough_window/breakthrough_period``，见
+``artifacts/linkage-breakthrough/02-design/tech-design.md``）。
+
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
 * **无历史窗口**：状态只含决策 K 线单根 + 仓位 + 净值 + 今日 + 回撤 + 盘面状态
   （v4 拆「日线」「日内」两行，v5 在日线行追加折点趋势项，v7 键名中文化并将量/持仓量比
   与 bar 序号并入现价行，v8 账户行升六键加净值/今日，v9 日线行趋势项升为各 2 项 +
   三分支趋势状态），绝对价格不进入模型输入；
-  「盘口」与「联动」行为 ``na`` 常量占位
-  （真实 bid/ask 未接，非目标；v7 起量/持仓量比已并入现价行，联动行不再承载实际值）；
+  「盘口」行为 ``na`` 常量占位
+  （真实 bid/ask 未接，非目标；v7 起量/持仓量比已并入现价行；联动行 v10 起为突破动量，
+  见上，不再是常量占位）；
 * **账户行**（v4，v8 升六键）：持仓值中文标签（空仓/持多/持空，未知方向抛
   ``DatasetError`` 不静默）；v8 起键序固定为 持仓/[开仓价/止损价]/净值/今日/回撤
   （磁盘键名沿用 v7 的 ``开仓价/止损价``，内部字段 entry/stop；空仓时无开仓价/止损价
@@ -126,12 +132,13 @@ import shutil
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
 from dataset.board_state import DAY_END, NIGHT_START
 from dataset.errors import DatasetError
+from dataset.periods import resolve_duration_seconds
 from dataset.storage import file_sha256, load_ohlcv
 from dataset.turning_points import (
     TrendExtreme,
@@ -161,6 +168,7 @@ from dataset.market_episode.labels import (
     SegmentOutcome,
     evaluate_segment,
 )
+from dataset.market_episode.linkage import breakthrough_momentum
 from dataset.market_episode.replay import (
     Bar,
     LONG,
@@ -203,7 +211,11 @@ from dataset.market_episode.segments import (
 #: 跳过判据收紧为 up/down 折点各 ≥2 + 新增「缺决策交易日日线行」跳过原因；
 #: 其余行与 v8 逐字节同构，2026-10-03 用户拍板，
 #: 见 artifacts/trend-state-v9/02-design/tech-design.md）
-STATE_SCHEMA = "marketsense.episode_state.v9"
+#: v10 联动行升为突破动量 ``联动: 突破=<momentum|na>``（三态判据 + 权重 1..N-1 线性
+#: 加权 + 只用已收盘 K 线/桶；首根/可用根数 < 2 → ``na``；窗口/周期 =
+#: EpisodeParams.breakthrough_window/breakthrough_period，其余五行与 v9 逐字节同构，
+#: 见 artifacts/linkage-breakthrough/02-design/tech-design.md）
+STATE_SCHEMA = "marketsense.episode_state.v10"
 #: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
 QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
@@ -442,8 +454,11 @@ def render_state(
     price_precision: int,
     board_state: BoardStateValues,
     trend_context: UsableTrendContext,
+    breakthrough_bars: Sequence[Bar] = (),
+    breakthrough_window: int = 20,
+    breakthrough_duration_seconds: int = 60,
 ) -> str:
-    """确定性状态文本（v9 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
+    """确定性状态文本（v10 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
 
     只做「决策 K 线单根 + 仓位 + 净值 + 今日 + 回撤 + 盘面状态 + 日线折点趋势上下文」
     的序列化：函数签名决定它无法访问决策 K 线之后的任何 bar（``board_state`` 的今日值与
@@ -454,6 +469,13 @@ def render_state(
     v7：联动行变为 ``na`` 常量占位（量/持仓量比值移入现价行）；``bar`` 序号移入现价行。
     v8：账户行升六键（持仓/[开仓价/止损价]/净值/今日/回撤，键序固定）。
     v9：日线行趋势项升为涨势/跌势各 2 项（编号倒序 -1/-2）+ 三分支趋势状态与时长。
+    v10：联动行升为突破动量 ``联动: 突破=<momentum|na>``——对 ``breakthrough_bars``
+    （调用方传入**截至决策 K 线 T（含）**的片段 1m 序列，防泄漏上界由调用方切片保证）
+    按 ``breakthrough_window``/``breakthrough_duration_seconds`` 计算
+    （``dataset.market_episode.linkage.breakthrough_momentum``，函数内只用已收盘数据：
+    1m 逐根天然收盘，非 1m 由重采样 ``is_closed`` 排除未收满桶）；
+    首根/可用根数 < 2 → ``na``（缺省空序列同）。缺省窗口/周期 = EpisodeParams 默认口径，
+    生产调用方（build_record）必须显式透传 params 派生值。
     """
     account_values = (
         f"净值={format_ratio_value(net_value, price_precision)}"
@@ -470,6 +492,14 @@ def render_state(
             f"{label} 开仓价={format_ratio_value(position.entry_ratio, price_precision)}"
             f" 止损价={format_ratio_value(position.stop_ratio, price_precision)}"
         )
+    # v10 联动行：突破动量（momentum ∈ [-1, +1]，非比值；首根/可用根数不足 → na）。
+    # breakthrough_bars 必须已截至决策 K 线 T（含）：build_record 传 bars[: bar_index + 1]，
+    # 防泄漏上界由调用方切片保证；momentum 函数内只用已收盘数据（1m 逐根天然收盘；
+    # 非 1m 由 resample_bars 的 is_closed 排除未收满桶），正负号照常（负值自然带 - 号）。
+    momentum = breakthrough_momentum(
+        breakthrough_bars, breakthrough_window, breakthrough_duration_seconds
+    )
+    linkage_line = f"联动: 突破={format_ratio_value(momentum, price_precision)}"
     return " \n ".join(
         (
             STATE_SCHEMA,
@@ -481,7 +511,7 @@ def render_state(
                 trend_context=trend_context,
             ),
             _intraday_line(board_state, reference_bar, price_precision),
-            "联动: na",
+            linkage_line,
             px_ratio_line(bar, reference_bar, price_precision),
             "盘口: na",
         )
@@ -496,6 +526,8 @@ def build_record(
     price_precision: int,
     prev_day_ohlc: tuple[float, float, float],
     trend_context: UsableTrendContext,
+    breakthrough_window: int = 20,
+    breakthrough_duration_seconds: int = 60,
 ) -> dict[str, Any]:
     """把一个入选决策点映射为 NanoJev 训练记录。
 
@@ -505,7 +537,12 @@ def build_record(
     无未来数据泄漏）；
     ``today_high/today_low`` 只由 ``bars[: point.bar_index + 1]``（≤ 决策 K 线）累计，
     无未来数据泄漏；``point.net_value/point.today_pnl``（v8 账户行「净值/今日」）同样由
-    调用方（账户回放）只用 ≤ 决策 K 线的数据算好透传（跨片段净值链由后续任务接入）。
+    调用方（账户回放）只用 ≤ 决策 K 线的数据算好透传（跨片段净值链由后续任务接入）；
+    ``breakthrough_window/breakthrough_duration_seconds``（v10 联动行）＝突破动量的窗口与
+    周期秒数（生产调用方由 ``params.breakthrough_window`` /
+    ``resolve_duration_seconds(params.breakthrough_period)`` 传入；缺省 = EpisodeParams
+    默认口径 20/60；联动行动量对 ``bars[: point.bar_index + 1]``（≤ 决策 K 线）计算，
+    防泄漏上界同上）。
     """
     bar = bars[point.bar_index]
     prefix = bars[: point.bar_index + 1]
@@ -525,6 +562,9 @@ def build_record(
             today_low=min(item.low for item in prefix),
         ),
         trend_context=trend_context,
+        breakthrough_bars=prefix,
+        breakthrough_window=breakthrough_window,
+        breakthrough_duration_seconds=breakthrough_duration_seconds,
     )
     criteria = FLAT_CRITERIA if point.position is None else HELD_CRITERIA
     if point.action not in criteria:
@@ -758,9 +798,15 @@ def generate_dataset(
         if daily_turning_points_dir is not None
         else _default_daily_turning_points_dir(data_dir)
     )
+    # v10：联动行突破动量的周期秒数（1m→60 直接用决策序列；5m/15m/1h 重采样；
+    # 1d/未知周期已由 EpisodeParams 校验拒绝）
+    breakthrough_duration_seconds = resolve_duration_seconds(params.breakthrough_period)
 
     outcomes: dict[str, SegmentOutcome] = {}
     bars_by_segment: dict[str, tuple[Bar, ...]] = {}
+    # v10：1m K 线按 symbol → segment_id 两级缓存（同 symbol 多片段各自独立序列，
+    # 不跨片段延伸），供 check_state_leakage 审计侧联动行独立复算
+    bars_by_symbol: dict[str, dict[str, tuple[Bar, ...]]] = {}
     records_by_split: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLIT_ROLES}
     daily_loaded_by_symbol: dict[str, Any] = {}
     # v9：日线行元组按 symbol 缓存（上一交易日查找与决策交易日行号查找共用同源行序）
@@ -793,6 +839,7 @@ def generate_dataset(
             continue
         prev_daily_by_segment[segment.segment_id] = prev
         bars, source_version = load_segment_bars(segment, data_dir=data_dir)
+        bars_by_symbol.setdefault(segment.symbol, {})[segment.segment_id] = bars
         # v8（T5b）：净值链节传递——本片段起点 = 上一评估片段末结算净值/峰值
         # （净值尺度 ÷ NET_VALUE_BASE 换算为 equity 尺度；首片段 = 100/100）
         outcome = evaluate_segment(
@@ -890,6 +937,8 @@ def generate_dataset(
                     price_precision=params.price_precision,
                     prev_day_ohlc=prev,
                     trend_context=context,
+                    breakthrough_window=params.breakthrough_window,
+                    breakthrough_duration_seconds=breakthrough_duration_seconds,
                 )
             )
 
@@ -938,6 +987,11 @@ def generate_dataset(
         symbols_by_segment={segment.segment_id: segment.symbol for segment in segments},
         account_inputs_by_segment=account_inputs_by_segment,
         daily_rows_by_symbol=daily_rows_by_symbol,
+        # v10：联动行突破动量独立复算入参（symbol → segment_id → 片段完整 1m 序列）
+        # + 窗口/周期秒数（生成侧同源透传，审计侧内联重写判据防自证）
+        bars_by_symbol=bars_by_symbol,
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=breakthrough_duration_seconds,
     )
 
     segments_text = _dump_json([segment.canonical() for segment in segments])

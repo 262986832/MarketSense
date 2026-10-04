@@ -328,6 +328,8 @@ def test_load_episode_params_defaults_and_overrides() -> None:
         "reward_risk_threshold": 3.0,
         "price_precision": 6,
         "flat_sample_band_minutes": 2,
+        "breakthrough_window": 20,
+        "breakthrough_period": "1m",
     }
 
     params = load_episode_params(

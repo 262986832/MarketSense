@@ -38,6 +38,7 @@ from dataset.market_episode.segments import (
     load_segments,
     load_symbols_config,
 )
+from dataset.periods import resolve_duration_seconds
 from dataset.storage import save_ohlcv
 from dataset.tests.market_episode_fixtures import (
     RENDER_TREND_CONTEXT,
@@ -95,6 +96,20 @@ def _symbols_by_segment(workspace) -> dict[str, str]:
     return {segment.segment_id: segment.symbol for segment in load_segments(workspace.manifest)}
 
 
+def _bars_by_symbol(
+    workspace, bars_by_segment
+) -> dict[str, dict[str, tuple]]:
+    """symbol → segment_id → 片段完整 1m 序列（v10 联动行独立复算入参，两级容器）。
+
+    构造方式与生成侧同构（``generate_dataset``：
+    ``bars_by_symbol.setdefault(segment.symbol, {})[segment.segment_id] = bars``）。
+    """
+    mapping: dict[str, dict[str, tuple]] = {}
+    for segment_id, symbol in _symbols_by_segment(workspace).items():
+        mapping.setdefault(symbol, {})[segment_id] = bars_by_segment[segment_id]
+    return mapping
+
+
 def _account_inputs_by_segment(
     segments, symbols, params, bars_by_segment
 ) -> dict[str, AccountReplayInputs]:
@@ -150,6 +165,9 @@ def test_generated_records_pass_all_audit_checks(tmp_path: Path) -> None:
         trend_points_by_symbol=daily_trend_points_map(workspace),
         daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
     )
     check_audit_consistency(result.audit, _records_by_split(result))
     assert all(row["split"] in SPLIT_ROLES for row in records)
@@ -196,6 +214,9 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
         trend_points_by_symbol=daily_trend_points_map(workspace),
         daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
     )
 
     # 人为把某条记录的状态换成分片内"下一根"的比值行 → 必须被检出
@@ -232,6 +253,9 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
             trend_points_by_symbol=daily_trend_points_map(workspace),
             daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
+            bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+            breakthrough_window=params.breakthrough_window,
+            breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         )
 
 
@@ -261,6 +285,9 @@ def test_state_leakage_detects_absolute_price_in_state(tmp_path: Path) -> None:
             trend_points_by_symbol=daily_trend_points_map(workspace),
             daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
+            bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+            breakthrough_window=params.breakthrough_window,
+            breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         )
 
 
@@ -275,6 +302,9 @@ def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
         trend_points_by_symbol=daily_trend_points_map(workspace),
         daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
     )
 
     tampered = [copy.deepcopy(record) for record in records]
@@ -293,6 +323,9 @@ def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
             trend_points_by_symbol=daily_trend_points_map(workspace),
             daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
+            bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+            breakthrough_window=params.breakthrough_window,
+            breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         )
 
 
@@ -314,6 +347,9 @@ def test_state_leakage_detects_prev_daily_absolute_price(tmp_path: Path) -> None
             trend_points_by_symbol=daily_trend_points_map(workspace),
             daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
+            bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+            breakthrough_window=params.breakthrough_window,
+            breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         )
 
 
@@ -512,6 +548,9 @@ def test_state_leakage_detects_wrong_trend_line(tmp_path: Path) -> None:
         trend_points_by_symbol=daily_trend_points_map(workspace),
         daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
     )
 
     tampered = [copy.deepcopy(record) for record in records]
@@ -529,6 +568,9 @@ def test_state_leakage_detects_wrong_trend_line(tmp_path: Path) -> None:
             trend_points_by_symbol=daily_trend_points_map(workspace),
             daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
+            bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+            breakthrough_window=params.breakthrough_window,
+            breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         )
 
 
@@ -547,6 +589,9 @@ def test_state_leakage_detects_trend_extreme_absolute_price(tmp_path: Path) -> N
             trend_points_by_symbol=daily_trend_points_map(workspace),
             daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
+            bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+            breakthrough_window=params.breakthrough_window,
+            breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         )
 
 
@@ -598,6 +643,9 @@ def test_state_leakage_account_line_independent_recompute(tmp_path: Path) -> Non
         trend_points_by_symbol=daily_trend_points_map(workspace),
         daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         account_inputs_by_segment=_account_inputs_by_segment(
             segments, symbols, params, bars_by_segment
         ),
@@ -624,6 +672,9 @@ def test_state_leakage_detects_tampered_account_line(tmp_path: Path) -> None:
         trend_points_by_symbol=daily_trend_points_map(workspace),
         daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
     )
 
     # 正常记录（未篡改）→ 通过
@@ -650,3 +701,78 @@ def test_state_leakage_detects_tampered_account_line(tmp_path: Path) -> None:
         r"净值=[\d.]+", "净值=9.999999", tampered[0]["state"], count=1
     )
     check_state_leakage(tampered, **kwargs)
+
+
+def test_state_leakage_linkage_line_independent_recompute(tmp_path: Path) -> None:
+    """v10 联动行：传入 ``bars_by_symbol``（两级容器）后全部正常记录通过。
+
+    期望值按夹具 K 线手算（_PATTERN 每段前 2 根：
+    bar0=(1000, 1000.5, 999.5, 1000)、bar1=(1000, 1010, 1000, 1009)）：
+    - 片段首根（bar0）：可用根数 1 < 2 → ``突破=na``；
+    - bar1：bar1.high=1010 > bar0.high=1000.5 且 bar1.close=1009 > bar0.close=1000
+      → 信号 +1；n=2 → 单信号权重 1 → momentum = 1·(+1)/1 = 1.0 → ``突破=1.000000``。
+    """
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
+    check_state_leakage(
+        records,
+        bars_by_segment=bars_by_segment,
+        price_precision=params.price_precision,
+        prev_daily_by_segment=prev_daily_map(workspace),
+        trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
+        symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
+    )
+
+    first = next(record for record in records if parse_state_id(record["state_id"])[1] == 0)
+    second = next(record for record in records if parse_state_id(record["state_id"])[1] == 1)
+    assert "联动: 突破=na" in first["state"]  # 片段首根 → 可用根数不足 → na
+    assert "联动: 突破=1.000000" in second["state"]  # 手算 +1（见 docstring 算式）
+
+
+def test_state_leakage_detects_tampered_linkage_line(tmp_path: Path) -> None:
+    """v10 联动行 tamper 防护：突破动量实算值 / na 占位任一被篡改 → DatasetError。
+
+    另锁定 ``bars_by_symbol`` 缺省 None 的 v9 旧行为：联动行按 ``联动: na`` 常量
+    占位比对（v9 格式记录可过；v10 格式记录在该缺省下报错）。
+    """
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
+    kwargs = dict(
+        bars_by_segment=bars_by_segment,
+        price_precision=params.price_precision,
+        prev_daily_by_segment=prev_daily_map(workspace),
+        trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
+        symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
+    )
+
+    # 篡改实算突破动量（bar1，期望 1.000000）→ 独立复算不一致 → DatasetError
+    tampered = [copy.deepcopy(record) for record in records]
+    second = next(record for record in tampered if parse_state_id(record["state_id"])[1] == 1)
+    assert "突破=1.000000" in second["state"]
+    second["state"] = re.sub(r"突破=[\d.]+", "突破=9.999999", second["state"], count=1)
+    with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
+        check_state_leakage(tampered, **kwargs)
+
+    # 篡改片段首根 na 占位（bar0）→ 期望 na 不再匹配 → DatasetError
+    tampered = [copy.deepcopy(record) for record in records]
+    first = next(record for record in tampered if parse_state_id(record["state_id"])[1] == 0)
+    first["state"] = first["state"].replace("联动: 突破=na", "联动: 突破=9.999999", 1)
+    with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
+        check_state_leakage(tampered, **kwargs)
+
+    # 缺省 bars_by_symbol=None → v9 旧行为：联动行按 `联动: na` 常量占位比对——
+    # 构造 v9 格式联动行记录（全部决策点联动行还原为 na 常量）→ 通过
+    v9_style = [copy.deepcopy(record) for record in records]
+    for record in v9_style:
+        record["state"] = re.sub(r"联动: 突破=\S+", "联动: na", record["state"], count=1)
+    check_state_leakage(v9_style, **dict(kwargs, bars_by_symbol=None))
+
+    # 同一批 v10 格式记录在 None 缺省下报错（None 只兼容 v9 格式联动行）
+    with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
+        check_state_leakage(records, **dict(kwargs, bars_by_symbol=None))

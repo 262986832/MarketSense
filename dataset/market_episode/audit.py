@@ -87,10 +87,15 @@ GOLD_LABEL_KINDS = frozenset(
 #: 段长「时长=n根」）+ 对称三分支趋势状态与状态时长（最近可用折点确认根 → 决策交易日
 #: T 的 1d 行号差），daily_trend_extremes 值升为 recent_2up_2down 口径、新增
 #: daily_trend_state 键（三分支判据 + 时长口径），AUDIT_SCHEMA 仍保持 v1：
-#: daily_trend_state 为纯增量键，演进标记继续由 state_template 承载）
+#: daily_trend_state 为纯增量键，演进标记继续由 state_template 承载；
+#: v10 起联动行升为突破动量（三态判据 + 权重 1..N-1 线性加权 + 只用已收盘 K 线/桶；
+#: 首根/可用根数 < 2 → na；窗口/周期 = EpisodeParams.breakthrough_window/
+#: breakthrough_period），state_template 追加 +breakthrough_momentum 标记并新增
+#: breakthrough 键，既有 daily_trend_extremes/daily_trend_state 键不变，
+#: AUDIT_SCHEMA 仍保持 v1（联动行为行内替换，非新增节））
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v9:decision_bar_only+board_state+daily_trend_extremes+account_net_value",
+    "state_template": "marketsense.episode_state.v10:decision_bar_only+board_state+daily_trend_extremes+account_net_value+breakthrough_momentum",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "net_value_base_100:equity=100*(1+cum_ratio_pnl),1_lot=1_notional,no_multiplier,no_fees",
@@ -101,6 +106,7 @@ FROZEN_DECISIONS: Mapping[str, str] = {
     "board_state_today": "segment_bars_cumulative_extrema_through_decision_bar",
     "daily_trend_extremes": "daily_tp_csv_confirmed_date_lt_trade_date__recent_2up_2down_over_segment_first_open",
     "daily_trend_state": "symmetric_-1_vs_-2_extreme_price:up=both_gt,down=both_lt,else_range_incl_equal__duration=recent_pivot_confirm_to_trade_date_daily_open_bars",
+    "breakthrough": "three_state_high_close_symmetric__linear_weights_1_to_k__closed_bar_window",
     "account_carry": "net_value_and_peak_carry_across_segments_time_ordered_serial_replay",
     "today_pnl": "segment_equity_change_resets_per_segment",
     "question_template": "marketsense.episode_question.v1:concise_action_labels",
@@ -278,6 +284,76 @@ def _independent_px_line(bar: Bar, reference: Bar, precision: int) -> str:
         f"现价: 开={values[0]} 高={values[1]} 低={values[2]} 收={values[3]}"
         f" bar={values[4]} 成交量比={values[5]} 持仓量比={values[6]}"
     )
+
+
+def _independent_breakthrough_momentum(
+    bars: tuple[Bar, ...], window: int, duration_seconds: int
+) -> float | None:
+    """独立内联重算联动行突破动量（v10；**不调用** ``dataset.market_episode.linkage``
+    的任何计算函数，三态判据/重采样聚合/加权全部内联重写，防自证）。
+
+    * 三态信号（严格比较，相等 → 0）：+1 若 cur.high > prev.high 且 cur.close > prev.close；
+      -1 若 cur.low < prev.low 且 cur.close < prev.close；其余 0；
+    * 1m（``duration_seconds == 60``）直接用 ``bars``（逐根天然已收盘）；非 1m 按同聚合
+      规则内联重采样：桶起点 = floor(开盘 epoch 秒 / duration) × duration（休市后下一根
+      按自身时间重新对齐，跨休市不拼接），聚合 high = max / low = min / close = 末根
+      （信号只读三值），收满判定 = 下一桶首根开盘时刻 ≥ 桶终点（末桶无下一根 →
+      未收满不可用），只取已收满桶；
+    * ``n = min(window, 可用根数) < 2`` → ``None``（渲染层映射 ``突破=na``）；
+      权重 1..n-1（最近信号权重最大），动量 = Σ(w·s)/Σw（纯 Python 求和）。
+    """
+    if window < 1:
+        raise DatasetError(f"审计独立复算：window 必须 ≥ 1，实际: {window}")
+    closed: list[tuple[float, float, float]]
+    if duration_seconds == 60:
+        closed = [(bar.high, bar.low, bar.close) for bar in bars]
+    else:
+        if duration_seconds < 1:
+            raise DatasetError(
+                f"审计独立复算：duration_seconds 必须 ≥ 1，实际: {duration_seconds}"
+            )
+        buckets: dict[int, list[Bar]] = {}
+        for item in bars:
+            open_ts = int(pd.Timestamp(item.timestamp).value) // 10**9
+            start = open_ts // duration_seconds * duration_seconds
+            buckets.setdefault(start, []).append(item)
+        starts = sorted(buckets)
+        closed = []
+        for position, start in enumerate(starts):
+            group = buckets[start]
+            if position + 1 < len(starts):
+                next_open = int(
+                    pd.Timestamp(buckets[starts[position + 1]][0].timestamp).value
+                ) // 10**9
+                if next_open < start + duration_seconds:
+                    continue  # 未收满桶不可用（下一根 1m 落在本桶内）
+            else:
+                continue  # 末桶无下一根 → 未收满不可用（片段尾桶）
+            closed.append(
+                (
+                    max(item.high for item in group),
+                    min(item.low for item in group),
+                    group[-1].close,
+                )
+            )
+    count = min(window, len(closed))
+    if count < 2:
+        return None
+    sequence = closed[-count:]
+    numerator = 0.0
+    denominator = 0
+    for weight in range(1, count):
+        prev_high, prev_low, prev_close = sequence[weight - 1]
+        cur_high, cur_low, cur_close = sequence[weight]
+        if cur_high > prev_high and cur_close > prev_close:
+            signal = 1
+        elif cur_low < prev_low and cur_close < prev_close:
+            signal = -1
+        else:
+            signal = 0
+        numerator += weight * signal
+        denominator += weight
+    return numerator / denominator
 
 
 def _independent_daily_line(
@@ -684,6 +760,9 @@ def check_state_leakage(
     symbols_by_segment: Mapping[str, str],
     account_inputs_by_segment: Mapping[str, AccountReplayInputs] | None = None,
     daily_rows_by_symbol: Mapping[str, tuple[tuple[Any, float, float, float], ...]] | None = None,
+    bars_by_symbol: Mapping[str, Mapping[str, tuple[Bar, ...]]] | None = None,
+    breakthrough_window: int = 20,
+    breakthrough_duration_seconds: int = 60,
 ) -> None:
     """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的数据计算。
 
@@ -705,6 +784,15 @@ def check_state_leakage(
       时由 :func:`_independent_account_values` 独立复算并与 state 文本逐值比对，
       任一值被篡改/与重放不一致即 ``DatasetError``（防自证/tamper 防护）；缺省
       ``None`` 保持旧行为（账户行不参与复算比对）；
+    * 联动行（v10/T4 接线）：传入 ``bars_by_symbol``（symbol → segment_id → 该片段
+      完整 1m 序列的两级容器；同 symbol 多片段各自独立、不跨片段延伸）时，对每决策点
+      用 :func:`_independent_breakthrough_momentum` 独立复算突破动量（对
+      ``bars[: bar_index + 1]``（≤ 决策 K 线）切片，窗口 = ``breakthrough_window``、
+      周期秒 = ``breakthrough_duration_seconds``（生产侧由 EpisodeParams 派生同源透传），
+      三态判据/聚合/加权全部内联重写，不调用 linkage 模块函数防自证）并与 state 文本
+      逐值比对（首根/可用根数 < 2 → ``突破=na`` 同样比对），不一致 → ``DatasetError``
+      （消息含 segment/bar 定位）；缺省 ``None`` 保持 v9 旧行为（联动行按 ``na``
+      常量占位比对，既有调用点零破坏）；
     * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量，也不得出现上一交易日
       日线的绝对价格与该记录可用折点的绝对极值价（它们只能以比值出现；v9 起可用
       折点含涨势/跌势 -1/-2 共 4 个入选极值，全部在扫描范围内）。
@@ -789,9 +877,39 @@ def check_state_leakage(
                 price_precision,
                 trend_context,
             )
+        if bars_by_symbol is None:
+            # v5~v9 旧行为（缺省 None，既有调用点零破坏）：联动行按常量占位比对
+            expected_linkage = "联动: na"
+        else:
+            # v10（T4）：联动行突破动量独立复算（三态判据 + 加权内联重写，不调用
+            # linkage 模块函数防自证）；容器 = symbol → segment_id → 片段完整 1m 序列
+            # （同 symbol 多片段各自独立，不跨片段延伸）；复算对 bars[: bar_index + 1]
+            # （≤ 决策 K 线）切片，防泄漏上界与生成侧同口径
+            symbol_bars = bars_by_symbol.get(symbol)
+            _require(
+                symbol_bars is not None,
+                f"审计缺少 symbol {symbol!r} 的 1m K 线容器"
+                f"（记录 {record['id']} 联动行无法独立复算）",
+            )
+            assert symbol_bars is not None
+            segment_bars = symbol_bars.get(segment_id)
+            _require(
+                segment_bars is not None,
+                f"审计缺少片段 {segment_id!r}（symbol {symbol!r}）的 1m K 线"
+                f"（记录 {record['id']} 联动行无法独立复算）",
+            )
+            assert segment_bars is not None
+            momentum = _independent_breakthrough_momentum(
+                segment_bars[: bar_index + 1],
+                breakthrough_window,
+                breakthrough_duration_seconds,
+            )
+            expected_linkage = (
+                f"联动: 突破={format_ratio_value(momentum, price_precision)}"
+            )
         expected_lines = (
             ("现价", _independent_px_line(bar, reference, price_precision)),
-            ("联动", "联动: na"),
+            ("联动", expected_linkage),
             ("日线", expected_daily_line),
             ("日内", _independent_intraday_line(prefix, bar_index, reference, price_precision)),
         )

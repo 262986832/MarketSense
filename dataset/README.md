@@ -113,8 +113,10 @@ python -m dataset board-state --symbol DCE.v2701 --start 2026-09-01 --end 2026-0
 `dataset/market_episode/replay.py`（数据装载 + 状态行构造 + 账户域 re-export 兼容 shim——
 既有 `from dataset.market_episode.replay import Bar, ReplayAccount, ...` 调用点继续可用）与
 `labels.py`（policy：盈亏比规则真值标签 + (b) 采样），另有 `segments.py`
-（清单/品种配置/参数）、`nanojev_records.py`（记录映射与落盘）、`audit.py`（确定性双跑、
-跨 split 隔离、泄漏抽查 + 账户行独立复算、跨片段账户净值链硬校验、计数汇总）。
+（清单/品种配置/参数）、`linkage.py`（联动行突破动量：三态突破信号 + 1m→Nm 重采样 +
+线性加权动量，纯函数域，v10 起接入）、`nanojev_records.py`（记录映射与落盘）、
+`audit.py`（确定性双跑、跨 split 隔离、泄漏抽查 + 账户行/联动行独立复算、跨片段账户
+净值链硬校验、计数汇总）。
 
 前置与用法：先 `dataset fetch --period 1m` 与 `dataset fetch --period 1d` 落盘 K 线（缺日线
 硬报错不静默），并 `dataset turning-points --period 1d` 落盘日线折点（v9 日线行涨势/跌势
@@ -142,13 +144,15 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 
 - 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
   同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
-- **状态文本模板（v9）**：`marketsense.episode_state.v9`，7 行：`账户:`、`日线:`、
+- **状态文本模板（v10）**：`marketsense.episode_state.v10`，7 行：`账户:`、`日线:`、
   `日内:`、`联动:`、`现价:`、`盘口:`（na 占位）；
   v7 拍板：训练 state 文本键名中文化；日内行 `bar=` 序号与联动行量/持仓量比值并入现价行
   （持仓量只保留收盘时刻，开盘时刻丢弃）；联动行变为 `na` 常量占位。
   v8 拍板（2026-10-03，account-service 任务）：账户行升六键加净值/今日（跨片段净值链同步接入）。
   v9 拍板（2026-10-03，trend-state-v9 任务）：日线行趋势项升级为涨势/跌势各最近 2 个折点
   （编号时间倒序 -1/-2）+ 对称三分支趋势状态与状态时长（见下方日线行）；其余行与 v8 逐字节同构。
+  v10 拍板（2026-10-04，linkage-breakthrough 任务）：联动行升为突破动量
+  `联动: 突破=<momentum|na>`（见下方联动行）；其余五行与 v9 逐字节同构。
   行间用 `" \n "` 连接（换行符前后各一个空格，v3 起生效，转义后的 JSON 文本更易读）。
   - `账户: 持仓=<空仓|持多|持空>[ 开仓价=<..> 止损价=<..>] 净值=<..> 今日=<..> 回撤=<..>`：
     v8 键序固定为 持仓/[开仓价/止损价]/净值/今日/回撤（磁盘键名沿用 v7 的 `开仓价/止损价`，
@@ -159,7 +163,20 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
     （片段内权益变化，每片段重置，片段首个决策点 = 0.000000，可为负）；`回撤` 公式不变
     = (峰值 − 权益)/峰值，但峰值跨片段延续（见下方净值链）→ 数值不再每片段从 0 起算、
     与 v7 不同；三值均由调用方（账户回放）只用 ≤ 决策 K 线的数据算好传入，无未来泄漏；
-  - `联动: na`：v7 起常量占位（量/持仓量比自 v7 起在现价行）；
+  - `联动: 突破=<momentum|na>`（v7~v9 为 `na` 常量占位；v10 起为突破动量，
+    momentum ∈ [-1, +1]，**非比值**）：对**截至决策 K 线 T（刚收盘，含）**的片段 1m 序列
+    （`bars[: bar_index + 1]`，防泄漏上界由调用方切片保证）计算：
+    ①**三态突破信号**（相邻两根 K 线/桶，严格比较，相等 → 0）：
+    `cur.high > prev.high` 且 `cur.close > prev.close` → +1（涨势突破）；
+    `cur.low < prev.low` 且 `cur.close < prev.close` → -1（跌势突破，对称）；其余 → 0；
+    ②**线性加权**：取末尾 min(N, 可用根数) 根**已收盘** K 线/桶（N = `breakthrough_window`，
+    默认 20），相邻对产生 n-1 个信号，`momentum = Σ(w·s)/Σw`，权重 1..n-1（最近信号权重最大）；
+    ③**粒度** = `breakthrough_period`（默认 `1m`，可配 `5m/15m/1h`）：1m 逐根天然收盘直接
+    可用；非 1m 由 1m 序列**重采样**（桶起点 = floor(开盘时刻 epoch 秒/时长)×时长 整分钟
+    对齐；聚合 open=首/high=max/low=min/close=末/volume=sum；**收满判定 = 下一根 1m bar
+    开盘时刻 ≥ 桶终点**，无下一根（片段尾桶）→ 未收满不可用——T 所在未收满桶自动排除，
+    无未来泄漏）；`1d`/未知周期在参数校验即拒绝（`ConfigError`）；
+    ④首根决策点/可用根数 < 2（含空序列）→ `突破=na`（首根无历史语义）。
   - `日线: 昨日高=<..> 昨日低=<..> 昨日收=<..> 涨势(-1, 最高=<..>, 时长=<n>根) 涨势(-2, 最高=<..>, 时长=<n>根) 跌势(-1, 最低=<..>, 时长=<n>根) 跌势(-2, 最低=<..>, 时长=<n>根) 趋势=<涨势中|跌势中|震荡> 时长=<n>根>`
     （v4 起由原 board_state 行拆出，v5 起追加 trend 四键，v7 起键名中文化，
     v9 起趋势项升为涨势/跌势各 2 项 + 三分支趋势状态）：
@@ -231,6 +248,27 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   均独立实现，**不调用** `recent_trend_extremes`/`trend_state_direction`/生成侧序列化实现，
   防自证）并与 state 文本逐值比对（不一致不写出任何产物）；缺省 `None` 保持 v5/v8
   单极值旧行为（既有调用点零破坏）；绝对价泄漏扫描覆盖涨势/跌势共 4 个入选极值。
+- **联动行配置项（v10）**：`episode.breakthrough_window`（突破动量窗口，默认 20，必须 ≥ 1）
+  与 `episode.breakthrough_period`（突破动量粒度，默认 `"1m"`，允许 `1m/5m/15m/1h`；
+  `1d`/未知周期 → `ConfigError`，经 `resolve_duration_seconds` 双保险校验）；YAML 示例：
+
+  ```yaml
+  episode:
+    breakthrough_window: 20   # 最近 N 根已收盘 K 线/桶的相邻对加权
+    breakthrough_period: "1m" # 1m 直接用决策序列；5m/15m/1h 从 1m 重采样；1d 拒绝
+  ```
+
+- **审计 v10 同步（联动行独立复算，2026-10-04）**：`FROZEN_DECISIONS` 的 `state_template`
+  升 v10 标记（追加 `+breakthrough_momentum`）并新增 `breakthrough` 键
+  （`three_state_high_close_symmetric__linear_weights_1_to_k__closed_bar_window`；
+  `AUDIT_SCHEMA` 保持 v1，联动行为行内替换）；`check_state_leakage` 新增参数
+  `bars_by_symbol`（symbol → segment_id → 该片段完整 1m 序列的**两级容器**；同 symbol
+  多片段各自独立、不跨片段延伸）与 `breakthrough_window`/`breakthrough_duration_seconds`
+  （生成侧由 `EpisodeParams` 派生同源透传），联动行由审计侧 `_independent_breakthrough_momentum`
+  独立复算（三态判据/重采样聚合/加权**全部内联重写，不调用** linkage 模块函数，防自证；
+  对 `bars[: bar_index + 1]` 切片，防泄漏上界与生成侧同口径）并与 state 文本逐值比对
+  （不一致不写出任何产物）；缺省 `None` 保持 v9 兼容语义（联动行按 `联动: na` 比对，
+  既有调用点零破坏）。
 - **questions/candidates 文案（2026-10-02 用户拍板精简）**：唯一 choice 题 `next_action`，候选文案只留动作语义——空仓 `open_long=买入开仓 / open_short=卖出开仓 / stay_flat=继续空仓`，持仓 `close=平仓 / hold=继续持有 / reverse=反手`；成交价位由执行程序与滑点决定，不进模型输入。questions 文本由 `QUESTION_SCHEMA = marketsense.episode_question.v1` 标记（首次建立），纳入审计 `input.question_schema_sha256` 与 `run_id` 哈希；文案再演进必须换标记（产生新 run）。
 - 确定性：无墙钟/随机；同输入双跑输出 sha256 一致。
 - `run_id` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记 + questions schema 标记) 的前 12 位；**状态/候选文案变更产生新 run**（旧 run 保留不覆盖）；
@@ -261,8 +299,14 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   （链入口因 train 9 片段回参而前移，绝对净值不同）；独立复算 dev+test 1541/1541 条
   日线行趋势内容与折点 CSV + 1d CSV 重算一致；真实数据双跑 sha256 一致；
   见主 README §5「首轮真实数据」）。
+  v10（联动行升突破动量 `联动: 突破=<momentum|na>`，2026-10-04）**当前产物**
+  `run-d14277ebcf70`（DCE.v2701 2026-09 全月，**train 4188 / dev 886 / test 655** 全部非空，
+  NanoJev `--validate-only` 通过；与 v9 run 逐值比对**仅联动行变化**：`突破=na` 6 条
+  （= bar0 有记录的片段，首根无历史语义），非 na 值域 [-1,1] mean 0.0337；净值链
+  100 → 155.041756 → 160.000608 → 166.489676 与 v9 一致；三轮生成 sha256 幂等；
+  见主 README §5「首轮真实数据」）。
   v2/v3/v4 run 的 5729 条记录 board_state 值均与 `dataset board-state` CSV 全量交叉核对一致。
-  磁盘现存 **5 个 run**（上述 v5/v6/v7/v8 + 当前 v9；更早的 v1~v4 run 已由用户会话清理）。
+  磁盘现存 **6 个 run**（上述 v5/v6/v7/v8/v9 + 当前 v10；更早的 v1~v4 run 已由用户会话清理）。
 
 契约硬门（只读执行第三方脚本）：
 
@@ -370,6 +414,22 @@ highs, lows = recent_trend_extremes(loaded.points, n=2)
 # highs/lows 各取最近 2 个（时间倒序）：两方向 -1 段极值均 > -2 → "up"（涨势中），
 # 均 < -2 → "down"（跌势中），其余（含任一方向相等）→ "range"（震荡）
 direction = trend_state_direction(highs, lows)  # "up" | "down" | "range"
+
+from dataset.market_episode.linkage import (  # v10 联动行突破动量（纯函数域）
+    ResampledBar, breakthrough_momentum, breakthrough_signal, resample_bars,
+)
+
+# 三态突破信号（严格比较，相等 → 0）：cur.high>prev.high 且 cur.close>prev.close → +1；
+# 对称（cur.low<prev.low 且 cur.close<prev.close）→ -1；其余 → 0
+signal = breakthrough_signal(prev, cur)                       # int
+
+# 1m → duration_seconds 桶重采样（整分钟对齐；收满判定 = 下一根 1m 开盘 ≥ 桶终点，
+# 片段尾桶不可用；open=首/high=max/low=min/close=末/volume=sum）
+resampled = resample_bars(bars, duration_seconds=300)         # tuple[ResampledBar, ...]
+
+# 末尾 min(window, 可用根数) 根已收盘 K 线/桶的相邻对信号线性加权（权重 1..n-1，最近最大）；
+# 可用根数 < 2 → None（渲染层映射 突破=na）；bars 须已截至决策 K 线 T（含）
+momentum = breakthrough_momentum(bars, window=20, duration_seconds=60)  # float | None
 ```
 
 ## 测试
@@ -388,6 +448,8 @@ direction = trend_state_direction(highs, lows)  # "up" | "down" | "range"
   `344 passed, 1 xfailed`（14.07s）。
 - 2026-10-03 实测（trend-state-v9：三分支分类 + v9 日线行 + 审计独立复算 + n=2 跳过用例）：
   `345 passed, 1 xfailed`（14.01s；转折点用例含 `trend_state_direction` 直测）。
+- 2026-10-04 实测（linkage-breakthrough：突破动量纯函数 32 用例 + 审计 v10 锁定用例）：
+  `379 passed, 1 xfailed`（pytest 终态 0 failed）。
 
 ## 已知边界（未验证项）
 
@@ -396,8 +458,8 @@ direction = trend_state_direction(highs, lows)  # "up" | "down" | "range"
 - 本包不做实时订阅、不做模型/决策，也不定义最终模型输入格式（非目标）；
   `board-state`（盘面状态读取）是首个状态 building block（研究 building block，非最终格式）。
 - episode 训练数据生成已在真实片段上端到端运行（2026-10-01 首轮 `run-c1cb097177a3`；
-  当前产物 `run-de0026683ce6`（v9 状态：日线行涨势/跌势各 2 项 + 三分支趋势状态；
-  21/21 片段全保留）；详细结果见主 README §5「首轮真实数据」）。
+  当前产物 `run-d14277ebcf70`（v10 状态：联动行突破动量；日线行为 v9 的涨势/跌势各 2 项 +
+  三分支趋势状态；21/21 片段全保留）；详细结果见主 README §5「首轮真实数据」）。
 - K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
   新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。
 - 转折点发射语义于 2026-09-26 变更（甲口径：`up`/`down` 点 `timestamp`/`bar_index` =

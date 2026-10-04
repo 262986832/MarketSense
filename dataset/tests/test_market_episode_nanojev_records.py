@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 
 from dataset.errors import DataLoadError, DatasetError
+from dataset.market_episode.audit import check_no_absolute_values
 from dataset.market_episode.labels import (
     ACTION_CLOSE,
     ACTION_HOLD,
@@ -129,6 +130,8 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
         reference_bar=bar_list[0],
         position=None,
         drawdown=0.0,
+        net_value=100.0,
+        today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
         trend_up_extreme=DAILY_TP_UP,
@@ -137,12 +140,12 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
 
     assert state == (
         f"{STATE_SCHEMA} \n "
-        "账户: 持仓=空仓 回撤=0.000000 \n "
-        "联动: v=1.000000 oi_open=1.000000 oi_close=1.000000 \n "
-        "日线: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000 "
+        "账户: 持仓=空仓 净值=100.000000 今日=0.000000 回撤=0.000000 \n "
+        "日线: 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000 "
         "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5 \n "
-        "日内: bar=0 today_h=1.002000 today_l=0.998000 \n "
-        "现价: o=1.000000 h=1.002000 l=0.998000 c=1.000000 \n "
+        "日内: 今高=1.002000 今低=0.998000 \n "
+        "联动: na \n "
+        "现价: 开=1.000000 高=1.002000 低=0.998000 收=1.000000 bar=0 成交量比=1.000000 持仓量比=1.000000 \n "
         "盘口: na"
     )
 
@@ -155,6 +158,8 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
         reference_bar=bar_list[0],
         position=PositionSnapshot(direction="short", entry_ratio=0.9985, stop_ratio=1.0005),
         drawdown=0.0015,
+        net_value=100.0,
+        today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
         trend_up_extreme=DAILY_TP_UP,
@@ -163,35 +168,52 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
 
     assert state == (
         f"{STATE_SCHEMA} \n "
-        "账户: 持仓=持空 entry=0.998500 stop=1.000500 回撤=0.001500 \n "
-        "联动: v=1.000000 oi_open=1.002000 oi_close=1.001996 \n "
-        "日线: prev_h=2.010000 prev_l=1.980000 prev_c=1.990000 "
+        "账户: 持仓=持空 开仓价=0.998500 止损价=1.000500 净值=100.000000 今日=0.000000 回撤=0.001500 \n "
+        "日线: 昨日高=2.010000 昨日低=1.980000 昨日收=1.990000 "
         "trend_up=4.020000 trend_up_len=7 trend_dn=3.980000 trend_dn_len=5 \n "
-        "日内: bar=1 today_h=1.010000 today_l=0.999500 \n "
-        "现价: o=1.000000 h=1.010000 l=1.000500 c=1.008000 \n "
+        "日内: 今高=1.010000 今低=0.999500 \n "
+        "联动: na \n "
+        "现价: 开=1.000000 高=1.010000 低=1.000500 收=1.008000 bar=1 成交量比=1.000000 持仓量比=1.001996 \n "
         "盘口: na"
     )
 
 
 def test_render_state_marks_undefined_denominators_as_na() -> None:
     bar_list = bars([(1000, 1000.5, 999.5, 1000), (1000, 1010, 1000.5, 1008)], volume=0)
-    zero_oi = bars([(1000, 1000.5, 999.5, 1000), (1000, 1010, 1000.5, 1008)])
+    zero_oi = bars(
+        [(1000, 1000.5, 999.5, 1000), (1000, 1010, 1000.5, 1008)], oi_start=0, oi_step=0
+    )
 
     state = render_state(
         bar=bar_list[1],
         reference_bar=bar_list[0],
         position=None,
         drawdown=0.0,
+        net_value=100.0,
+        today_pnl=0.0,
+        price_precision=6,
+        board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
+        trend_up_extreme=DAILY_TP_UP,
+        trend_dn_extreme=DAILY_TP_DOWN,
+    )
+    zero_oi_state = render_state(
+        bar=zero_oi[1],
+        reference_bar=zero_oi[0],
+        position=None,
+        drawdown=0.0,
+        net_value=100.0,
+        today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
         trend_up_extreme=DAILY_TP_UP,
         trend_dn_extreme=DAILY_TP_DOWN,
     )
 
-    assert "联动: v=na oi_open=1.002000 oi_close=1.001996" in state
-    assert "日线: prev_h=2.010000" in state  # 日线行不受分母影响（价格分母正常）
+    assert "成交量比=na" in state  # v7：量比在现价行，volume=0 → na
+    assert "持仓量比=na" in zero_oi_state  # v7：持仓量只保留收盘，close_oi=0 → na
+    assert "联动: na" in state
+    assert "日线: 昨日高=2.010000" in state  # 日线行不受分母影响（价格分母正常）
     assert "inf" not in state and "nan" not in state
-    assert zero_oi  # 非零分母分支由上一个夹具覆盖
 
 
 def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar() -> None:
@@ -202,6 +224,8 @@ def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar
         reference_bar=bar_list[0],
         position=None,
         drawdown=0.0,
+        net_value=100.0,
+        today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(prev_day_high=2010.0, prev_day_low=1980.0,
                                      prev_day_close=1990.0, today_high=1010.0, today_low=999.5),
@@ -211,7 +235,7 @@ def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar
 
     for absolute in ("1000.000000", "1010.000000", "999.500000", "1008.000000"):
         assert absolute not in state
-    assert len(state.splitlines()) == 7  # 模板 v5：7 行（账户/联动/日线/日内/现价/盘口；行间连接符为 " \n "）
+    assert len(state.splitlines()) == 7  # 模板 v7：7 行（账户/日线/日内/联动/现价/盘口；行间连接符为 " \n "）
 
 
 def test_v5_daily_line_trend_values_match_independent_hand_calc() -> None:
@@ -234,15 +258,16 @@ def test_v5_daily_line_trend_values_match_independent_hand_calc() -> None:
         ),
     )
 
-    assert record["state"].startswith("marketsense.episode_state.v5")
+    assert record["state"].startswith(STATE_SCHEMA)
     assert (
-        "日线: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000 "
+        "日线: 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000 "
         "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
     ) in record["state"]
 
 
-def test_v5_daily_line_keeps_v4_prev_values() -> None:
-    """数值等价：v5 日线行的 prev 三值与 v4 同值（trend 四值只是行内追加，不改既有值）。"""
+def test_daily_line_prev_values_unchanged_since_v4() -> None:
+    """数值等价：日线行 prev 三值自 v4 起同值（v5 行内追加 trend 四值；v7 键名中文化为
+    昨日高/昨日低/昨日收，数值不变；trend 四值本次不改）。"""
     bar_list = bars(_PATTERN)
 
     state = render_state(
@@ -250,14 +275,17 @@ def test_v5_daily_line_keeps_v4_prev_values() -> None:
         reference_bar=bar_list[0],
         position=None,
         drawdown=0.0,
+        net_value=100.0,
+        today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
         trend_up_extreme=DAILY_TP_UP,
         trend_dn_extreme=DAILY_TP_DOWN,
     )
 
-    # v4 日线行原文（trend 四值之前的 prev 部分）逐字保留
-    assert "日线: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000 " in state
+    # v4→v8：键名中文化（昨日高/昨日低/昨日收），数值逐字不变
+    # （v8 账户行扩展净值/今日键不影响日线行；本断言锁定日线行逐字不变）
+    assert "日线: 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000 " in state
 
 
 # --------------------------------------------------------------------------- #
@@ -336,7 +364,7 @@ def test_build_record_maps_ids_split_questions_and_gold() -> None:
     assert flat_record["gold_label_kind"] == {QUESTION_ID: "deterministic_truth"}
     assert flat_record["state"].startswith(STATE_SCHEMA)
     assert "持仓=空仓" in flat_record["state"]
-    assert "持仓=持多 entry=1.012000 stop=0.998000" in holding_record["state"]
+    assert "持仓=持多 开仓价=1.012000 止损价=0.998000" in holding_record["state"]
 
 
 def test_build_record_rejects_action_outside_position_criteria() -> None:
@@ -380,9 +408,9 @@ def test_build_record_board_state_uses_prev_daily_and_prefix_extrema() -> None:
     )
 
     # prev：2010/1980/1990 ÷ 首根开盘 100；today：前缀 [0..1] 极值 110/99.8 ÷ 100
-    # （第 3 根 high=200 不进入 today_h）
-    assert "日线: prev_h=20.100000 prev_l=19.800000 prev_c=19.900000" in record["state"]
-    assert "日内: bar=1 today_h=1.100000 today_l=0.998000" in record["state"]
+    # （第 3 根 high=200 不进入今高）
+    assert "日线: 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000" in record["state"]
+    assert "日内: 今高=1.100000 今低=0.998000" in record["state"]
     assert "20.000000" not in record["state"]
 
 
@@ -406,11 +434,14 @@ def _generate(tmp_path: Path, *, rows=_ROWS, band: int = 2):
 def test_generate_dataset_writes_all_splits_and_passes_mirror_validation(tmp_path: Path) -> None:
     _, result = _generate(tmp_path)
 
+    # v8 净值链（时间序串行回放）：三片段同型亏损使净值加性累计 100 → 97.8 → 95.6，
+    # 第 3 片段 bar1 盯市回撤 (100 − 94.4)/100 = 5.6% ≥ 阈值 5% → 死亡吸收态
+    # （检出当根强平、episode 结束、当根不产决策样本）→ test 片段只产出 bar0 一条记录
     assert result.record_counts == {
         "train": 2,
         "dev": 2,
         "calibration": 0,
-        "test": 2,
+        "test": 1,
         "ood": 0,
     }
     records: list[dict] = []
@@ -420,12 +451,12 @@ def test_generate_dataset_writes_all_splits_and_passes_mirror_validation(tmp_pat
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
         assert all(row["split"] == split for row in rows)
         records.extend(rows)
-    assert len(records) == 6
+    assert len(records) == 5
     _mirror_nanojev_validate(records)
 
     assert (result.run_dir / AUDIT_FILENAME).is_file()
     assert result.audit["schema"] == "marketsense.episode_audit.v1"
-    assert result.audit["totals"]["selected"] == 6
+    assert result.audit["totals"]["selected"] == 5
     assert result.audit["per_split"]["train"] == {"records": 2, "questions": 2}
 
 
@@ -439,6 +470,147 @@ def test_generate_dataset_records_follow_manifest_and_bar_order(tmp_path: Path) 
 
     assert [row["id"] for row in train_rows] == ["seg-train:0", "seg-train:1"]
     assert [row["gold"][QUESTION_ID] for row in train_rows] == [ACTION_OPEN_LONG, ACTION_HOLD]
+
+
+# --------------------------------------------------------------------------- #
+# v8 跨片段账户净值链（净值/今日/回撤由 generate_dataset 时间序串行回放接入）
+# --------------------------------------------------------------------------- #
+#: 3 根一个片段的净值链模式：bar0 机会分钟开多、bar1 盯市回落持有、
+#: bar2 盯市新高（close[bar1]=109 → 权益 +0.078）后片段末强平（107 → +0.058 实现）。
+#: 逐片段同型 → 末结算净值 = 起点净值 + 5.8，末峰值 = max(起点峰值, 起点净值 + 7.8)
+_CHAIN_PATTERN = [
+    (100, 100.2, 99.8, 100),
+    (100, 110, 100, 109),
+    (109, 111, 108, 110),
+]
+
+
+def _chain_records_by_id(result) -> dict[str, dict]:
+    rows: list[dict] = []
+    for split in SPLIT_ROLES:
+        rows.extend(
+            json.loads(line)
+            for line in (result.run_dir / f"{split}.jsonl").read_text(encoding="utf-8").splitlines()
+            if line
+        )
+    return {row["id"]: row for row in rows}
+
+
+def test_cross_segment_net_value_chain_carries_across_segments(tmp_path: Path) -> None:
+    """v8 净值链：净值跨片段按全局时间序串行延续（首片段首决策点 = 100）。
+
+    每片段同型盈亏 → 末结算净值链 100 → 105.8 → 111.6 → 117.4；下一片段首决策点
+    净值 = 上一片段末结算净值（100 × final_equity），今日收益每片段重置为 0。"""
+    workspace = build_workspace(tmp_path, _CHAIN_PATTERN * 3)
+    result = generate_dataset(
+        load_segments(workspace.manifest),
+        symbols=load_symbols_config(workspace.symbols_path),
+        data_dir=workspace.data_dir,
+        params=EpisodeParams(),
+        output_dir=tmp_path / "out",
+    )
+
+    assert result.record_counts["train"] == 3
+    assert result.record_counts["dev"] == 3
+    assert result.record_counts["test"] == 3
+    chain = {
+        entry["segment_id"]: entry.get("account_chain")
+        for entry in result.audit["per_segment"]
+    }
+    assert chain["seg-train"] == {"initial_net_value": 100.0, "final_net_value": 105.8}
+    assert chain["seg-dev"] == {"initial_net_value": 105.8, "final_net_value": 111.6}
+    assert chain["seg-test"] == {"initial_net_value": 111.6, "final_net_value": 117.4}
+
+    by_id = _chain_records_by_id(result)
+    # 首片段首决策点：净值 = 100（NET_VALUE_BASE）、今日 = 0、回撤 = 0
+    assert "净值=100.000000 今日=0.000000 回撤=0.000000" in by_id["seg-train:0"]["state"]
+    # 片段 2 首决策点净值 = 片段 1 末结算净值 105.8，今日每片段重置为 0
+    assert "净值=105.800000 今日=0.000000" in by_id["seg-dev:0"]["state"]
+    # 片段 3 首决策点净值 = 片段 2 末结算净值 111.6
+    assert "净值=111.600000 今日=0.000000" in by_id["seg-test:0"]["state"]
+
+
+def test_cross_segment_chain_frozen_through_skipped_segment(tmp_path: Path) -> None:
+    """跳过片段（缺上一交易日日线）链冻结穿过：不产出链条目，首个实际评估片段
+    起点净值仍 = 100（不因跳过片段后移）。"""
+    workspace = build_two_day_workspace(tmp_path)
+    result = generate_dataset(
+        load_segments(workspace.manifest),
+        symbols=load_symbols_config(workspace.symbols_path),
+        data_dir=workspace.data_dir,
+        params=EpisodeParams(),
+        output_dir=tmp_path / "out",
+    )
+
+    assert set(result.board_state_skipped) == {"seg-train"}
+    assert result.record_counts["train"] == 0
+    chain = {
+        entry["segment_id"]: entry.get("account_chain")
+        for entry in result.audit["per_segment"]
+    }
+    assert "seg-train" not in chain  # 跳过片段无链条目
+    assert chain["seg-dev"] == {"initial_net_value": 100.0, "final_net_value": 97.8}
+    assert chain["seg-test"] == {"initial_net_value": 97.8, "final_net_value": 95.6}
+    by_id = _chain_records_by_id(result)
+    assert "净值=100.000000 今日=0.000000" in by_id["seg-dev:0"]["state"]
+    assert "净值=97.800000 今日=0.000000" in by_id["seg-test:0"]["state"]
+
+
+def test_drawdown_formula_locked_to_carried_peak_across_segments(tmp_path: Path) -> None:
+    """回撤公式锁定：(峰值 − 权益) / 峰值，峰值跨片段延续（下一片段峰值起点 =
+    上一片段末峰值）。
+
+    链 fixture 逐片段同型：末峰值 = max(起点峰值, 起点净值 + 7.8)（净值尺度），
+    末结算净值 = 起点净值 + 5.8 → 峰值链 100 → 107.8 → 113.6 → 119.4。
+    下一片段首决策点回撤 = (上一片段末峰值 − 上一片段末净值) / 上一片段末峰值。"""
+    workspace = build_workspace(tmp_path, _CHAIN_PATTERN * 3)
+    result = generate_dataset(
+        load_segments(workspace.manifest),
+        symbols=load_symbols_config(workspace.symbols_path),
+        data_dir=workspace.data_dir,
+        params=EpisodeParams(),
+        output_dir=tmp_path / "out",
+    )
+
+    by_id = _chain_records_by_id(result)
+    # seg-dev 首决策点：权益 1.058、峰值起点 = 上一片段末峰值 1.078（净值 107.8）
+    # → 回撤 = (107.8 − 105.8) / 107.8 = 0.0185528…（若峰值不延续将得 0.000000）
+    assert "回撤=0.018553" in by_id["seg-dev:0"]["state"]
+    # 同片段下一决策点（权益 1.046）：(107.8 − 104.6) / 107.8 = 0.0296846…（分母锁定
+    # 峰值而非当前净值：若误用权益作分母将得 0.011342）
+    assert "回撤=0.029685" in by_id["seg-dev:1"]["state"]
+    # seg-test 首决策点：峰值起点 = seg-dev 末峰值 113.6 → (113.6 − 111.6) / 113.6 = 0.0176056…
+    assert "回撤=0.017606" in by_id["seg-test:0"]["state"]
+    # 盯市权益超过延续峰值 → 峰值上移、回撤归零；seg-dev bar2：权益 1.136 > 1.078）
+    assert "净值=113.600000 今日=7.800000 回撤=0.000000" in by_id["seg-dev:2"]["state"]
+
+
+def test_check_no_absolute_values_exempts_account_line_only() -> None:
+    """账户行豁免（v8 六键为净值尺度账户值，与绝对价不同域）：账户行净值=100.x
+    （与首根开盘绝对价同数字）不报错；同一绝对价 token 出现在现价行仍被拦截。"""
+    bar_list = bars(_PATTERN)  # 首根开盘绝对价 100 → 绝对价 token 含 100.000000
+    state = render_state(
+        bar=bar_list[0],
+        reference_bar=bar_list[0],
+        position=None,
+        drawdown=0.0,
+        net_value=100.0,
+        today_pnl=0.0,
+        price_precision=6,
+        board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
+        trend_up_extreme=DAILY_TP_UP,
+        trend_dn_extreme=DAILY_TP_DOWN,
+    )
+    assert "净值=100.000000" in state  # 账户行净值与首根开盘绝对价同数字
+
+    # 账户行豁免：整份状态文本含 净值=100.000000 不触发绝对价报错
+    check_no_absolute_values(state, bar_list[0], precision=6)
+
+    # 同一绝对价 token 出现在非账户行（现价行）→ 仍被拦截
+    with pytest.raises(DatasetError, match="绝对价格"):
+        check_no_absolute_values(
+            state + " \n 现价: 绝对价=100.000000", bar_list[0], precision=6
+        )
 
 
 def test_generate_dataset_is_deterministic_and_run_isolated(tmp_path: Path) -> None:
@@ -592,10 +764,10 @@ def test_generate_dataset_skips_segments_without_prev_daily_and_reports(
     ]
     assert dev_rows
     for row in dev_rows:
-        # v5 日线行全行：prev = 首日日线行 ÷ 次日片段首根开盘 100；
+        # v5/v7 日线行全行：prev = 首日日线行 ÷ 次日片段首根开盘 100；v7 键名中文化；
         # trend 四值 = 默认夹具折点段极值（up 4020→40.2 段长 7；down 3980→39.8 段长 5）
         assert (
-            "日线: prev_h=40.100000 prev_l=39.900000 prev_c=40.050000 "
+            "日线: 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000 "
             "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
         ) in row["state"]
     train_rows = [
@@ -715,7 +887,7 @@ def test_trend_points_confirmed_on_or_after_trade_date_are_not_usable(tmp_path: 
     for record in records:
         # 可用折点 = 确认日 01-01 的 down/up（首根开盘 100）：4020→40.2 段长 7、3980→39.8 段长 5
         assert (
-            "日线: prev_h=40.100000 prev_l=39.900000 prev_c=40.050000 "
+            "日线: 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000 "
             "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
         ) in record["state"]
         # 确认日 == 决策交易日的折点极值价（4500/4600 ÷ 100）不得出现
@@ -793,7 +965,7 @@ def test_generate_dataset_skips_segments_without_usable_trend_points(tmp_path: P
     assert dev_rows
     for row in dev_rows:
         assert (
-            "日线: prev_h=40.100000 prev_l=39.900000 prev_c=40.050000 "
+            "日线: 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000 "
             "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
         ) in row["state"]
 
@@ -944,14 +1116,22 @@ def test_night_bars_use_next_trading_day_for_trend_points(tmp_path: Path) -> Non
 
     # 若夜盘被错锚到历日（01-01），确认日 01-01 的折点不可用 → 片段被跳过、本断言失败
     assert result.trend_extreme_skipped == {}
-    for split in ("train", "dev", "test"):
-        assert result.record_counts[split] > 0
-        for line in (result.run_dir / f"{split}.jsonl").read_text(encoding="utf-8").splitlines():
-            row = json.loads(line)
-            assert (
-                "日线: prev_h=40.100000 prev_l=39.900000 prev_c=40.050000 "
-                "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
-            ) in row["state"]
+    # v8 净值链（时间序串行回放）：seg-train 逐笔同型亏损（−2.2/笔）→ 末结算净值 93.4、
+    # 末峰值 100 → seg-dev/seg-test 起点回撤 (100 − 93.4)/100 = 6.6% ≥ 阈值 5% →
+    # 首根（bar0）即死亡吸收态（当根不产决策样本，链冻结穿过）：dev/test 0 记录是
+    # 链语义下的正确结果（账户死亡），而非折点跳过
+    assert result.record_counts["train"] > 0
+    assert result.record_counts["dev"] == 0
+    assert result.record_counts["test"] == 0
+    deaths = {entry["segment_id"]: entry["deaths"] for entry in result.audit["per_segment"]}
+    assert deaths["seg-dev"] == [0]
+    assert deaths["seg-test"] == [0]
+    for line in (result.run_dir / "train.jsonl").read_text(encoding="utf-8").splitlines():
+        row = json.loads(line)
+        assert (
+            "日线: 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000 "
+            "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
+        ) in row["state"]
 
 
 def test_multi_day_segment_later_trade_date_sees_later_confirmed_points(tmp_path: Path) -> None:

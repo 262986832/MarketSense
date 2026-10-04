@@ -2,8 +2,10 @@
 
 分层（DESIGN 冻结取舍）：
 
-* :mod:`dataset.market_episode.replay` —— mechanics：确定性回放账户引擎
-  （决策 K 线成交模型、止损锚定、比值表达、t-1 盯市、死亡/片段末强平）；
+* :mod:`dataset.account` —— 账户域：确定性回放账户执行语义（决策 K 线成交模型、
+  止损锚定、比值化记账、t-1 盯市、死亡/收盘强平契约）；仅依赖 ``dataset.errors``；
+* :mod:`dataset.market_episode.replay` —— 数据装载 + 状态行构造
+  + 账户域 re-export 兼容 shim（迁移自原 mechanics 层账户引擎）；
 * :mod:`dataset.market_episode.labels` —— policy：盈亏比规则真值标签 + (b) 采样；
 * :mod:`dataset.market_episode.segments` —— 片段清单 / 品种 tick 配置 / episode 参数；
 * :mod:`dataset.market_episode.nanojev_records` —— NanoJev 记录映射、状态序列化、落盘；

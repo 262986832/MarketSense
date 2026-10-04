@@ -7,9 +7,10 @@
 * ``family_id`` = ``metadata.source_group_id`` = ``segment_id``（一个片段 = 一个 episode，
   直接复用 NanoJev 的 state/source_group 跨 split 泄漏检查）；
 * ``split`` = 片段的 ``split_role``；
-* ``state`` = 确定性文本序列化的**相对比值**状态（v5 六部分：账户（仓位 + 回撤）/
-  联动（量/持仓量）/ 日线（上一交易日高/低/收 + 日线折点趋势极值）/ 日内
-  （``bar=`` 序号 + 今日高/低）/ 现价（决策 K 线 OHLC）/ 盘口（na 占位））；
+* ``state`` = 确定性文本序列化的**相对比值**状态（v8 六部分：账户（六键：持仓 /
+  [开仓价/止损价] / 净值 / 今日 / 回撤）/ 日线（上一交易日高/低/收 + 日线折点趋势极值）/
+  日内（今日高/低）/
+  联动（na 占位）/ 现价（决策 K 线 OHLC + bar 序号 + 量/持仓量比值）/ 盘口（na 占位））；
 * ``questions`` 恰好一个 choice 题 ``next_action``：空仓
   ``{open_long, open_short, stay_flat}`` / 持仓 ``{close, hold, reverse}``；
   候选文案只留动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
@@ -21,31 +22,50 @@
 v3 起行间换行符前后加空格，转义后的 JSON 文本更易读，同日拍板；v4 起行重排为宏观→微观
 六部分（账户/联动/日线/日内/现价/盘口），持仓值中文化（空仓/持多/持空）+ 盘口 ``na``
 占位，数值语义与 v3 逐项等价，同日用户拍板；v5 起「日线」行新增 4 个 trend 键
-（最近可确认 up/down 折点的段极值 + 段长，2026-10-02 用户拍板））**
+（最近可确认 up/down 折点的段极值 + 段长，同日拍板）；v6 起行重排为
+账户/日线/日内/联动/现价/盘口（联动行移至日内行之后），
+行内键与数值语义与 v5 逐项等价，同日用户拍板；v7 起：①训练 state 文本键名中文化
+（昨日高/昨日低/昨日收/今高/今低/开/高/低/收，持仓时账户行 entry/stop → 开仓价/止损价），
+②日内行 ``bar`` 序号与联动行量/持仓量比值并入现价行（持仓量只保留收盘时刻，
+开盘时刻丢弃），③联动行变为 ``na`` 常量占位（同盘口行约定），
+trend 四键本次不改（后续随折点信息补充一并调整），2026-10-02 用户拍板；
+v8 起账户行升六键（持仓/[开仓价/止损价]/净值/今日/回撤；净值/今日为净值尺度新值、
+由调用方只用 ≤ 决策 K 线的数据算好传入，跨片段净值链由 ``generate_dataset``
+时间序串行回放接入，2026-10-03 用户拍板，
+见 ``artifacts/account-service/02-design/tech-design.md``）**
 
 ```text
-marketsense.episode_state.v5
-账户: 持仓=空仓 回撤=<..>
-联动: v=<..> oi_open=<..> oi_close=<..>
-日线: prev_h=<..> prev_l=<..> prev_c=<..> trend_up=<..> trend_up_len=<n> trend_dn=<..> trend_dn_len=<n>
-日内: bar=<片段内 0 基序号> today_h=<..> today_l=<..>
-现价: o=<..> h=<..> l=<..> c=<..>
+marketsense.episode_state.v8
+账户: 持仓=空仓 净值=<..> 今日=<..> 回撤=<..>
+日线: 昨日高=<..> 昨日低=<..> 昨日收=<..> trend_up=<..> trend_up_len=<n> trend_dn=<..> trend_dn_len=<n>
+日内: 今高=<..> 今低=<..>
+联动: na
+现价: 开=<..> 高=<..> 低=<..> 收=<..> bar=<片段内 0 基序号> 成交量比=<..> 持仓量比=<..>
 盘口: na
 ```
 
 （行与行之间用 ``" \n "`` 连接，即换行符前后各一个空格。持仓非空时账户行为：
-``账户: 持仓=持多|持空 entry=<..> stop=<..> 回撤=<..>``。）
+``账户: 持仓=持多|持空 开仓价=<..> 止损价=<..> 净值=<..> 今日=<..> 回撤=<..>``。）
 
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
-* **无历史窗口**：状态只含决策 K 线单根 + 仓位 + 回撤 + 盘面状态（v4 拆「日线」「日内」
-  两行，v5 在日线行追加折点趋势项），绝对价格不进入模型输入；「盘口」行为 ``na`` 常量占位
-  （真实 bid/ask 未接，非目标）；
-* **账户行**（v4）：持仓值中文标签（空仓/持多/持空，未知方向抛 ``DatasetError`` 不静默）；
-  持仓非空时 ``entry/stop`` 在 ``回撤`` 前（沿用 v3 的 position→drawdown 相对顺序，仅合并为一行）；
-* **日线行**（原 v2 board_state 行 prev 部分，v4 拆出，v5 追加 trend 四值；prev 与
-  ``dataset/board_state.py`` 同口径）：
-  - ``prev_h/prev_l/prev_c`` = **上一交易日**日线高/低/收（来源 ``{symbol}_1d.csv``，
+* **无历史窗口**：状态只含决策 K 线单根 + 仓位 + 净值 + 今日 + 回撤 + 盘面状态
+  （v4 拆「日线」「日内」两行，v5 在日线行追加折点趋势项，v7 键名中文化并将量/持仓量比
+  与 bar 序号并入现价行，v8 账户行升六键加净值/今日），绝对价格不进入模型输入；
+  「盘口」与「联动」行为 ``na`` 常量占位
+  （真实 bid/ask 未接，非目标；v7 起量/持仓量比已并入现价行，联动行不再承载实际值）；
+* **账户行**（v4，v8 升六键）：持仓值中文标签（空仓/持多/持空，未知方向抛
+  ``DatasetError`` 不静默）；v8 起键序固定为 持仓/[开仓价/止损价]/净值/今日/回撤
+  （磁盘键名沿用 v7 的 ``开仓价/止损价``，内部字段 entry/stop；空仓时无开仓价/止损价
+  两键，沿用 v7 先例）；``净值/今日``（render_state 参数 net_value/today_pnl，
+  ``DecisionPoint`` 同名字段）为净值尺度新值（初值 100、今日收益每片段重置、比值化记账），
+  ``回撤`` 公式不变；三值均由调用方只用 ≤ 决策 K 线的数据算好传入
+  （跨片段净值链由 ``generate_dataset`` 时间序串行回放接入，见
+  ``artifacts/account-service/02-design/tech-design.md``）；
+* **日线行**（原 v2 board_state 行 prev 部分，v4 拆出，v5 追加 trend 四值，v7 键名中文化；
+  prev 与 ``dataset/board_state.py`` 同口径）：
+  - ``昨日高/昨日低/昨日收``（内部字段 prev_h/prev_l/prev_c）= **上一交易日**日线高/低/收
+    （来源 ``{symbol}_1d.csv``，
     取日线文件中严格早于片段交易日的最后一行）÷ 片段首根开盘价；
   - ``trend_up``/``trend_dn`` = 最近**可确认** up/down 折点的段内实际最高/最低价
     （``trend_extreme_price``，来源 ``data/turning_points/{symbol}_1d.csv``）÷ 片段首根开盘价；
@@ -57,8 +77,10 @@ marketsense.episode_state.v5
   - 逐决策点各自取其决策交易日的可用最近折点（多日片段的后段决策点能看到后确认的折点）；
   - 任一入选决策点的可用 up/down 折点单侧缺失 → **跳过整个片段**（不产出记录），记入审计
     ``trend_extremes.skipped_segments`` 与 stderr 告警（不静默）；全部片段被跳过 → 硬错误；
-* **日内行**（原 v2 board_state 行 today 部分 + ``bar=`` 序号，v4 拆出）：
-  - ``today_h/today_l`` = 片段首根至决策 K 线（**含**）的 1m 高/低**累计极值** ÷ 片段首根开盘价
+* **日内行**（原 v2 board_state 行 today 部分，v4 拆出；v7 起 ``bar=`` 序号移入现价行，
+  键名中文化）：
+  - ``今高/今低``（内部字段 today_h/today_l）= 片段首根至决策 K 线（**含**）的 1m 高/低
+    **累计极值** ÷ 片段首根开盘价
     （State(T) 只用 ≤ 决策 K 线的数据，无未来泄漏）；
   - 分母与现价行一致（全交易日片段下片段首根 = 交易日窗口首根 = 今日开盘，
     见 ``artifacts/nanojev-integration-alignment/01-requirement/requirement-report.md``）；
@@ -81,7 +103,7 @@ import math
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -97,7 +119,10 @@ from dataset.turning_points import (
 )
 
 from dataset.market_episode.audit import (
+    AccountReplayInputs,
+    NET_VALUE_BASE,
     build_audit_payload,
+    check_account_chain,
     check_audit_consistency,
     check_records,
     check_state_leakage,
@@ -118,11 +143,12 @@ from dataset.market_episode.replay import (
     LONG,
     PositionSnapshot,
     SHORT,
+    ReplayAccount,
+    TradeEvent,
     format_ratio_value,
     load_segment_bars,
     px_ratio_line,
     ratio_or_none,
-    vol_ratio_line,
 )
 from dataset.market_episode.segments import (
     SPLIT_ROLES,
@@ -135,8 +161,19 @@ from dataset.market_episode.segments import (
 #: 前后加空格——转义后的 JSON 文本更易读；v4 行重排为宏观→微观六部分（账户/联动/日线/
 #: 日内/现价/盘口）+ 持仓值中文化 + 盘口 na 占位，数值语义与 v3 逐项等价，2026-10-02 用户拍板；
 #: v5 日线行新增日线折点趋势极值项 trend_up/trend_up_len/trend_dn/trend_dn_len
-#: （确认根日期严格早于决策交易日的最近 up/down 折点段极值 + 段长，2026-10-02 用户拍板）
-STATE_SCHEMA = "marketsense.episode_state.v5"
+#: （确认根日期严格早于决策交易日的最近 up/down 折点段极值 + 段长，2026-10-02 用户拍板）；
+#: v6 行重排（账户/日线/日内/联动/现价/盘口）——联动行移至日内行之后，行内键与
+#: 数值语义与 v5 逐项等价，2026-10-02 用户拍板；
+#: v7 训练 state 文本键名中文化（昨日高/昨日低/昨日收/今高/今低/开/高/低/收，持仓时
+#: entry/stop → 开仓价/止损价），日内行 bar 序号与联动行量/持仓量比值并入现价行
+#: （持仓量只保留收盘时刻），联动行变为 na 常量占位，trend 四键本次不改，
+#: 2026-10-02 用户拍板；
+#: v8 账户行升六键（持仓/[开仓价/止损价]/净值/今日/回撤；键序固定，磁盘键名沿用 v7 的
+#: 开仓价/止损价；净值/今日为净值尺度新值（初值 100、今日收益每片段重置），回撤公式
+#: 不变；三值由调用方只用 ≤ 决策 K 线的数据算好传入，跨片段净值链由 generate_dataset
+#: 时间序串行回放接入；v8 在 v7-chinese-keys 基础上扩展，2026-10-03 用户拍板，
+#: 见 artifacts/account-service/02-design/tech-design.md）
+STATE_SCHEMA = "marketsense.episode_state.v8"
 #: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
 QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
@@ -274,13 +311,13 @@ def _daily_line(
     trend_up_extreme: TrendExtreme,
     trend_dn_extreme: TrendExtreme,
 ) -> str:
-    """日线行（v5）：上一交易日高/低/收 + 日线折点趋势极值的比值
+    """日线行（v5/v7）：上一交易日高/低/收（v7 起中文名昨日高/低/收）+ 日线折点趋势极值的比值
     （分母 = 片段首根开盘价；分母 ≤ 0 时逐值写 ``na``；段长为整数，不入比值口径）。"""
     return (
         "日线: "
-        f"prev_h={format_ratio_value(ratio_or_none(board_state.prev_day_high, reference_bar.open), price_precision)}"
-        f" prev_l={format_ratio_value(ratio_or_none(board_state.prev_day_low, reference_bar.open), price_precision)}"
-        f" prev_c={format_ratio_value(ratio_or_none(board_state.prev_day_close, reference_bar.open), price_precision)}"
+        f"昨日高={format_ratio_value(ratio_or_none(board_state.prev_day_high, reference_bar.open), price_precision)}"
+        f" 昨日低={format_ratio_value(ratio_or_none(board_state.prev_day_low, reference_bar.open), price_precision)}"
+        f" 昨日收={format_ratio_value(ratio_or_none(board_state.prev_day_close, reference_bar.open), price_precision)}"
         f" trend_up={format_ratio_value(ratio_or_none(trend_up_extreme.trend_extreme_price, reference_bar.open), price_precision)}"
         f" trend_up_len={trend_up_extreme.segment_length}"
         f" trend_dn={format_ratio_value(ratio_or_none(trend_dn_extreme.trend_extreme_price, reference_bar.open), price_precision)}"
@@ -289,16 +326,15 @@ def _daily_line(
 
 
 def _intraday_line(
-    bar: Bar,
     board_state: BoardStateValues,
     reference_bar: Bar,
     price_precision: int,
 ) -> str:
-    """日内行：片段内 0 基序号 + 今日高/低累计极值的比值（State(T) 只用 ≤ 决策 K 线的数据）。"""
+    """日内行（v7）：今日高/低累计极值的比值（State(T) 只用 ≤ 决策 K 线的数据；
+    ``bar`` 序号自 v7 起移入现价行，不再出现在本行）。"""
     return (
-        f"日内: bar={bar.index}"
-        f" today_h={format_ratio_value(ratio_or_none(board_state.today_high, reference_bar.open), price_precision)}"
-        f" today_l={format_ratio_value(ratio_or_none(board_state.today_low, reference_bar.open), price_precision)}"
+        f"日内: 今高={format_ratio_value(ratio_or_none(board_state.today_high, reference_bar.open), price_precision)}"
+        f" 今低={format_ratio_value(ratio_or_none(board_state.today_low, reference_bar.open), price_precision)}"
     )
 
 
@@ -308,18 +344,28 @@ def render_state(
     reference_bar: Bar,
     position: PositionSnapshot | None,
     drawdown: float,
+    net_value: float,
+    today_pnl: float,
     price_precision: int,
     board_state: BoardStateValues,
     trend_up_extreme: TrendExtreme,
     trend_dn_extreme: TrendExtreme,
 ) -> str:
-    """确定性状态文本（v5 六部分：账户/联动/日线/日内/现价/盘口；模板见模块 docstring）。
+    """确定性状态文本（v8 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
 
-    只做「决策 K 线单根 + 仓位 + 回撤 + 盘面状态 + 日线折点极值」的序列化：函数签名
-    决定它无法访问决策 K 线之后的任何 bar（``board_state`` 的今日值由调用方只用
-    ≤ 决策 K 线的数据算好传入；折点极值由调用方按确认日 < 决策交易日过滤后传入，
-    无未来数据泄漏在构造层面成立）。
+    只做「决策 K 线单根 + 仓位 + 净值 + 今日 + 回撤 + 盘面状态 + 日线折点极值」的序列化：
+    函数签名决定它无法访问决策 K 线之后的任何 bar（``board_state`` 的今日值与
+    ``net_value``/``today_pnl`` 均由调用方只用 ≤ 决策 K 线的数据算好传入；
+    折点极值由调用方按确认日 < 决策交易日过滤后传入，无未来数据泄漏在构造层面成立）。
+
+    v7：联动行变为 ``na`` 常量占位（量/持仓量比值移入现价行）；``bar`` 序号移入现价行。
+    v8：账户行升六键（持仓/[开仓价/止损价]/净值/今日/回撤，键序固定）。
     """
+    account_values = (
+        f"净值={format_ratio_value(net_value, price_precision)}"
+        f" 今日={format_ratio_value(today_pnl, price_precision)}"
+        f" 回撤={format_ratio_value(drawdown, price_precision)}"
+    )
     if position is None:
         held_text = POSITION_LABELS[None]
     else:
@@ -327,14 +373,13 @@ def render_state(
         if label is None:
             raise DatasetError(f"未知持仓方向，无法序列化账户行: {position.direction!r}")
         held_text = (
-            f"{label} entry={format_ratio_value(position.entry_ratio, price_precision)}"
-            f" stop={format_ratio_value(position.stop_ratio, price_precision)}"
+            f"{label} 开仓价={format_ratio_value(position.entry_ratio, price_precision)}"
+            f" 止损价={format_ratio_value(position.stop_ratio, price_precision)}"
         )
     return " \n ".join(
         (
             STATE_SCHEMA,
-            f"账户: 持仓={held_text} 回撤={format_ratio_value(drawdown, price_precision)}",
-            vol_ratio_line(bar, reference_bar, price_precision),
+            f"账户: 持仓={held_text} {account_values}",
             _daily_line(
                 board_state,
                 reference_bar,
@@ -342,7 +387,8 @@ def render_state(
                 trend_up_extreme,
                 trend_dn_extreme,
             ),
-            _intraday_line(bar, board_state, reference_bar, price_precision),
+            _intraday_line(board_state, reference_bar, price_precision),
+            "联动: na",
             px_ratio_line(bar, reference_bar, price_precision),
             "盘口: na",
         )
@@ -365,7 +411,8 @@ def build_record(
     ``trend_up_extreme``/``trend_dn_extreme`` = 该决策交易日可用的最近 up/down 折点段极值
     （调用方按确认日 < 决策交易日过滤后传入，无未来数据泄漏）；
     ``today_high/today_low`` 只由 ``bars[: point.bar_index + 1]``（≤ 决策 K 线）累计，
-    无未来数据泄漏。
+    无未来数据泄漏；``point.net_value/point.today_pnl``（v8 账户行「净值/今日」）同样由
+    调用方（账户回放）只用 ≤ 决策 K 线的数据算好透传（跨片段净值链由后续任务接入）。
     """
     bar = bars[point.bar_index]
     prefix = bars[: point.bar_index + 1]
@@ -374,6 +421,8 @@ def build_record(
         reference_bar=bars[0],
         position=point.position,
         drawdown=point.drawdown,
+        net_value=point.net_value,
+        today_pnl=point.today_pnl,
         price_precision=price_precision,
         board_state=BoardStateValues(
             prev_day_high=prev_day_ohlc[0],
@@ -492,6 +541,68 @@ def _prev_daily_ohlc(
     return prev
 
 
+def _replay_account_values(
+    bars: tuple[Bar, ...],
+    events: tuple[TradeEvent, ...],
+    *,
+    tick_size: float,
+    processed_bar_count: int,
+    initial_net_value: float,
+    initial_peak_net_value: float,
+) -> dict[int, tuple[float, float, float]]:
+    """由 TradeEvent 轨迹重驱 :class:`ReplayAccount`，复算逐处理 bar 的（净值, 今日, 回撤）。
+
+    生成侧填 ``DecisionPoint`` 净值/今日的真实值来源（替换 T5a 的 0.0 占位）：三值全部由
+    :class:`ReplayAccount` 只用 ≤ 决策 K 线的数据算出（与 ``evaluate_segment`` 的
+    point 构造路径同源同 mark 报告；先记号后成交，调用约定一致）；决策点三值 =
+    该根成交**前**的盯市值（同根事件流顺序即执行顺序——反手 = 先平后开两笔）。
+    净值 = ``NET_VALUE_BASE × equity``；今日 = 净值 − 片段起点净值（``initial_net_value``，
+    净值尺度，每片段重置）；回撤取 mark 报告值。审计侧独立复算
+    （``audit._independent_account_values``）已由 ``check_state_leakage`` 接线
+    （T6b，入参 = 本函数同款链起点快照），与本函数重放结果逐值比对——两者不共享
+    实现（防自证：任一侧漂移/被篡改即 ``DatasetError``）。
+
+    :raises DatasetError: processed_bar_count 越界 / 存在未消费事件 /
+        重驱成交轨迹与事件流不一致（均不静默）
+    """
+    if not 0 < processed_bar_count <= len(bars):
+        raise DatasetError(
+            f"账户回放 processed_bar_count 越界: {processed_bar_count}"
+            f"（片段共 {len(bars)} 根）"
+        )
+    account = ReplayAccount(
+        bars,
+        tick_size=tick_size,
+        initial_equity=float(initial_net_value) / NET_VALUE_BASE,
+        initial_peak=float(initial_peak_net_value) / NET_VALUE_BASE,
+    )
+    values: dict[int, tuple[float, float, float]] = {}
+    cursor = 0
+    for index in range(processed_bar_count):
+        # 先记号：决策点三值为该根成交前的盯市值（与 evaluate_segment 推进顺序一致）
+        report = account.mark_to_market(index)
+        net_value = NET_VALUE_BASE * report.equity
+        values[index] = (net_value, net_value - float(initial_net_value), report.drawdown)
+        # 后成交：事件流顺序即执行顺序（反手 = 同根先平后开两笔）
+        while cursor < len(events) and events[cursor].bar_index == index:
+            event = events[cursor]
+            if event.pnl_ratio is None:
+                account.open_position(event.direction, bars[index], reason=event.reason)
+            else:
+                account.close_position(bars[index], reason=event.reason)
+            cursor += 1
+    if cursor != len(events):
+        raise DatasetError(
+            "账户回放存在未消费的成交事件（事件数与处理 bar 范围不一致）: "
+            f"{cursor}/{len(events)}"
+        )
+    if list(account.events) != list(events):
+        # 重驱为确定性回放：成交价/盈亏全部由同一 bars + tick 重算，事件流必须逐项一致；
+        # 任何不一致说明记账回放漂移 → 硬错误（不静默）
+        raise DatasetError("账户回放成交轨迹与事件流不一致（不静默）")
+    return values
+
+
 def generate_dataset(
     segments: tuple[Segment, ...] | list[Segment],
     *,
@@ -517,11 +628,31 @@ def generate_dataset(
     硬报错；任一入选决策点折点单侧/双侧缺失 → 跳过整个片段（记入审计与结果，
     不静默）；全部片段被跳过则硬错误（不写出任何产物）。
 
+    v8 起（T5b 接线）：处理顺序 = ``(start, end, segment_id)`` 时间升序稳定排序——
+    净值/峰值跨片段按**全局时间序**串行传递（多 symbol 清单跨 symbol 同样串行传递，
+    设计披露 ③）；输入指纹（``canonical()`` 列表）保持清单原序不变（只改处理顺序，
+    不改指纹）。净值链：首评估片段起点 = 100.0（``NET_VALUE_BASE``×1.0，峰值起点
+    同值）；每评估片段起点 = 上一评估片段末结算净值/峰值（跳过片段不产出记录，
+    链冻结穿过，carry 不变）；每入选决策点的净值/今日由事件流重驱账户的 mark 报告
+    复算（今日 = 净值 − 片段起点净值）；落盘前 ``check_account_chain`` 硬校验
+    （违规不写出任何产物），per_segment 审计新增 ``account_chain`` 节（起末净值，
+    跨片段可追溯）。``check_state_leakage`` 调用点传入逐片段账户复算入参
+    （事件轨迹 + 处理 bar 数 + 链起点快照，T6b）：账户行净值/今日/回撤由审计侧
+    独立复算防自证，不一致即不写出任何产物。
+
     :raises DatasetError: 校验失败或自检不通过（不写出任何产物）
     :raises DataLoadError: 日线/日线折点文件缺失或损坏（硬错误，不静默）
     """
     segments = tuple(segments)
     validate_segments(segments, data_dir=data_dir, symbols=symbols)
+
+    # v8（T5b）：处理顺序 = (start, end, segment_id) 时间升序稳定排序（净值链按全局
+    # 时间序串行传递，设计披露 ③：多 symbol 清单跨 symbol 同样串行传递）；输入指纹
+    # （下方 segments_text 的 canonical() 列表）保持清单原序不变——只改处理顺序，
+    # 不改指纹。
+    ordered_segments = sorted(
+        segments, key=lambda segment: (segment.start, segment.end, segment.segment_id)
+    )
 
     tp_dir = (
         Path(daily_turning_points_dir)
@@ -538,8 +669,14 @@ def generate_dataset(
     trend_points_by_symbol: dict[str, tuple[TurningPoint, ...]] = {}
     trend_source_versions: dict[str, str] = {}
     trend_extreme_skipped: dict[str, str] = {}
+    # v8（T5b）净值链（净值尺度，逐评估片段串行传递；跳过片段链冻结穿过——carry 不变）
+    carry_net_value = NET_VALUE_BASE
+    carry_peak_net_value = NET_VALUE_BASE
+    chain_entries: list[dict[str, Any]] = []
+    # v8（T6b）逐片段账户链起点快照（净值, 峰值），供审计侧账户行独立复算入参
+    account_initial_values: dict[str, tuple[float, float]] = {}
 
-    for segment in segments:
+    for segment in ordered_segments:
         loaded = daily_loaded_by_symbol.get(segment.symbol)
         if loaded is None:
             loaded = _load_daily_ohlc(data_dir, segment.symbol)
@@ -553,12 +690,40 @@ def generate_dataset(
             continue
         prev_daily_by_segment[segment.segment_id] = prev
         bars, source_version = load_segment_bars(segment, data_dir=data_dir)
+        # v8（T5b）：净值链节传递——本片段起点 = 上一评估片段末结算净值/峰值
+        # （净值尺度 ÷ NET_VALUE_BASE 换算为 equity 尺度；首片段 = 100/100）
         outcome = evaluate_segment(
             segment,
             bars,
             tick_size=float(symbols[segment.symbol]),
             params=params,
             source_data_version=source_version,
+            initial_equity=carry_net_value / NET_VALUE_BASE,
+            initial_peak=carry_peak_net_value / NET_VALUE_BASE,
+        )
+        # v8（T5b）：事件流重驱账户（mark 报告）填每决策点净值/今日（替换 T5a 的 0.0
+        # 占位；净值 = NET_VALUE_BASE×equity，今日 = 净值 − 片段起点净值）
+        account_values = _replay_account_values(
+            bars,
+            outcome.events,
+            tick_size=float(symbols[segment.symbol]),
+            processed_bar_count=outcome.processed_bar_count,
+            initial_net_value=carry_net_value,
+            initial_peak_net_value=carry_peak_net_value,
+        )
+        # v8（T6b）：记录本片段账户链起点快照（与上面传入 _replay_account_values 的
+        # initial 同源同值；供 check_state_leakage 调用审计侧独立复算防自证比对）
+        account_initial_values[segment.segment_id] = (carry_net_value, carry_peak_net_value)
+        outcome = replace(
+            outcome,
+            decision_points=tuple(
+                replace(
+                    point,
+                    net_value=account_values[point.bar_index][0],
+                    today_pnl=account_values[point.bar_index][1],
+                )
+                for point in outcome.decision_points
+            ),
         )
         # v5：逐入选决策点取其决策交易日的可用日线折点极值（确认日 < 决策交易日；
         # 片段内按 trade_date 缓存，单交易日片段只算一次）
@@ -586,7 +751,20 @@ def generate_dataset(
                 f"trade_date={missing_trade_date} 缺日线转折点"
                 "（需确认日严格早于该交易日的 up/down 折点各 ≥1，1d 转折点文件）"
             )
+            # 跳过片段：不产出记录，净值链冻结穿过（carry 不变，传给下一实际生成片段）
             continue
+        # v8（T5b）：链条目（处理时间序）+ 传递给下一实际生成片段
+        # （末结算净值 = NET_VALUE_BASE×final_equity，峰值同机制）
+        final_net_value = NET_VALUE_BASE * outcome.final_equity
+        chain_entries.append(
+            {
+                "segment_id": segment.segment_id,
+                "initial_net_value": carry_net_value,
+                "final_net_value": final_net_value,
+            }
+        )
+        carry_net_value = final_net_value
+        carry_peak_net_value = NET_VALUE_BASE * outcome.final_peak
         outcomes[segment.segment_id] = outcome
         bars_by_segment[segment.segment_id] = bars
         for point, trend_up, trend_dn in prepared:
@@ -617,6 +795,23 @@ def generate_dataset(
         record for split in SPLIT_ROLES for record in records_by_split[split]
     ]
     check_records(all_records)
+    # v8（T5b）硬门：跨片段净值链按处理时间序逐对核验（首评估片段起点净值 =
+    # NET_VALUE_BASE、下一片段起点净值 == 上一片段末结算净值），违规 raise
+    # DatasetError（不写出任何产物）；归一化链条目写入 per_segment 的 account_chain 节
+    account_chain = check_account_chain(chain_entries)
+    # v8（T6b）硬门：账户行三值（净值/今日/回撤）由审计侧 _independent_account_values
+    # 独立复算（内联重放，不调用 ReplayAccount/序列化实现）并与 state 文本逐值比对
+    # （防自证/tamper 防护）；入参 = 逐片段事件轨迹 + 处理 bar 数 + 链起点快照，
+    # 不一致即 raise DatasetError（不写出任何产物）
+    account_inputs_by_segment = {
+        segment_id: AccountReplayInputs(
+            events=outcome.events,
+            processed_bar_count=outcome.processed_bar_count,
+            initial_net_value=account_initial_values[segment_id][0],
+            initial_peak_net_value=account_initial_values[segment_id][1],
+        )
+        for segment_id, outcome in outcomes.items()
+    }
     check_state_leakage(
         all_records,
         bars_by_segment=bars_by_segment,
@@ -624,6 +819,7 @@ def generate_dataset(
         prev_daily_by_segment=prev_daily_by_segment,
         trend_points_by_symbol=trend_points_by_symbol,
         symbols_by_segment={segment.segment_id: segment.symbol for segment in segments},
+        account_inputs_by_segment=account_inputs_by_segment,
     )
 
     segments_text = _dump_json([segment.canonical() for segment in segments])
@@ -667,6 +863,7 @@ def generate_dataset(
             symbol: loaded.source_data_version
             for symbol, loaded in daily_loaded_by_symbol.items()
         },
+        account_chain=account_chain,
     )
     check_audit_consistency(payload, records_by_split)
 

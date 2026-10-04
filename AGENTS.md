@@ -85,20 +85,50 @@ MarketSense 是一个**研究型**项目，研究问题：
   `--daily-turning-points-dir` 参数，默认 `<data_dir>/../turning_points`；
   `STATE_SCHEMA = marketsense.episode_state.v5`；完整语义见
   `artifacts/daily-extreme-state/02-design/tech-design.md`）。
+  同日拍板状态模板升 v6（state-template-v6-order 任务）：行重排为
+  账户/日线/日内/联动/现价/盘口（联动行移至日内行之后），行内键与数值语义与 v5
+  逐项等价（`STATE_SCHEMA = marketsense.episode_state.v6`；记录见
+  `artifacts/state-template-v6-order/01-solo/solo-report.md`）。
+  同日拍板状态模板升 v7（state-template-v7-chinese-keys 任务）：训练 state 文本键名中文化
+  （日线 prev 三键→昨日高/昨日低/昨日收，日内 today_h/l→今高/今低，现价 o/h/l/c→
+  开/高/低/收，持仓时 entry/stop→开仓价/止损价；「键名可以是英文」仅适用于内部程序）；
+  日内行 `bar=` 序号与联动行量/持仓量比值并入现价行（命名为成交量比/持仓量比，
+  持仓量只保留收盘时刻，开盘时刻丢弃），联动行变为 `na` 常量占位；
+  trend 四键本次不改（后续随折点信息补充一并调整；`bar` 键名与 schema 标记值保留英文）
+  （`STATE_SCHEMA = marketsense.episode_state.v7`；记录见
+  `artifacts/state-template-v7-chinese-keys/01-solo/solo-report.md`）。
+  2026-10-03 拍板状态模板升 v8（account-service 任务）：账户行升六键
+  `持仓/开仓价/止损价/净值/今日/回撤`（键序固定，空仓时无开仓价/止损价两键；
+  键名沿用 v7-chinese-keys「开仓价/止损价」，内部字段 entry/stop 不变）；
+  `净值` = 100×(1+已实现+浮盈)（净值尺度，初值 100，展示口径 `NET_VALUE_BASE × equity`），
+  `今日` = 净值−片段起点（每片段重置，可为负），`回撤` 公式不变但峰值跨片段延续
+  （数值与 v7 不同）；同日拍板跨片段净值链：片段按时间序串行回放，首评估片段起点 = 100，
+  逐片段起点 = 上一评估片段末结算净值/峰值，跳过片段链冻结穿过，
+  dev 起点 = train 末、test 起点 = dev 末（split 时间连续时自然成立）；
+  审计新增 per_segment `account_chain` 节 + `check_account_chain` 落盘前硬校验 +
+  账户行三值审计侧独立重放复算（不一致不写出产物）；
+  账户域自 `market_episode/replay.py` 迁至 `dataset/account.py`（后者变为 re-export shim）；
+  （`STATE_SCHEMA = marketsense.episode_state.v8`；完整语义见
+  `artifacts/account-service/02-design/tech-design.md`）。
   完整语义与实现阶段冻结项见 `artifacts/nanojev-training-data/02-design/tech-design.md`。
-- **首轮真实数据（2026-10-01 生成；2026-10-02 v2~v5 状态模板 + 候选文案精简，均通过契约校验）**：
+- **首轮真实数据（2026-10-01 生成；2026-10-02 v2~v7 状态模板 + 候选文案精简；
+  2026-10-03 v8 账户行六键 + 跨片段净值链，均通过契约校验）**：
   DCE.v2701（PVC）2026-09 全月 21 个交易日片段（`data/segments/sep2026.jsonl`：
   train 9-1~9-18 / dev 9-21~9-24 / test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
-  当前产物 `data/nanojev_dataset/run-7cbd6516d46f/`（模板 v5 + 精简候选文案，
-  **train 1392 / dev 886 / test 655**，全部非空；state 文本为 v5 六部分中文标签结构
-  （账户/联动/日线/日内/现价/盘口），「日线」行含 trend 四键（数据源 = 日线折点 CSV，
-  确认根日期 < 决策交易日）；9 个 train 片段（9-1~9-11）因缺 up 折点跳过并告警；
-  board_state 值已与 board-state CSV 全量交叉核对一致，trend 四值与日线折点 CSV
-  独立重算一致；当前 run 双跑 sha256 一致）；
-  历史 `run-3db1bf63afc2/`（模板 v4，train 4188）、`run-36b037252a62/`（模板 v3）、
-  `run-b25cfd1ff370/`（v2 状态 + 精简文案）、
-  `run-13aff088b982/`（v2 状态、候选文案含价位括号）与首轮 `run-c1cb097177a3/`（模板 v1）保留。
-  六者 NanoJev 原生 `--validate-only` 契约硬门均通过。`tick_size = 5` 为**用户确认值**
+  当前产物 `data/nanojev_dataset/run-c364ea4a30ac/`（模板 v8：账户行六键
+  `持仓/开仓价/止损价/净值/今日/回撤` + 跨片段净值链，**train 1392 / dev 886 / test 655**，
+  全部非空；state 文本为 v8 六部分结构（账户/日线/日内/联动/现价/盘口）：账户行六键
+  （净值尺度 100 基，今日每片段重置，回撤峰值跨片段延续），其余行与 v7 同构；
+  9 个 train 片段（9-1~9-11）因缺 up 折点跳过并告警；
+  净值链 100 → train 末 115.957034 → dev 末 120.915886 → test 末 127.404954（deaths=0）；
+  与 v7 run 逐值比对：gold/持仓/开仓价/止损价全部一致（回撤因峰值延续数值不同、公式不变）；
+  当前 run 双跑 sha256 一致；
+  磁盘现存 4 个 run：当前 v8 run + 历史 `run-4f1cd33a3cfe/`（模板 v7）、
+  `run-6ae3e38289a3/`（模板 v6）、
+  `run-7cbd6516d46f/`（模板 v5，state 文本为 v5 六部分结构（账户/联动/日线/日内/现价/盘口），
+  「日线」行含 trend 四键，board_state 值已与 board-state CSV 全量交叉核对一致，
+  trend 四值与日线折点 CSV 独立重算一致）——更早的 v1~v4 run 已由用户会话清理。
+  四者 NanoJev 原生 `--validate-only` 契约硬门均通过。`tick_size = 5` 为**用户确认值**
   （公开资料记载最小变动价位 1 元/吨，按用户确认执行，见 `dataset/config/symbols.local.yaml`）。
   Mac Intel 16G（无 CUDA）已完成数据通路三级 CPU 冒烟（`--self-check` / tokenize / 前向，
   全部通过）；**训练与推理入口硬性要求 CUDA，本机不可训练**（详见 `README.md` §7.4）。

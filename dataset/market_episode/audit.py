@@ -1,4 +1,5 @@
-"""审计与自检：确定性（双跑 sha256）、跨 split 隔离、状态泄漏抽查、计数汇总。
+"""审计与自检：确定性（双跑 sha256）、跨 split 隔离、状态泄漏抽查、跨片段账户净值链
+硬校验、计数汇总。
 
 本模块只做**只读检查**与审计文件内容构造，不修改账户、不生成标签。
 
@@ -8,6 +9,15 @@
 * :func:`check_state_leakage` **独立重算**决策 K 线的现价/联动/日线/日内四行（v5 日线行含
   日线折点趋势极值），并与记录内的状态文本比对（不调用状态序列化实现，避免自证），
   同时拒绝状态里出现绝对价格/量（含上一交易日日线绝对值与可用折点绝对极值价）；
+  v8 起传入 ``account_inputs_by_segment``（T6b 接线）时对每决策点的账户行三值
+  （净值/今日/回撤）经 :func:`_independent_account_values` 独立复算并逐值比对
+  （防自证/tamper 防护；缺省 ``None`` 保持旧行为）；
+* :func:`check_account_chain` 跨片段账户净值链硬校验（首评估片段起点净值 = 100、
+  逐对「下一片段起点净值 = 前一片段末结算净值」精确比对，跳过片段链冻结穿过）；
+* :func:`_independent_account_values` 由 TradeEvent 轨迹 + K 线 + 初始（净值, 峰值）
+  **内联重放** t−1 盯市规则，复算片段内逐处理 bar 的净值/今日/回撤三值（不调用
+  账户实现，防自证，供状态账户行独立比对使用；T6b 起由 ``check_state_leakage``
+  接线调用）；
 * :func:`verify_determinism` 同输入双跑并逐文件比对 sha256；
 * :func:`build_audit_payload` 汇总死亡/剔除/每 split 计数、输入指纹与生成参数。
 """
@@ -19,8 +29,9 @@ import datetime as dt
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
 
@@ -29,12 +40,23 @@ from dataset.errors import DatasetError
 from dataset.storage import file_sha256
 
 from dataset.market_episode.labels import SegmentOutcome
-from dataset.market_episode.replay import Bar, format_ratio_value, ratio_or_none
+from dataset.market_episode.replay import (
+    Bar,
+    DIRECTIONS,
+    LONG,
+    TradeEvent,
+    format_ratio_value,
+    ratio_or_none,
+)
 from dataset.market_episode.segments import SPLIT_ROLES, EpisodeParams, Segment
 from dataset.turning_points import TrendExtreme, TurningPoint
 
 #: 审计文件 schema 标记
 AUDIT_SCHEMA = "marketsense.episode_audit.v1"
+#: 净值基数（展示口径：净值 = ``NET_VALUE_BASE × equity``，equity 为比值化记账权益、
+#: 初始 1.0 → 首片段起点净值 100.0；与 ``dataset/account.py`` docstring 的约定一致。
+#: 账户域本身以 equity 记账、不定义该常量——净值是展示层换算，账户链校验以净值口径进行）
+NET_VALUE_BASE: float = 100.0
 #: 记录必填字段（对齐 NanoJev ``validate_training_row``）
 RECORD_REQUIRED_FIELDS = ("id", "state_id", "family_id", "split", "state", "questions")
 #: NanoJev 允许的 gold_label_kind / gold_probs_kind（镜像其常量）
@@ -50,20 +72,25 @@ GOLD_LABEL_KINDS = frozenset(
 )
 
 #: 本轮实现的冻结口径（写入审计文件，便于复算时对照；v2 起新增 board_state；
-#: v5 起新增日线折点趋势极值，AUDIT_SCHEMA 保持 v1：payload 为纯增量变更，
-#: v5 演进标记由 state_template 承载）
+#: v5 起新增日线折点趋势极值；v6 起行重排（联动行移至日内行之后）；v7 起键名中文化 +
+#: bar 序号与量/持仓量比值并入现价行（持仓量只保留收盘）+ 联动行 na 占位；
+#: v8 起账户行扩展净值/今日（净值 = NET_VALUE_BASE × equity，跨片段链式延续；
+#: 今日 = 片段内权益变化，每片段重置），AUDIT_SCHEMA 保持 v1：payload 为纯增量变更
+#: （account_carry / today_pnl 为纯增量键），演进标记由 state_template 承载）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v5:decision_bar_only+board_state+daily_trend_extremes",
+    "state_template": "marketsense.episode_state.v8:decision_bar_only+board_state+daily_trend_extremes+account_net_value",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
-    "accounting": "ratio_units:initial_equity=1.0,1_lot=1_notional,no_multiplier,no_fees",
+    "accounting": "net_value_base_100:equity=100*(1+cum_ratio_pnl),1_lot=1_notional,no_multiplier,no_fees",
     "flat_sample_band": "configurable_minutes_around_opportunity_minutes",
-    "initial_state": "first_bar_is_first_decision_point,flat,peak=1.0",
+    "initial_state": "first_bar_is_first_decision_point,flat,peak=initial_net_value",
     "reversal_condition_2": "stop_reached_first_or_scan_end_without_exceeding_current_bar",
     "board_state_prev_day": "daily_file_1d_prev_trading_day_over_segment_first_open",
     "board_state_today": "segment_bars_cumulative_extrema_through_decision_bar",
     "daily_trend_extremes": "daily_tp_csv_confirmed_date_lt_trade_date__recent_1up_1down_over_segment_first_open",
+    "account_carry": "net_value_and_peak_carry_across_segments_time_ordered_serial_replay",
+    "today_pnl": "segment_equity_change_resets_per_segment",
     "question_template": "marketsense.episode_question.v1:concise_action_labels",
 }
 
@@ -223,24 +250,22 @@ def _ratio_or_na(numerator: float, denominator: float, precision: int) -> str:
 
 
 def _independent_px_line(bar: Bar, reference: Bar, precision: int) -> str:
-    """独立重算的决策 K 线价格比值行（v4「现价」行；不调用状态序列化实现，避免自证）。"""
+    """独立重算的决策 K 线价格/量/持仓量比值行（v7「现价」行；不调用状态序列化实现，
+    避免自证）。v7 起 ``bar`` 序号与量/持仓量比值并入本行（持仓量只保留收盘时刻），
+    bar 序号与 state_id 解析出的决策 K 线交叉锁定（bar 即 ``bars[bar_index]``）。"""
     values = (
         _ratio_or_na(bar.open, reference.open, precision),
         _ratio_or_na(bar.high, reference.open, precision),
         _ratio_or_na(bar.low, reference.open, precision),
         _ratio_or_na(bar.close, reference.open, precision),
-    )
-    return f"现价: o={values[0]} h={values[1]} l={values[2]} c={values[3]}"
-
-
-def _independent_vol_line(bar: Bar, reference: Bar, precision: int) -> str:
-    """独立重算的成交量/持仓量归一化比值行（v4「联动」行）。"""
-    values = (
+        f"{bar.index}",
         _ratio_or_na(bar.volume, reference.volume, precision),
-        _ratio_or_na(bar.open_oi, reference.open_oi, precision),
         _ratio_or_na(bar.close_oi, reference.close_oi, precision),
     )
-    return f"联动: v={values[0]} oi_open={values[1]} oi_close={values[2]}"
+    return (
+        f"现价: 开={values[0]} 高={values[1]} 低={values[2]} 收={values[3]}"
+        f" bar={values[4]} 成交量比={values[5]} 持仓量比={values[6]}"
+    )
 
 
 def _independent_daily_line(
@@ -250,14 +275,14 @@ def _independent_daily_line(
     trend_up_extreme: TrendExtreme,
     trend_dn_extreme: TrendExtreme,
 ) -> str:
-    """独立重算日线行（v5：prev = 上一交易日日线值 ÷ 片段首根开盘；
-    trend = 可用折点段极值 ÷ 片段首根开盘 + 段长整数直出）。"""
+    """独立重算日线行（v5/v7：prev = 上一交易日日线值 ÷ 片段首根开盘，v7 起中文名
+    昨日高/低/收；trend = 可用折点段极值 ÷ 片段首根开盘 + 段长整数直出）。"""
     prev_high, prev_low, prev_close = prev_daily
     return (
         "日线: "
-        f"prev_h={format_ratio_value(ratio_or_none(prev_high, reference.open), precision)}"
-        f" prev_l={format_ratio_value(ratio_or_none(prev_low, reference.open), precision)}"
-        f" prev_c={format_ratio_value(ratio_or_none(prev_close, reference.open), precision)}"
+        f"昨日高={format_ratio_value(ratio_or_none(prev_high, reference.open), precision)}"
+        f" 昨日低={format_ratio_value(ratio_or_none(prev_low, reference.open), precision)}"
+        f" 昨日收={format_ratio_value(ratio_or_none(prev_close, reference.open), precision)}"
         f" trend_up={format_ratio_value(ratio_or_none(trend_up_extreme.trend_extreme_price, reference.open), precision)}"
         f" trend_up_len={trend_up_extreme.segment_length}"
         f" trend_dn={format_ratio_value(ratio_or_none(trend_dn_extreme.trend_extreme_price, reference.open), precision)}"
@@ -339,6 +364,152 @@ def _independent_trend_extremes(
     return last_up, last_down
 
 
+@dataclass(frozen=True)
+class AccountReplayInputs:
+    """账户行独立复算的逐片段入参（v8/T6b；与 :func:`_independent_account_values`
+    参数一一对应，``bars`` 由 ``check_state_leakage`` 的 ``bars_by_segment`` 提供，
+    不在此重复）。
+
+    * ``events``：片段 TradeEvent 轨迹（生成侧 ``SegmentOutcome.events``）；
+    * ``processed_bar_count``：实际处理 bar 数（死亡即止）；
+    * ``initial_net_value`` / ``initial_peak_net_value``：片段账户链起点（净值, 峰值）
+      快照（净值尺度，首评估片段 = ``NET_VALUE_BASE``；与 ``generate_dataset`` 的
+      净值链 carry 同源同值）。
+    """
+
+    events: tuple[TradeEvent, ...]
+    processed_bar_count: int
+    initial_net_value: float
+    initial_peak_net_value: float
+
+
+def _independent_account_values(
+    events: Iterable[TradeEvent],
+    bars: Sequence[Bar],
+    *,
+    processed_bar_count: int,
+    initial_net_value: float = NET_VALUE_BASE,
+    initial_peak_net_value: float | None = None,
+) -> dict[int, tuple[float, float, float]]:
+    """独立复算片段内逐处理 bar 的账户三值 ``{bar_index: (净值, 今日, 回撤)}``。
+
+    防自证（沿 ``_independent_trend_extremes`` 先例）：由 TradeEvent 轨迹 + K 线 +
+    初始（净值, 峰值净值）**内联重放** t−1 盯市规则，**不调用** ``ReplayAccount``
+    与任何序列化实现。净值口径：净值 = ``NET_VALUE_BASE × equity``（equity 为比值
+    化记账权益），今日 = 净值 − 片段起点净值（``initial_net_value``，净值尺度），
+    回撤 = (峰值 − 权益)/峰值（比值，权益尺度算术与实现一致）。逐项语义：
+
+    * ``bar_index == i`` 的权益 = 初始权益 + 已实现盈亏 + 浮盈盯市；浮盈盯市价 =
+      ``close[i−1]``（比值口径，分母 = 片段首根开盘价）；``i == 0`` 尚无持仓，
+      权益 = 初始权益 → 今日 = 0；
+    * 持仓由事件流重建：开仓事件（``pnl_ratio is None``）设持仓
+      ``(direction, price_ratio)``，平仓事件累计已实现并清仓；决策点三值为该根
+      成交**前**的盯市值（先记号后成交，与推进顺序一致；反手 = 同根先平后开两笔）；
+    * 峰值在盯市时与平仓结算后更新（``peak = max(peak, equity)``，与
+      ``ReplayAccount.mark_to_market``/``close_position`` 同语义；结算后更新
+      确保片段末强平结算净值计入高水位）。
+
+    :param processed_bar_count: 实际处理 bar 数（死亡即止；与 ``SegmentOutcome``
+        的 ``processed_bar_count`` 同口径）；事件 bar 序号须落在处理范围内且升序。
+    :return: ``{bar_index: (净值, 今日, 回撤)}``（原始 float，供状态账户行逐值比对；
+        T6b 起由 ``check_state_leakage`` 接线调用）
+    """
+    if not bars:
+        raise DatasetError("审计：账户复算需要非空 K 线序列")
+    _require(
+        0 < processed_bar_count <= len(bars),
+        f"审计：账户复算 processed_bar_count 越界: {processed_bar_count}"
+        f"（片段共 {len(bars)} 根）",
+    )
+    _require(
+        float(initial_net_value) > 0,
+        f"审计：账户复算片段起点净值必须为正数: {initial_net_value!r}",
+    )
+    reference = float(bars[0].open)
+    _require(
+        reference > 0,
+        f"审计：片段首根开盘价必须为正数（比值表达的分母）: {bars[0].open!r}",
+    )
+    ordered_events = list(events)
+    previous_bar_index: int | None = None
+    for event in ordered_events:
+        _require(
+            0 <= event.bar_index < processed_bar_count,
+            f"审计：账户复算成交事件 bar 序号越界: {event.bar_index}"
+            f"（处理范围 0..{processed_bar_count - 1}）",
+        )
+        if previous_bar_index is not None:
+            _require(
+                event.bar_index >= previous_bar_index,
+                f"审计：账户复算成交事件 bar 序号非时间升序: "
+                f"{previous_bar_index} → {event.bar_index}",
+            )
+        previous_bar_index = event.bar_index
+
+    initial_equity = float(initial_net_value) / NET_VALUE_BASE
+    peak_equity = (
+        float(initial_peak_net_value) / NET_VALUE_BASE
+        if initial_peak_net_value is not None
+        else initial_equity
+    )
+    realized = 0.0
+    # 持仓 = (direction, entry_ratio)；entry_ratio 直接取开仓事件携带的 price_ratio
+    position: tuple[str, float] | None = None
+    values: dict[int, tuple[float, float, float]] = {}
+    event_cursor = 0
+    for index in range(processed_bar_count):
+        # 先记号：t−1 盯市（与 ReplayAccount.mark_to_market 同规则，算术内联重写）
+        equity = initial_equity + realized
+        if position is not None and index >= 1:
+            mark_ratio = float(bars[index - 1].close) / reference
+            entry_ratio = position[1]
+            equity += (
+                mark_ratio - entry_ratio
+                if position[0] == LONG
+                else entry_ratio - mark_ratio
+            )
+        if equity > peak_equity:
+            peak_equity = equity
+        drawdown = 0.0 if peak_equity <= 0 else (peak_equity - equity) / peak_equity
+        net_value = NET_VALUE_BASE * equity
+        values[index] = (net_value, net_value - float(initial_net_value), drawdown)
+        # 后成交：该 bar 的成交事件（事件流顺序即执行顺序：先平仓、后开仓）
+        while (
+            event_cursor < len(ordered_events)
+            and ordered_events[event_cursor].bar_index == index
+        ):
+            event = ordered_events[event_cursor]
+            if event.pnl_ratio is None:
+                _require(
+                    event.direction in DIRECTIONS,
+                    f"审计：账户复算在 bar {index} 遇到非法开仓方向: {event.direction!r}",
+                )
+                _require(
+                    position is None,
+                    f"审计：账户复算在 bar {index} 遇到重复开仓事件（已有持仓）",
+                )
+                position = (event.direction, event.price_ratio)
+            else:
+                _require(
+                    position is not None,
+                    f"审计：账户复算在 bar {index} 遇到无持仓平仓事件"
+                    f"（reason={event.reason!r}）",
+                )
+                realized += event.pnl_ratio
+                position = None
+                # 结算后峰值更新（与 ReplayAccount.close_position 同规则，
+                # 算术内联重写）：平仓结算权益计入高水位
+                settled_equity = initial_equity + realized
+                if settled_equity > peak_equity:
+                    peak_equity = settled_equity
+            event_cursor += 1
+    _require(
+        event_cursor == len(ordered_events),
+        "审计：账户复算存在未消费的成交事件（事件流与处理 bar 范围不一致）",
+    )
+    return values
+
+
 def check_state_leakage(
     records: list[dict[str, Any]],
     *,
@@ -347,16 +518,23 @@ def check_state_leakage(
     prev_daily_by_segment: Mapping[str, tuple[float, float, float]],
     trend_points_by_symbol: Mapping[str, tuple[TurningPoint, ...]],
     symbols_by_segment: Mapping[str, str],
+    account_inputs_by_segment: Mapping[str, AccountReplayInputs] | None = None,
 ) -> None:
     """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的数据计算。
 
-    * 记录里的现价/联动/日线/日内四行必须等于按 ≤ 决策 K 线的数据
-      **独立重算**的结果 → 状态若误用下一根/其它根会失败；
+    * 记录里的现价/日线/日内三行必须等于按 ≤ 决策 K 线的数据**独立重算**的结果 →
+      状态若误用下一根/其它根会失败（v7 起 ``bar`` 序号与量/持仓量比值在现价行内，
+      同受此检查；联动行为 ``na`` 常量占位，按常量比对）；
     * 日线行 trend 四值必须等于按「确认根日期严格早于决策交易日」过滤后的
       最近 1 up + 1 down 折点独立重算（T 日及之后确认的折点若被误用即被检出）；
+    * 账户行三值（净值/今日/回撤）：传入 ``account_inputs_by_segment``（v8/T6b 接线）
+      时由 :func:`_independent_account_values` 独立复算并与 state 文本逐值比对，
+      任一值被篡改/与重放不一致即 ``DatasetError``（防自证/tamper 防护）；缺省
+      ``None`` 保持旧行为（账户行不参与复算比对）；
     * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量，也不得出现上一交易日
       日线的绝对价格与该记录可用折点的绝对极值价（它们只能以比值出现）。
     """
+    account_values_cache: dict[str, dict[int, tuple[float, float, float]]] = {}
     for record in records:
         segment_id, bar_index = parse_state_id(record["state_id"])
         bars = bars_by_segment.get(segment_id)
@@ -394,7 +572,7 @@ def check_state_leakage(
         trend_up_extreme, trend_dn_extreme = extremes
         expected_lines = (
             ("现价", _independent_px_line(bar, reference, price_precision)),
-            ("联动", _independent_vol_line(bar, reference, price_precision)),
+            ("联动", "联动: na"),
             (
                 "日线",
                 _independent_daily_line(
@@ -412,6 +590,51 @@ def check_state_leakage(
                 expected in state_text,
                 f"记录 {record['id']} 状态中的{line_label}行与决策 K 线不一致"
                 f"（期望 {expected!r}）",
+            )
+        if account_inputs_by_segment is not None:
+            # v8（T6b）：账户行三值独立复算比对（防自证/tamper 防护；复算结果按片段
+            # 缓存，同片段多条记录共享一次重放）
+            inputs = account_inputs_by_segment.get(segment_id)
+            _require(
+                inputs is not None,
+                f"审计缺少片段 {segment_id!r} 的账户行独立复算入参",
+            )
+            assert inputs is not None
+            replayed = account_values_cache.get(segment_id)
+            if replayed is None:
+                replayed = _independent_account_values(
+                    inputs.events,
+                    bars,
+                    processed_bar_count=inputs.processed_bar_count,
+                    initial_net_value=inputs.initial_net_value,
+                    initial_peak_net_value=inputs.initial_peak_net_value,
+                )
+                account_values_cache[segment_id] = replayed
+            _require(
+                bar_index in replayed,
+                f"记录 {record['id']} 的决策 K 线序号 {bar_index} 超出账户复算"
+                f"处理范围（0..{inputs.processed_bar_count - 1}）",
+            )
+            replay_net, replay_today, replay_drawdown = replayed[bar_index]
+            expected_account = (
+                f"净值={format_ratio_value(replay_net, price_precision)}"
+                f" 今日={format_ratio_value(replay_today, price_precision)}"
+                f" 回撤={format_ratio_value(replay_drawdown, price_precision)}"
+            )
+            match = re.search(r"净值=(\S+) 今日=(\S+) 回撤=(\S+)", state_text)
+            _require(
+                match is not None,
+                f"记录 {record['id']} 状态缺少账户行净值/今日/回撤"
+                "（无法与独立复算比对）",
+            )
+            assert match is not None
+            actual_account = (
+                f"净值={match.group(1)} 今日={match.group(2)} 回撤={match.group(3)}"
+            )
+            _require(
+                actual_account == expected_account,
+                f"记录 {record['id']} 状态中的账户行净值/今日/回撤与独立复算不一致"
+                f"（期望 {expected_account!r}，实际 {actual_account!r}）",
             )
         neighbours = {0, bar_index - 1, bar_index, bar_index + 1}
         for neighbour in sorted(index for index in neighbours if 0 <= index < len(bars)):
@@ -440,6 +663,89 @@ def check_state_leakage(
                 )
 
 
+def check_account_chain(entries: Sequence[Any]) -> list[dict[str, Any]]:
+    """跨片段账户净值链硬校验（违规即 ``DatasetError``，同审计既有错误风格）。
+
+    * ``entries`` 为**按时间处理序**的逐评估片段链条目，每项两种形式之一：
+      ①含 ``segment_id`` / ``initial_net_value``（起点净值）/
+      ``final_net_value``（末结算净值）键的映射；②``(SegmentOutcome, initial_net_value)``
+      二元组——末结算净值取 ``NET_VALUE_BASE × outcome.final_equity``
+      （净值 = 100×equity；outcome 同时携带 ``final_peak`` 供峰值链传递，但本校验
+      只比对净值口径）；
+    * 首个评估片段起点净值必须精确等于 ``NET_VALUE_BASE``（= 100.0，即
+      ``NET_VALUE_BASE × 1.0``）；逐对核验「下一片段起点净值 == 上一片段末结算净值」
+      （精确 ``==``：链内为同一 float 传递，确定性成立）；
+    * 跳过片段（缺上一交易日日线/缺可用折点）不产出链条目——链在其前一片段末值上
+      **冻结穿过**，逐对 ``==`` 核验天然接受；空序列（全跳过场景）返回空列表。
+    * 通过后返回归一化链条目
+      ``[{"segment_id", "initial_net_value", "final_net_value"}, ...]``
+      （净值尺度，供 ``build_audit_payload`` 写入 per_segment ``account_chain`` 节，
+      跨片段可追溯）。
+    """
+    normalized: list[tuple[str, float, float]] = []
+    seen: set[str] = set()
+    for position, item in enumerate(entries):
+        if isinstance(item, dict):
+            for key in ("segment_id", "initial_net_value", "final_net_value"):
+                _require(key in item, f"审计账户链：第 {position} 项缺少键 {key!r}")
+            segment_id = item["segment_id"]
+            _require(
+                isinstance(segment_id, str) and bool(segment_id.strip()),
+                f"审计账户链：第 {position} 项 segment_id 必须为非空字符串: {segment_id!r}",
+            )
+            initial = float(item["initial_net_value"])
+            final = float(item["final_net_value"])
+        elif (
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[0], SegmentOutcome)
+        ):
+            outcome, initial_net_value = item
+            segment_id = outcome.segment_id
+            initial = float(initial_net_value)
+            final = NET_VALUE_BASE * float(outcome.final_equity)
+        else:
+            raise DatasetError(
+                f"审计账户链：第 {position} 项形式非法（应为含起末净值的映射或 "
+                f"(SegmentOutcome, 起点净值) 二元组）: {type(item).__name__}"
+            )
+        _require(
+            segment_id not in seen,
+            f"审计账户链：片段 {segment_id!r} 重复出现",
+        )
+        seen.add(segment_id)
+        _require(
+            initial > 0,
+            f"审计账户链：片段 {segment_id} 起点净值必须为正数: {initial!r}",
+        )
+        normalized.append((segment_id, initial, final))
+
+    chain: list[dict[str, Any]] = []
+    previous_final: float | None = None
+    for segment_id, initial, final in normalized:
+        if previous_final is None:
+            _require(
+                initial == NET_VALUE_BASE,
+                f"审计账户链：首片段 {segment_id} 起点净值 {initial!r} ≠ "
+                f"NET_VALUE_BASE（{NET_VALUE_BASE}，首片段必须以 100.0 起算）",
+            )
+        else:
+            _require(
+                initial == previous_final,
+                f"审计账户链：片段 {segment_id} 起点净值 {initial!r} ≠ "
+                f"前一片段末结算净值 {previous_final!r}",
+            )
+        chain.append(
+            {
+                "segment_id": segment_id,
+                "initial_net_value": round(initial, 12),
+                "final_net_value": round(final, 12),
+            }
+        )
+        previous_final = final
+    return chain
+
+
 def _absolute_price_tokens(values, precision: int) -> set[str]:
     """绝对价格 token 集合（固定小数位形式与浮点 ``repr`` 形式）。"""
     tokens: set[str] = set()
@@ -455,14 +761,13 @@ def _independent_intraday_line(
     reference: Bar,
     precision: int,
 ) -> str:
-    """独立重算日内行（today = 前缀累计极值；``bar=`` 取 state_id 解析出的序号，
-    与序列化侧的 ``bar.index`` 交叉锁定）。"""
+    """独立重算日内行（v7：today = 前缀累计极值，中文名今高/今低；``bar=`` 序号自 v7 起
+    移入现价行，由 ``_independent_px_line`` 的 ``bars[bar_index].index`` 与 state_id 交叉锁定）。"""
     today_high = max(bar.high for bar in bars_prefix)
     today_low = min(bar.low for bar in bars_prefix)
     return (
-        f"日内: bar={bar_index}"
-        f" today_h={format_ratio_value(ratio_or_none(today_high, reference.open), precision)}"
-        f" today_l={format_ratio_value(ratio_or_none(today_low, reference.open), precision)}"
+        f"日内: 今高={format_ratio_value(ratio_or_none(today_high, reference.open), precision)}"
+        f" 今低={format_ratio_value(ratio_or_none(today_low, reference.open), precision)}"
     )
 
 
@@ -472,10 +777,19 @@ def check_no_absolute_values(state_text: str, bar: Bar, *, precision: int) -> No
     只检查价格 token（含固定小数位形式与浮点 ``repr`` 形式）：成交量/持仓量为小整数，
     与状态里 ``日内`` 行的 ``bar=<序号>`` 等数字 token 容易假阳性，且序列化器在结构上
     只输出比值行（由字节级夹具测试锁定），故不参与 token 检查。
+
+    「账户」行（``账户: `` 开头，净值/今日/回撤）**豁免** token 扫描：六键均为
+    净值尺度账户值（净值 = 100×equity，与绝对价不同域，语义上不构成泄漏）；
+    其余行（账户外的日线/日内/联动/现价/盘口）邻根 token 扫描语义不变。
     """
     tokens = _absolute_price_tokens((bar.open, bar.high, bar.low, bar.close), precision)
+    # 豁免「账户」行后逐行拼接再扫（行分隔符不属价格 token 字符，边界语义与逐行扫一致；
+    # v3+ 行连接符为 " \n "，账户行带前导空格，故前导空格不敏感）
+    scanned_text = "\n".join(
+        line for line in state_text.splitlines() if not line.lstrip().startswith("账户: ")
+    )
     for token in sorted(tokens):
-        if re.search(rf"(?<![\d.]){re.escape(token)}(?![\d.])", state_text):
+        if re.search(rf"(?<![\d.]){re.escape(token)}(?![\d.])", scanned_text):
             raise DatasetError(f"状态文本出现绝对价格 {token!r}（绝对数不得进入模型输入）")
 
 
@@ -493,13 +807,33 @@ def build_audit_payload(
     trend_extreme_skipped: Mapping[str, str] | None = None,
     trend_source_versions: Mapping[str, str] | None = None,
     daily_source_versions: Mapping[str, str | None] | None = None,
+    account_chain: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """构造审计文件内容（不含墙钟时间，保证双跑逐字节一致）。
 
     v5 起：新增顶层 section ``trend_extremes``（缺折点跳过清单 + 1d 转折点 CSV 版本），
     ``AUDIT_SCHEMA`` 保持 v1（payload 为纯增量变更；v5 演进标记由
     ``frozen_decisions.state_template`` 承载）。
+    v8 起：新增可选 ``account_chain``（:func:`check_account_chain` 的归一化返回）——
+    校验通过的每片段起点/末结算净值写入 per_segment 条目的 ``account_chain`` 节
+    （净值 = ``NET_VALUE_BASE × equity``，纯增量键；未传入时不写该键，行为与 v7 一致）。
     """
+    chain_by_segment: dict[str, tuple[float, float]] = {}
+    for position, chain_entry in enumerate(account_chain or ()):  # type: ignore[arg-type]
+        _require(
+            isinstance(chain_entry, dict),
+            f"审计 account_chain 第 {position} 条目必须是映射",
+        )
+        for key in ("segment_id", "initial_net_value", "final_net_value"):
+            _require(
+                key in chain_entry,
+                f"审计 account_chain 第 {position} 条目缺少键 {key!r}",
+            )
+        chain_by_segment[str(chain_entry["segment_id"])] = (
+            float(chain_entry["initial_net_value"]),
+            float(chain_entry["final_net_value"]),
+        )
+
     per_segment: list[dict[str, Any]] = []
     for segment in segments:
         outcome = outcomes.get(segment.segment_id)
@@ -507,30 +841,36 @@ def build_audit_payload(
             # board_state / 日线折点跳过的片段不产出 per_segment 审计（分别在
             # board_state.skipped_segments 与 trend_extremes.skipped_segments 记录）
             continue
-        per_segment.append(
-            {
-                "segment_id": segment.segment_id,
-                "symbol": segment.symbol,
-                "period": segment.period,
-                "split_role": segment.split_role,
-                "start_ts": segment.start.isoformat(),
-                "end_ts": segment.end.isoformat(),
-                "tick_size": float(symbols[segment.symbol]),
-                "source_data_version": outcome.source_data_version,
-                "bars": outcome.bar_count,
-                "processed_bars": outcome.processed_bar_count,
-                "decision_points": len(outcome.decision_points),
-                "selected": len(outcome.selected),
-                "excluded_flat": outcome.excluded_flat,
-                "stop_exit_bars": list(outcome.stop_exits),
-                "deaths": [event.bar_index for event in outcome.deaths],
-                "death_forced_close": [event.forced_close for event in outcome.deaths],
-                "segment_end_forced_close": outcome.segment_end_forced_close,
-                "action_counts": dict(sorted(outcome.action_counts.items())),
-                "realized_pnl_ratio": round(outcome.realized_pnl_ratio, 12),
-                "peak_equity": round(outcome.peak_equity, 12),
+        entry = {
+            "segment_id": segment.segment_id,
+            "symbol": segment.symbol,
+            "period": segment.period,
+            "split_role": segment.split_role,
+            "start_ts": segment.start.isoformat(),
+            "end_ts": segment.end.isoformat(),
+            "tick_size": float(symbols[segment.symbol]),
+            "source_data_version": outcome.source_data_version,
+            "bars": outcome.bar_count,
+            "processed_bars": outcome.processed_bar_count,
+            "decision_points": len(outcome.decision_points),
+            "selected": len(outcome.selected),
+            "excluded_flat": outcome.excluded_flat,
+            "stop_exit_bars": list(outcome.stop_exits),
+            "deaths": [event.bar_index for event in outcome.deaths],
+            "death_forced_close": [event.forced_close for event in outcome.deaths],
+            "segment_end_forced_close": outcome.segment_end_forced_close,
+            "action_counts": dict(sorted(outcome.action_counts.items())),
+            "realized_pnl_ratio": round(outcome.realized_pnl_ratio, 12),
+            "peak_equity": round(outcome.peak_equity, 12),
+        }
+        chain = chain_by_segment.get(segment.segment_id)
+        if chain is not None:
+            # v8：跨片段净值链（check_account_chain 校验通过后的起末净值，纯增量键）
+            entry["account_chain"] = {
+                "initial_net_value": round(chain[0], 12),
+                "final_net_value": round(chain[1], 12),
             }
-        )
+        per_segment.append(entry)
 
     per_split = {
         split: {
@@ -667,10 +1007,13 @@ def verify_determinism(
 
 __all__ = [
     "AUDIT_SCHEMA",
+    "AccountReplayInputs",
     "FROZEN_DECISIONS",
     "GOLD_LABEL_KINDS",
+    "NET_VALUE_BASE",
     "RECORD_REQUIRED_FIELDS",
     "build_audit_payload",
+    "check_account_chain",
     "check_audit_consistency",
     "check_no_absolute_values",
     "check_record_ids_unique",

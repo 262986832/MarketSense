@@ -83,6 +83,13 @@ class DecisionPoint:
     drawdown: float
     reward_risk_long: float | None
     reward_risk_short: float | None
+    #: 账户净值（净值尺度；v8 账户行「净值」键的数据源，由调用方（账户回放）
+    #: 只用 ≤ 决策 K 线的数据算好传入；跨片段净值链（时间序串行回放，初值 100）
+    #: 由后续任务接入，当前默认 0.0 仅为未接入的占位，非真实净值。
+    #: 见 artifacts/account-service/02-design/tech-design.md）
+    net_value: float = 0.0
+    #: 片段内今日收益（净值尺度，每片段重置；v8 账户行「今日」键的数据源，同上由调用方算好传入）
+    today_pnl: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,10 @@ class SegmentOutcome:
     events: tuple[TradeEvent, ...]
     realized_pnl_ratio: float
     peak_equity: float
+    # 片段末结算净值/峰值（比值口径，默认参数下 final_equity 以 1.0 起算；
+    # 跨片段传递时作为下一片段 evaluate_segment 的 initial_equity/initial_peak 来源）
+    final_equity: float
+    final_peak: float
     source_data_version: str | None
 
     @property
@@ -286,6 +297,8 @@ def evaluate_segment(
     tick_size: float,
     params: EpisodeParams,
     source_data_version: str | None = None,
+    initial_equity: float = 1.0,
+    initial_peak: float | None = None,
 ) -> SegmentOutcome:
     """在片段内逐根确定性推进账户并生成规则真值标签。
 
@@ -294,11 +307,18 @@ def evaluate_segment(
     1. t−1 盯市（``mark_to_market``）→ 空仓时死亡判定；
     2. 空仓 → 开仓评估（可见未来仅用于计算 gold，状态仍只由 ≤ 决策 K 线数据构造）；
     3. 持仓 → 先判程序止损离场（不产生样本），再判死亡，最后判反转/持有。
+
+    跨片段传递：``initial_equity`` / ``initial_peak``（缺省 1.0 / ``None``）由上一
+    片段末 ``SegmentOutcome.final_equity`` / ``final_peak`` 传入；缺省行为与
+    不传时逐值一致（``initial_peak=None`` → 账户层取 ``initial_equity``）。
     """
     if not bars:
         raise DatasetError(f"片段 {segment.segment_id} 没有 K 线")
     account = ReplayAccount(
-        bars, tick_size=tick_size
+        bars,
+        tick_size=tick_size,
+        initial_equity=initial_equity,
+        initial_peak=initial_peak,
     )
     points: list[DecisionPoint] = []
     stop_exits: list[int] = []
@@ -392,6 +412,9 @@ def evaluate_segment(
         events=account.events,
         realized_pnl_ratio=account.realized_pnl,
         peak_equity=account.peak_equity,
+        # 片段末已全部平仓结算（各离场路径均先 close）：净值 = 初始净值 + 已实现盈亏
+        final_equity=account.initial_equity + account.realized_pnl,
+        final_peak=account.peak_equity,
         source_data_version=source_data_version,
     )
 

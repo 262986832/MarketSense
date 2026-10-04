@@ -866,3 +866,67 @@ def test_load_extreme_columns_strict_parsing(tmp_path: Path) -> None:
     )
     with pytest.raises(DataLoadError, match="存在缺失或非数值"):
         load_turning_points("DCE.v2701", "1m", data_dir=tmp_path)
+
+
+def test_trend_state_direction_branches() -> None:
+    """v9 趋势状态纯函数三分支（2026-10-03 trend-state-v9 T2）。
+
+    输入为 ``recent_trend_extremes(points, n=2)`` 的时间倒序元组（``[0]`` = 最近
+    即 -1、``[1]`` = 次近即 -2）；HH+HL → up、LL+LH → down、混合/相等 → range；
+    任一元组长度 < 2 → DatasetError。
+    """
+    from dataset import trend_state_direction
+    from dataset.errors import DatasetError
+    from dataset.turning_points import TrendExtreme
+
+    def extreme(price: float, kind: str) -> TrendExtreme:
+        return TrendExtreme(
+            kind=kind,
+            trend_extreme_price=price,
+            trend_extreme_bar_index=0,
+            segment_length=1,
+        )
+
+    # 高点升高 + 低点升高 → up（涨势中）
+    assert (
+        trend_state_direction(
+            (extreme(105.0, "up"), extreme(100.0, "up")),
+            (extreme(96.0, "down"), extreme(90.0, "down")),
+        )
+        == "up"
+    )
+    # 高点降低 + 低点降低 → down（跌势中）
+    assert (
+        trend_state_direction(
+            (extreme(100.0, "up"), extreme(105.0, "up")),
+            (extreme(90.0, "down"), extreme(96.0, "down")),
+        )
+        == "down"
+    )
+    # 混合（高抬 + 低降）→ range（震荡）
+    assert (
+        trend_state_direction(
+            (extreme(105.0, "up"), extreme(100.0, "up")),
+            (extreme(90.0, "down"), extreme(96.0, "down")),
+        )
+        == "range"
+    )
+    # 相等（含边界）→ range
+    assert (
+        trend_state_direction(
+            (extreme(105.0, "up"), extreme(105.0, "up")),
+            (extreme(96.0, "down"), extreme(96.0, "down")),
+        )
+        == "range"
+    )
+    # 任一元组长度 < 2 → DatasetError
+    with pytest.raises(DatasetError, match="需要各方向 ≥2 个段极值"):
+        trend_state_direction(
+            (extreme(105.0, "up"),),
+            (extreme(96.0, "down"), extreme(90.0, "down")),
+        )
+    with pytest.raises(DatasetError, match="需要各方向 ≥2 个段极值"):
+        trend_state_direction(
+            (extreme(105.0, "up"), extreme(100.0, "up")),
+            (),
+        )

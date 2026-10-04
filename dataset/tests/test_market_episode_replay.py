@@ -25,8 +25,7 @@ from dataset.market_episode.replay import (
 from dataset.market_episode.segments import load_segments
 from dataset.storage import save_ohlcv
 from dataset.tests.market_episode_fixtures import (
-    DAILY_TP_DOWN,
-    DAILY_TP_UP,
+    RENDER_TREND_CONTEXT,
     SYMBOL,
     bars,
     build_workspace,
@@ -298,8 +297,7 @@ def test_visible_state_depends_only_on_bars_up_to_decision_bar() -> None:
         today_pnl=0.0,
         price_precision=6,
         board_state=board,
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     mutated = bars(base_rows + [(966, 1200, 900, 1100)])[index]  # 决策 K 线之后的 bar 改变
@@ -312,8 +310,7 @@ def test_visible_state_depends_only_on_bars_up_to_decision_bar() -> None:
         today_pnl=0.0,
         price_precision=6,
         board_state=board,
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     assert state_before == state_after
@@ -333,8 +330,7 @@ def test_visible_state_contains_no_absolute_prices() -> None:
         price_precision=6,
         board_state=BoardStateValues(prev_day_high=2000.0, prev_day_low=1980.0,
                                      prev_day_close=1990.0, today_high=1010.0, today_low=999.5),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     for price in (1000, 1000.5, 999.5, 1010, 1008):

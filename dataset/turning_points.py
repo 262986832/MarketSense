@@ -85,6 +85,20 @@
 数据层子函数 :func:`recent_trend_extremes`（详见函数 docstring）可从点序列取
 最近 ``n`` 个高点与 ``n`` 个低点的段极值（:class:`TrendExtreme`，含段长；段长
 由点序列确定性推导，不入 CSV）。
+
+趋势状态分类（2026-10-03 v9）
+-----------------------------
+
+:func:`trend_state_direction` 对 :func:`recent_trend_extremes`（``n=2``）返回的
+两个时间倒序元组做**纯比较**分类（v9 训练状态日线行「趋势=」键的三分支判据，见
+``artifacts/trend-state-v9/02-design/tech-design.md``）：
+
+* ``"up"``（涨势中）：高/低两方向最近项（``-1``）段极值**均严格大于**次近项（``-2``）；
+* ``"down"``（跌势中）：均严格小于；
+* ``"range"``（震荡）：其余，含任一方向相等（判据不含等号）。
+
+纯比较、无选择/过滤逻辑（「审计侧独立实现不调用数据层选择函数」的边界不被破坏）；
+:func:`recent_trend_extremes` 本体不变（v9 调用侧改传 ``n=2``）。
 """
 
 from __future__ import annotations
@@ -473,6 +487,46 @@ def recent_trend_extremes(
 
     # 时间倒序（最近优先）：取各自最近 n 个后反转
     return tuple(reversed(highs[-n:])), tuple(reversed(lows[-n:]))
+
+
+def trend_state_direction(
+    highs: tuple[TrendExtreme, ...], lows: tuple[TrendExtreme, ...]
+) -> str:
+    """对称三分支趋势状态分类（2026-10-03 v9；纯比较，无选择/过滤逻辑）。
+
+    输入 :func:`recent_trend_extremes`（``n=2``）返回的两个时间倒序元组（**最近优先**：
+    ``[0]`` = 编号 ``-1`` 最近项、``[1]`` = 编号 ``-2`` 次近项）；判据 = 各方向最近项
+    （``-1``）与次近项（``-2``）的段极值价（``trend_extreme_price``）比较（在**绝对
+    价格层**比较——同分母比值与绝对价序等价；分母 ≤ 0 时序列化侧整段退化为 ``na``，
+    与本分类无关）：
+
+    * ``"up"``（涨势中）：``-1``（最近）up 段极值 > ``-2``（次近）且 ``-1`` down
+      段极值 > ``-2``（高抬高价升）；
+    * ``"down"``（跌势中）：两方向 ``-1`` 段极值均 ``<`` ``-2``（高降低降）；
+    * ``"range"``（震荡）：其余（含任一方向 ``-1 == -2`` 相等——判据不含等号）。
+
+    :param highs: 最近 2 个 up 点段极值（时间倒序，``recent_trend_extremes`` 的
+        首个返回值）
+    :param lows: 最近 2 个 down 点段极值（时间倒序，``recent_trend_extremes`` 的
+        第二个返回值）
+    :return: ``"up"`` | ``"down"`` | ``"range"``
+    :raises DatasetError: 任一元组长度 ``< 2``
+    """
+    if len(highs) < 2 or len(lows) < 2:
+        raise DatasetError(
+            "trend_state_direction 需要各方向 ≥2 个段极值"
+            f"（recent_trend_extremes n=2 的返回值）: highs={len(highs)}, lows={len(lows)}"
+        )
+    # 时间倒序（最近优先）：[0] = 编号 -1（最近）、[1] = 编号 -2（次近）
+    high_higher = highs[0].trend_extreme_price > highs[1].trend_extreme_price
+    high_lower = highs[0].trend_extreme_price < highs[1].trend_extreme_price
+    low_higher = lows[0].trend_extreme_price > lows[1].trend_extreme_price
+    low_lower = lows[0].trend_extreme_price < lows[1].trend_extreme_price
+    if high_higher and low_higher:
+        return "up"
+    if high_lower and low_lower:
+        return "down"
+    return "range"
 
 
 def turning_points_filename(symbol: str, period: str) -> str:

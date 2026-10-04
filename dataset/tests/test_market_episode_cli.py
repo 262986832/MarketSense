@@ -289,16 +289,24 @@ def test_episode_generate_reports_trend_extreme_skips_on_stderr(tmp_path: Path, 
         ).reset_index(drop=True),
         symbol=SYMBOL, period="1d", output_dir=data_dir,
     )
-    # 折点均确认于 01-02：== seg-train 决策交易日（单侧视角不可用 → 跳过）
+    # 折点均确认于 01-02：== seg-train 决策交易日（不可用 → 跳过）；
+    # < seg-dev/seg-test 决策交易日 01-03 且 up/down 各 ≥2（可用 → 正常产出）；
+    # v9 同源不变式：bar_index = 1d 文件行号（01-02 = 行 1）
     write_daily_turning_points(
         data_dir.parent / "turning_points" / f"{SYMBOL}_1d.csv",
         rows=[
             {"kind": "down", "timestamp": "2024-01-02 09:05:00+08:00", "price": 3980.0,
-             "bar_index": 5, "volume": 120, "oi": 5010,
-             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 5},
+             "bar_index": 1, "volume": 120, "oi": 5010,
+             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 1},
             {"kind": "up", "timestamp": "2024-01-02 09:35:00+08:00", "price": 4020.0,
-             "bar_index": 12, "volume": 130, "oi": 5020,
-             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 12},
+             "bar_index": 1, "volume": 130, "oi": 5020,
+             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 1},
+            {"kind": "down", "timestamp": "2024-01-02 10:05:00+08:00", "price": 3990.0,
+             "bar_index": 1, "volume": 140, "oi": 5030,
+             "trend_extreme_price": 3990.0, "trend_extreme_bar_index": 1},
+            {"kind": "up", "timestamp": "2024-01-02 10:35:00+08:00", "price": 4040.0,
+             "bar_index": 1, "volume": 150, "oi": 5040,
+             "trend_extreme_price": 4040.0, "trend_extreme_bar_index": 1},
         ],
     )
     manifest = write_manifest(

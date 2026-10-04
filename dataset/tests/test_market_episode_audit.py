@@ -40,11 +40,11 @@ from dataset.market_episode.segments import (
 )
 from dataset.storage import save_ohlcv
 from dataset.tests.market_episode_fixtures import (
-    DAILY_TP_DOWN,
-    DAILY_TP_UP,
+    RENDER_TREND_CONTEXT,
     SYMBOL,
     bars,
     build_workspace,
+    daily_rows_map,
     daily_trend_points_map,
     frame,
     prev_daily_map,
@@ -148,6 +148,7 @@ def test_generated_records_pass_all_audit_checks(tmp_path: Path) -> None:
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
         trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
     )
     check_audit_consistency(result.audit, _records_by_split(result))
@@ -193,6 +194,7 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
         trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
     )
 
@@ -218,8 +220,7 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
             today_high=max(bar.high for bar in segment_bars[: bar_index + 2]),
             today_low=min(bar.low for bar in segment_bars[: bar_index + 2]),
         ),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     with pytest.raises(DatasetError, match="与决策 K 线不一致"):
@@ -229,6 +230,7 @@ def test_state_leakage_detects_state_built_from_next_bar(tmp_path: Path) -> None
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
             trend_points_by_symbol=daily_trend_points_map(workspace),
+            daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
         )
 
@@ -257,6 +259,7 @@ def test_state_leakage_detects_absolute_price_in_state(tmp_path: Path) -> None:
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
             trend_points_by_symbol=daily_trend_points_map(workspace),
+            daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
         )
 
@@ -270,6 +273,7 @@ def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
         trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
     )
 
@@ -287,6 +291,7 @@ def test_state_leakage_detects_wrong_board_state_line(tmp_path: Path) -> None:
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
             trend_points_by_symbol=daily_trend_points_map(workspace),
+            daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
         )
 
@@ -307,6 +312,7 @@ def test_state_leakage_detects_prev_daily_absolute_price(tmp_path: Path) -> None
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
             trend_points_by_symbol=daily_trend_points_map(workspace),
+            daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
         )
 
@@ -442,8 +448,7 @@ def test_state_of_flat_minute_uses_bars_up_to_its_own_index() -> None:
         price_precision=6,
         board_state=BoardStateValues(prev_day_high=2010.0, prev_day_low=1980.0,
                                      prev_day_close=1990.0, today_high=1012.0, today_low=990.0),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     assert (
@@ -494,7 +499,8 @@ def test_audit_records_source_data_version_per_segment(tmp_path: Path) -> None:
 
 
 def test_state_leakage_detects_wrong_trend_line(tmp_path: Path) -> None:
-    """v5 日线行 trend 篡改 → 独立重算不一致（日线行与决策 K 线不一致）→ 必须被检出。"""
+    """v9 日线行趋势项篡改（涨势 -1 段极值比值）→ 独立重算不一致（日线行与决策
+    K 线不一致）→ 必须被检出。"""
     import re as _re
 
     workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
@@ -504,13 +510,14 @@ def test_state_leakage_detects_wrong_trend_line(tmp_path: Path) -> None:
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
         trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
     )
 
     tampered = [copy.deepcopy(record) for record in records]
-    assert "trend_up=" in tampered[0]["state"]
+    assert "涨势(-1, 最高=" in tampered[0]["state"]
     tampered[0]["state"] = _re.sub(
-        r"trend_up=[\d.]+", "trend_up=9.999999", tampered[0]["state"], count=1
+        r"涨势\(-1, 最高=[\d.]+", "涨势(-1, 最高=9.999999", tampered[0]["state"], count=1
     )
 
     with pytest.raises(DatasetError, match="日线行与决策 K 线不一致"):
@@ -520,6 +527,7 @@ def test_state_leakage_detects_wrong_trend_line(tmp_path: Path) -> None:
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
             trend_points_by_symbol=daily_trend_points_map(workspace),
+            daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
         )
 
@@ -537,6 +545,7 @@ def test_state_leakage_detects_trend_extreme_absolute_price(tmp_path: Path) -> N
             price_precision=params.price_precision,
             prev_daily_by_segment=prev_daily_map(workspace),
             trend_points_by_symbol=daily_trend_points_map(workspace),
+            daily_rows_by_symbol=daily_rows_map(workspace),
             symbols_by_segment=_symbols_by_segment(workspace),
         )
 
@@ -587,6 +596,7 @@ def test_state_leakage_account_line_independent_recompute(tmp_path: Path) -> Non
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
         trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
         account_inputs_by_segment=_account_inputs_by_segment(
             segments, symbols, params, bars_by_segment
@@ -612,6 +622,7 @@ def test_state_leakage_detects_tampered_account_line(tmp_path: Path) -> None:
         price_precision=params.price_precision,
         prev_daily_by_segment=prev_daily_map(workspace),
         trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
         symbols_by_segment=_symbols_by_segment(workspace),
     )
 

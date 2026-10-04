@@ -13,9 +13,10 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 import yaml
 
+from dataset.market_episode.nanojev_records import UsableTrendContext
 from dataset.market_episode.replay import Bar, bars_from_frame
 from dataset.market_episode.segments import SEGMENT_SCHEMA, SYMBOLS_SCHEMA
-from dataset.storage import save_ohlcv
+from dataset.storage import load_ohlcv, save_ohlcv
 from dataset.tests.conftest import build_ohlcv
 from dataset.turning_points import (
     TURNING_POINT_COLUMNS,
@@ -34,11 +35,18 @@ DAILY_START = "2024-01-01 00:00:00"
 DAILY_ROWS: tuple[tuple[float, float, float, float], ...] = (
     (4000.0, 4010.0, 3990.0, 4005.0),
 )
-#: 测试用日线转折点默认点集（v5 日线行 trend 四值数据源；确认日 2024-01-01 严格早于
-#: 片段交易日 2024-01-02/01-03，up/down 各 ≥1；kind 含 start 点以覆盖
+#: 片段交易日（2024-01-02）日线行（v9：``_trade_date_daily_index`` 需要 T 日在 1d 文件
+#: 中有行，其行号 = 趋势状态时长口径；T 行 OHLC 值不进 State(T)，行号在 T 开盘即知）
+DAILY_T_ROW: tuple[float, float, float, float] = (4010.0, 4020.0, 4000.0, 4015.0)
+#: 测试用日线转折点默认点集（v9 日线行趋势项数据源；确认日 2024-01-01 严格早于
+#: 片段交易日 2024-01-02/01-03，up/down 各 ≥2；kind 含 start 点以覆盖
 #: 「up/down 之外不参与选择」的过滤行为；量级与 1m 行情（~100）拉开，避免绝对 token
 #: 假阳性；timestamp 带时区偏移与生产 CSV 写法一致——``load_turning_points`` 按
-#: ISO8601+utc 解析，naive 串会被当作 UTC 而平移日历日）
+#: ISO8601+utc 解析，naive 串会被当作 UTC 而平移日历日。
+#: v9 同源不变式：折点确认根 ``bar_index`` = 1d 文件 0 基行号（默认 1d 文件行 0 =
+#: 2024-01-01、行 1 = T 日 2024-01-02），全部折点确认于 2024-01-01 → bar_index 恒 0，
+#: 段长（= 触发根 − 上一个 up/down 点触发根，无前序 → 0）恒为 0；
+#: 第二组（更晚确认、高抬高低抬低）在时间倒序下为 -1 编号项）
 DAILY_TP_ROWS: tuple[dict[str, Any], ...] = (
     {
         "kind": "start",
@@ -52,30 +60,79 @@ DAILY_TP_ROWS: tuple[dict[str, Any], ...] = (
         "kind": "down",
         "timestamp": "2024-01-01 21:05:00+08:00",
         "price": 3980.0,
-        "bar_index": 5,
+        "bar_index": 0,
         "volume": 120,
         "oi": 5010,
         "trend_extreme_price": 3980.0,
-        "trend_extreme_bar_index": 5,
+        "trend_extreme_bar_index": 0,
     },
     {
         "kind": "up",
         "timestamp": "2024-01-01 21:35:00+08:00",
         "price": 4020.0,
-        "bar_index": 12,
+        "bar_index": 0,
         "volume": 130,
         "oi": 5020,
         "trend_extreme_price": 4020.0,
-        "trend_extreme_bar_index": 12,
+        "trend_extreme_bar_index": 0,
+    },
+    {
+        "kind": "down",
+        "timestamp": "2024-01-01 22:05:00+08:00",
+        "price": 3990.0,
+        "bar_index": 0,
+        "volume": 140,
+        "oi": 5030,
+        "trend_extreme_price": 3990.0,
+        "trend_extreme_bar_index": 0,
+    },
+    {
+        "kind": "up",
+        "timestamp": "2024-01-01 22:35:00+08:00",
+        "price": 4040.0,
+        "bar_index": 0,
+        "volume": 150,
+        "oi": 5040,
+        "trend_extreme_price": 4040.0,
+        "trend_extreme_bar_index": 0,
     },
 )
-#: 默认点集的可用 trend 极值（手工推导，与 recent_trend_extremes/_independent_trend_extremes
-#: 的段长推导一致：down@bar5 段长 5−0=5；up@bar12 段长 12−5=7）
+#: 默认点集的可用 trend 极值（手工推导，与 recent_trend_extremes/_independent_trend_context
+#: 的段长推导一致；v9 时间倒序下第二组（*2）为 -1 编号项、第一组为 -2 编号项；
+#: 第一组 up/down = DAILY_TP_UP/DAILY_TP_DOWN）
 DAILY_TP_UP = TrendExtreme(
-    kind="up", trend_extreme_price=4020.0, trend_extreme_bar_index=12, segment_length=7
+    kind="up", trend_extreme_price=4020.0, trend_extreme_bar_index=0, segment_length=0
 )
 DAILY_TP_DOWN = TrendExtreme(
-    kind="down", trend_extreme_price=3980.0, trend_extreme_bar_index=5, segment_length=5
+    kind="down", trend_extreme_price=3980.0, trend_extreme_bar_index=0, segment_length=0
+)
+DAILY_TP_UP2 = TrendExtreme(
+    kind="up", trend_extreme_price=4040.0, trend_extreme_bar_index=0, segment_length=0
+)
+DAILY_TP_DOWN2 = TrendExtreme(
+    kind="down", trend_extreme_price=3990.0, trend_extreme_bar_index=0, segment_length=0
+)
+#: v9 渲染夹具：render_state/build_record 直测用趋势上下文（不依赖 TP CSV 回读；
+#: highs/lows 为 recent_trend_extremes(n=2) 时间倒序语义：[0] = -1 最近、[1] = -2 次近；
+#: 高抬高价 + 低抬低价 → trend_state_direction = "up"（涨势中）；各段长取不同值以锁定格式）
+RENDER_TREND_CONTEXT = UsableTrendContext(
+    highs=(
+        TrendExtreme(
+            kind="up", trend_extreme_price=4020.0, trend_extreme_bar_index=12, segment_length=7
+        ),
+        TrendExtreme(
+            kind="up", trend_extreme_price=4010.0, trend_extreme_bar_index=9, segment_length=4
+        ),
+    ),
+    lows=(
+        TrendExtreme(
+            kind="down", trend_extreme_price=3980.0, trend_extreme_bar_index=5, segment_length=5
+        ),
+        TrendExtreme(
+            kind="down", trend_extreme_price=3970.0, trend_extreme_bar_index=2, segment_length=2
+        ),
+    ),
+    state_duration=3,
 )
 
 
@@ -178,7 +235,7 @@ def write_daily_turning_points(
     """按 ``TURNING_POINT_COLUMNS`` 13 列写日线转折点 CSV（回读走 ``load_turning_points``
     与生产同路径，读取结果可在测试中独立核对）。
 
-    ``rows`` 缺省用 ``DAILY_TP_ROWS``（确认日早于片段交易日、up/down 各 ≥1）。
+    ``rows`` 缺省用 ``DAILY_TP_ROWS``（确认日早于片段交易日、up/down 各 ≥2）。
     自定义点集供边界用例构造单侧缺失/同日确认/多日泛化等定制 TP 文件；缺失键写
     空单元格（相对值/极值列的空单元格合法，与生产 CSV 表示一致）。
     """
@@ -196,7 +253,7 @@ def write_daily_turning_points(
 
 
 def daily_trend_points_map(workspace: Workspace) -> dict[str, tuple[TurningPoint, ...]]:
-    """symbol → 日线转折点元组（供 ``check_state_leakage`` 新必参的独立重算入参）。
+    """symbol → 日线转折点元组（供 ``check_state_leakage`` 独立重算入参）。
 
     读取走 ``load_turning_points``（与生产同路径；symbol 由文件名 ``{symbol}_1d.csv``
     确定性反解）。
@@ -206,6 +263,26 @@ def daily_trend_points_map(workspace: Workspace) -> dict[str, tuple[TurningPoint
     symbol = name[: -len(suffix)]
     loaded = load_turning_points(symbol, "1d", data_dir=workspace.turning_points_path.parent)
     return {symbol: loaded.points}
+
+
+def daily_rows_map(
+    workspace: Workspace,
+) -> dict[str, tuple[tuple[Any, float, float, float], ...]]:
+    """symbol → 1d 日线行元组 ``(交易日, 高, 低, 收)``（供 ``check_state_leakage`` v9
+    全内容复算入参 ``daily_rows_by_symbol``，与生成侧 ``_daily_rows`` 同构）。
+
+    读取走 ``load_ohlcv``（与生产同路径；symbol 由文件名 ``{symbol}_1d.csv`` 反解）。
+    """
+    symbol = workspace.daily_path.name[: -len("_1d.csv")]
+    loaded = load_ohlcv(symbol, "1d", data_dir=workspace.data_dir)
+    return {
+        symbol: tuple(
+            (pd.Timestamp(ts).date(), float(high), float(low), float(close))
+            for ts, high, low, close in zip(
+                loaded.df["timestamp"], loaded.df["high"], loaded.df["low"], loaded.df["close"]
+            )
+        )
+    }
 
 
 @dataclass(frozen=True)
@@ -254,16 +331,36 @@ def build_workspace(
 ) -> Workspace:
     """把 ``rows`` 均分成 ``split_roles`` 个互不重叠的片段（一个片段 = 一个 episode）。
 
-    ``daily_rows``/``daily_start`` 可覆盖日线夹具（默认 DAILY_ROWS/DAILY_START：
-    上一交易日 = 片段交易日前一天）；``daily_tp_rows`` 可覆盖日线转折点夹具
+    ``daily_rows``/``daily_start`` 可覆盖日线夹具；缺省日线夹具 = ``DAILY_ROWS`` +
+    ``DAILY_T_ROW``（v9：T 日必须在 1d 文件中有行）——调用方自带 ``daily_rows`` 时
+    原样写入（T 行存在性由调用方自保证，如同日无严格早于它的日线行的边界用例）；
+    ``daily_tp_rows`` 可覆盖日线转折点夹具
     （默认 DAILY_TP_ROWS：确认日严格早于片段交易日、up/down 各 ≥1，满足 v5 生成
     要求，既有调用点零修改即可获得文件）。"""
     if len(rows) < len(split_roles):
         raise ValueError("K 线数量必须不少于片段数量")
     data_dir = tmp_path / "data" / "ohlcv"
     save_ohlcv(frame(rows), symbol=symbol, period="1m", output_dir=data_dir)
+    # v9：默认日线夹具追加 T 日行（DAILY_T_ROW，_trade_date_daily_index 需要其行号）；
+    # 调用方自带 daily_rows 时原样写入（T 行存在性由调用方自保证）。
+    # 默认路径逐行独立 frame 再拼接（frame() 为 1 分钟步长，多行直排会同日历日）
+    if daily_rows is not None:
+        daily_frame = frame(list(daily_rows), start=daily_start)
+    else:
+        daily_dates = [
+            (
+                pd.Timestamp(DAILY_START, tz="Asia/Shanghai") + pd.Timedelta(days=offset)
+            ).date().isoformat()
+            for offset in range(len(DAILY_ROWS) + 1)
+        ]
+        daily_frame = pd.concat(
+            tuple(
+                frame([row], start=f"{date} 00:00:00")
+                for date, row in zip(daily_dates, [*DAILY_ROWS, DAILY_T_ROW])
+            )
+        ).reset_index(drop=True)
     daily_path = save_ohlcv(
-        frame(list(daily_rows if daily_rows is not None else DAILY_ROWS), start=daily_start),
+        daily_frame,
         symbol=symbol,
         period="1d",
         output_dir=data_dir,
@@ -365,9 +462,13 @@ def build_two_day_workspace(
 __all__ = [
     "DAILY_ROWS",
     "DAILY_START",
+    "DAILY_T_ROW",
     "DAILY_TP_DOWN",
+    "DAILY_TP_DOWN2",
     "DAILY_TP_ROWS",
     "DAILY_TP_UP",
+    "DAILY_TP_UP2",
+    "RENDER_TREND_CONTEXT",
     "START",
     "SYMBOL",
     "TICK_SIZE",
@@ -376,6 +477,7 @@ __all__ = [
     "bars",
     "build_two_day_workspace",
     "build_workspace",
+    "daily_rows_map",
     "daily_trend_points_map",
     "frame",
     "prev_daily_map",

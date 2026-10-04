@@ -117,10 +117,14 @@ python -m dataset board-state --symbol DCE.v2701 --start 2026-09-01 --end 2026-0
 跨 split 隔离、泄漏抽查 + 账户行独立复算、跨片段账户净值链硬校验、计数汇总）。
 
 前置与用法：先 `dataset fetch --period 1m` 与 `dataset fetch --period 1d` 落盘 K 线（缺日线
-硬报错不静默），并 `dataset turning-points --period 1d` 落盘日线折点（v5 日线行 trend 四值
-数据源；默认取 `<data_dir>/../turning_points`，`--daily-turning-points-dir` 可覆盖；文件
-缺失/损坏 → `DataLoadError` 硬报错 exit 1，不静默），再把 `dataset/config/symbols.example.yaml`
-复制为 `symbols.local.yaml` 并填 `tick_size`，然后用 `--segments` 指向片段清单
+硬报错不静默），并 `dataset turning-points --period 1d` 落盘日线折点（v9 日线行涨势/跌势
+趋势项数据源；默认取 `<data_dir>/../turning_points`，`--daily-turning-points-dir` 可覆盖；文件
+缺失/损坏 → `DataLoadError` 硬报错 exit 1，不静默）。1d 数据窗口需覆盖足够历史，使各片段
+交易日在折点文件中均有 up/down 各 ≥2 个可用折点、且日线文件含该交易日行（v9 跳过判据，
+见下）：sep2026 当前 1d 窗口 = **2026-01-19 ~ 2026-09-30 共 171 行**（2026-10-03 由备份
+`backup_v2701_1d_20260119_20260924/`（1-19~9-24）∪ 原 1d（8-24~9-30）合并，重叠段
+2026-08-24~09-24 共 24 根逐值核实 0 不一致，合并后重写 sidecar 并重生成日线折点 CSV；
+备份目录原样保留），再把 `dataset/config/symbols.example.yaml`复制为 `symbols.local.yaml` 并填 `tick_size`，然后用 `--segments` 指向片段清单
 （详细步骤与配置项见 `README.md` §7.2 小节 7）：
 
 ```bash
@@ -138,11 +142,13 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 
 - 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
   同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
-- **状态文本模板（v8）**：`marketsense.episode_state.v8`，7 行：`账户:`、`日线:`、
+- **状态文本模板（v9）**：`marketsense.episode_state.v9`，7 行：`账户:`、`日线:`、
   `日内:`、`联动:`、`现价:`、`盘口:`（na 占位）；
   v7 拍板：训练 state 文本键名中文化；日内行 `bar=` 序号与联动行量/持仓量比值并入现价行
-  （持仓量只保留收盘时刻，开盘时刻丢弃）；联动行变为 `na` 常量占位；trend 四键本次不改。
+  （持仓量只保留收盘时刻，开盘时刻丢弃）；联动行变为 `na` 常量占位。
   v8 拍板（2026-10-03，account-service 任务）：账户行升六键加净值/今日（跨片段净值链同步接入）。
+  v9 拍板（2026-10-03，trend-state-v9 任务）：日线行趋势项升级为涨势/跌势各最近 2 个折点
+  （编号时间倒序 -1/-2）+ 对称三分支趋势状态与状态时长（见下方日线行）；其余行与 v8 逐字节同构。
   行间用 `" \n "` 连接（换行符前后各一个空格，v3 起生效，转义后的 JSON 文本更易读）。
   - `账户: 持仓=<空仓|持多|持空>[ 开仓价=<..> 止损价=<..>] 净值=<..> 今日=<..> 回撤=<..>`：
     v8 键序固定为 持仓/[开仓价/止损价]/净值/今日/回撤（磁盘键名沿用 v7 的 `开仓价/止损价`，
@@ -154,18 +160,30 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
     = (峰值 − 权益)/峰值，但峰值跨片段延续（见下方净值链）→ 数值不再每片段从 0 起算、
     与 v7 不同；三值均由调用方（账户回放）只用 ≤ 决策 K 线的数据算好传入，无未来泄漏；
   - `联动: na`：v7 起常量占位（量/持仓量比自 v7 起在现价行）；
-  - `日线: 昨日高=<..> 昨日低=<..> 昨日收=<..> trend_up=<..> trend_up_len=<n> trend_dn=<..> trend_dn_len=<n>`
-    （v4 起由原 board_state 行拆出，v5 起追加 trend 四键，v7 起键名中文化）：
+  - `日线: 昨日高=<..> 昨日低=<..> 昨日收=<..> 涨势(-1, 最高=<..>, 时长=<n>根) 涨势(-2, 最高=<..>, 时长=<n>根) 跌势(-1, 最低=<..>, 时长=<n>根) 跌势(-2, 最低=<..>, 时长=<n>根) 趋势=<涨势中|跌势中|震荡> 时长=<n>根>`
+    （v4 起由原 board_state 行拆出，v5 起追加 trend 四键，v7 起键名中文化，
+    v9 起趋势项升为涨势/跌势各 2 项 + 三分支趋势状态）：
     `昨日高/昨日低/昨日收`（内部字段 prev_h/prev_l/prev_c）= **上一交易日**日线高/低/收
     （来源 `{symbol}_1d.csv`，取日线文件中严格早于片段
     交易日的最后一行）÷ 片段首根开盘价；
-    `trend_up`/`trend_dn` = 最近**可确认** up/down 折点的段内实际最高/最低价
-    （`trend_extreme_price`，来源日线折点 CSV `data/turning_points/{symbol}_1d.csv`）÷
-    片段首根开盘价，`trend_up_len`/`trend_dn_len` = 对应趋势段长（整数，由点序列确定性推导）；
+    `涨势(-1/-2, 最高=.., 时长=n根)` = 最近 **2 个**可用 up 折点（编号**时间倒序**：-1 最近、
+    -2 次近）的段内实际最高价（`trend_extreme_price`，来源日线折点 CSV
+    `data/turning_points/{symbol}_1d.csv`）÷ 片段首根开盘价 + 对应趋势段长（整数，由点序列
+    确定性推导）；`跌势(-1/-2, 最低=.., 时长=n根)` = 最近 2 个可用 down 折点的段内实际最低价
+    ÷ 片段首根开盘价 + 段长；
     「可确认」口径：折点确认根日期**严格早于**该 bar 的**决策交易日**（State(T) 不得引用
     T 日及之后确认的折点，无未来泄漏）；决策交易日归属与 `dataset board-state` 夜盘规则
     同口径（日盘 bar → 其日历日；夜盘 bar ≥ 21:00 → 其后下一个交易日）；逐决策点各自取
-    其决策交易日的可用最近折点（多日片段的后段决策点能看到后确认的折点）；
+    其决策交易日的可用折点（多日片段的后段决策点能看到后确认的折点）；
+    `趋势` = 对称三分支分类（`dataset.turning_points.trend_state_direction`，纯比较）：
+    两方向 -1 段极值均**严格大于** -2（HH+HL）→ 涨势中；均**严格小于** -2（LL+LH）→
+    跌势中；其余（含任一方向 -1 == -2 相等，判据不含等号）→ 震荡；比较在**绝对价格层**
+    （同分母比值与绝对价序等价；分母 ≤ 0 时逐值写 `na`）；
+    `趋势` 后的 `时长=n根` = **状态时长** = 最近可用折点（**不分方向**）确认根 → 决策交易日
+    日线开盘的日线根数（= 决策交易日 T 在 1d 文件中的 0 基行号 − 最近可用折点确认根
+    `bar_index`，恒 ≥ 1；只用 T 的**行号**（T 是交易日这件事在 T 开盘即知），不读取 T 日线
+    OHLC 值，无未来泄漏；折点 CSV 的 `bar_index` 与 1d 行号须同源（同一 1d 内容生成），
+    同源不变式违反 → 硬报错不静默）；
   - `日内: 今高=<..> 今低=<..>`（v4 起由原 board_state 行拆出；v7 起 `bar=` 序号移入现价行，
     键名中文化）：
     `今高/今低`（内部字段 today_h/today_l）= 片段首根至决策 K 线（含）的 1m 高/低**累计极值**
@@ -177,9 +195,11 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
     今日开盘价不写（比值恒为 1.000000，纯冗余 token）；`bar=` = 片段内 0 基序号（v7 自日内行
     移入）；`成交量比` = 决策 K 线成交量 ÷ 首根成交量、`持仓量比` = 决策 K 线收盘时刻持仓量 ÷
     首根收盘时刻持仓量（v7 自联动行移入，开盘时刻持仓量丢弃）；分母 ≤ 0 时逐值写 `na`（不产生 `inf`）；
-  - 片段无上一交易日日线，或任一入选决策点的可用 up/down 折点单侧缺失 → **跳过该片段**
-    （不产出记录），记入审计（`board_state.skipped_segments` / `trend_extremes.skipped_segments`）
-    与 stderr 告警（不静默）；全部片段被跳过则硬报错不写出产物。
+  - 片段无上一交易日日线 → 跳过该片段（`board_state.skipped_segments` 桶）；
+    v9 起：任一入选决策交易日在 1d 文件中**缺该交易日行**（状态时长口径需要 T 行号），
+    或可用 up/down 折点**任一侧 < 2**（v5~v8 为各 ≥1）→ 跳过该片段（`trend_extremes.skipped_segments`
+    桶，两类原因文案区分，均 stderr 告警不静默）；跳过片段不产出记录、净值链冻结穿过；
+    全部片段被跳过则硬报错不写出产物。
 - **跨片段净值链（v8 拍板，2026-10-03）**：片段按 `(start, end, segment_id)` 全局时间升序
   稳定排序后**串行回放**（输入指纹保持清单原序，`run_id` 不受排序影响；多 symbol 清单跨
   symbol 同样串行传递）；首评估片段起点净值 = 100.0（峰值起点同值）；每评估片段起点
@@ -187,8 +207,9 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   `initial_equity`/`initial_peak` 参数接入，最终落到 `ReplayAccount` 同名参数）；
   跳过片段（缺上一交易日日线/缺可用折点）不产出记录，链**冻结穿过**（carry 不变）；
   split 起点边界（dev 起点 = train 末片段结算净值、test 起点 = dev 末）由时间序处理 +
-  split 时间连续性自然成立；sep2026 实测链：train 末 115.957034 → dev 末 120.915886 →
-  test 末 127.404954（audit `account_chain` 逐片段可追溯）。死亡级联披露：死亡后净值/峰值
+  split 时间连续性自然成立；sep2026 实测链（当前 v9 run）：train 末 155.041756 → dev 末
+  160.000608 → test 末 166.489676（audit `account_chain` 逐片段可追溯；v8 run 为
+  115.957034 → 120.915886 → 127.404954）。死亡级联披露：死亡后净值/峰值
   冻结延续，若某片段死亡（回撤 ≥ 阈值），后续片段首根盯市回撤仍 ≥ 阈值 → 级联死亡
   （后续片段 0 决策点/0 记录）；sep2026 实测 deaths=0 未触发。
 - **审计 account_chain 与账户行独立复算（v8）**：`check_account_chain` 在落盘前硬校验
@@ -201,6 +222,15 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   `check_no_absolute_values` 对「账户」行**豁免**邻根绝对价 token 扫描（六键均为净值尺度
   账户值，与绝对价不同域，不构成泄漏），其余行扫描语义不变；`AUDIT_SCHEMA` 保持 v1
   （`frozen_decisions` 新增 `account_carry`/`today_pnl` 两键，payload 纯增量）。
+- **审计 v9 同步（日线行全内容独立复算，2026-10-03）**：`FROZEN_DECISIONS` 的
+  `state_template` 升 v9 标记、`daily_trend_extremes` 值升为 `recent_2up_2down` 口径、
+  新增 `daily_trend_state` 键（三分支判据 + 状态时长口径；`AUDIT_SCHEMA` 仍保持 v1，
+  纯增量键）；`check_state_leakage` 新增参数 `daily_rows_by_symbol`（symbol → 1d 日线行
+  元组），日线行由审计侧 `_independent_trend_context`/`_independent_daily_line_v9`
+  **全内容**独立内联重算（最近 2 up + 2 down 选择与段长推导、状态时长行号差、三分支判据
+  均独立实现，**不调用** `recent_trend_extremes`/`trend_state_direction`/生成侧序列化实现，
+  防自证）并与 state 文本逐值比对（不一致不写出任何产物）；缺省 `None` 保持 v5/v8
+  单极值旧行为（既有调用点零破坏）；绝对价泄漏扫描覆盖涨势/跌势共 4 个入选极值。
 - **questions/candidates 文案（2026-10-02 用户拍板精简）**：唯一 choice 题 `next_action`，候选文案只留动作语义——空仓 `open_long=买入开仓 / open_short=卖出开仓 / stay_flat=继续空仓`，持仓 `close=平仓 / hold=继续持有 / reverse=反手`；成交价位由执行程序与滑点决定，不进模型输入。questions 文本由 `QUESTION_SCHEMA = marketsense.episode_question.v1` 标记（首次建立），纳入审计 `input.question_schema_sha256` 与 `run_id` 哈希；文案再演进必须换标记（产生新 run）。
 - 确定性：无墙钟/随机；同输入双跑输出 sha256 一致。
 - `run_id` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记 + questions schema 标记) 的前 12 位；**状态/候选文案变更产生新 run**（旧 run 保留不覆盖）；
@@ -217,14 +247,22 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   `trend_up/trend_up_len/trend_dn/trend_dn_len` 4 键，数据源 = 日线折点 CSV；9 个 train 片段
   9-1~9-11 因缺 up 折点跳过并告警）`run-7cbd6516d46f`；同日状态模板 v6（行重排）
   `run-6ae3e38289a3`；同日状态模板 v7（键名中文化）`run-4f1cd33a3cfe`；
-  v8（账户行六键 + 跨片段净值链，2026-10-03）**当前产物** `run-c364ea4a30ac`
-  （DCE.v2701 2026-09 全月，train 1392 / dev 886 / test 655 全部非空，NanoJev `--validate-only`
-  通过；9 个 train 片段 9-1~9-11 因缺 up 折点跳过并告警；净值链 100 → train 末
-  115.957034 → dev 末 120.915886 → test 末 127.404954，deaths=0；与 v7 run 逐值比对：
-  gold/持仓/开仓价/止损价全部一致，回撤因峰值跨片段延续数值不同、公式不变；
-  真实数据双跑 sha256 一致；见主 README §5「首轮真实数据」）。
+  v8（账户行六键 + 跨片段净值链，2026-10-03）`run-c364ea4a30ac`
+  （train 1392 / dev 886 / test 655；9 个 train 片段 9-1~9-11 因可用 up 折点不足 2（当时口径为
+  缺 up 折点）跳过并告警；净值链 100 → 115.957034 → 120.915886 → 127.404954，deaths=0；
+  与 v7 run 逐值比对：gold/持仓/开仓价/止损价全部一致，回撤因峰值跨片段延续数值不同、公式
+  不变）；v9（日线行趋势项升为涨势/跌势各 2 项 + 三分支趋势状态 + 状态时长；1d 数据窗口
+  扩至 1-19~9-30 备份合并，2026-10-03）**当前产物** `run-de0026683ce6`
+  （DCE.v2701 2026-09 全月，**train 4188 / dev 886 / test 655** 全部非空，NanoJev
+  `--validate-only` 通过；**21/21 片段全保留、0 告警**（合并 1d 后 train 9 片段回参，
+  折点门槛各 ≥2 满足）；净值链 100 → train 末 155.041756 → dev 末 160.000608 →
+  test 末 166.489676，deaths=0；与 v8 run 逐值比对：共享 12 片段 2933 条记录
+  gold/持仓/开仓价/止损价/昨日高/低/收全部一致，共享 12 片段净值增量 12/12 一致
+  （链入口因 train 9 片段回参而前移，绝对净值不同）；独立复算 dev+test 1541/1541 条
+  日线行趋势内容与折点 CSV + 1d CSV 重算一致；真实数据双跑 sha256 一致；
+  见主 README §5「首轮真实数据」）。
   v2/v3/v4 run 的 5729 条记录 board_state 值均与 `dataset board-state` CSV 全量交叉核对一致。
-  磁盘现存 4 个 run（上述 v5/v6/v7/v8；更早的 v1~v4 run 已由用户会话清理）。
+  磁盘现存 **5 个 run**（上述 v5/v6/v7/v8 + 当前 v9；更早的 v1~v4 run 已由用户会话清理）。
 
 契约硬门（只读执行第三方脚本）：
 
@@ -322,12 +360,16 @@ from dataset import (
     TianQinProvider, DataProvider,
     TurningPoint, TrendExtreme, find_turning_points, resolve_initial_direction,
     save_turning_points, load_turning_points, WindowMeta,
-    RelativeMetrics, relative_metrics, recent_trend_extremes,
+    RelativeMetrics, relative_metrics, recent_trend_extremes, trend_state_direction,
 )
 
 # 最近 n 个高/低点的当次趋势段极值（时间倒序，含段长；n 超额/非法 → DatasetError）
 loaded = load_turning_points("DCE.v2701", "1d", data_dir="data/turning_points")
-highs, lows = recent_trend_extremes(loaded.points, n=1)
+highs, lows = recent_trend_extremes(loaded.points, n=2)
+# 对称三分支趋势状态分类（v9 日线行「趋势=」判据；纯比较，无选择/过滤逻辑）
+# highs/lows 各取最近 2 个（时间倒序）：两方向 -1 段极值均 > -2 → "up"（涨势中），
+# 均 < -2 → "down"（跌势中），其余（含任一方向相等）→ "range"（震荡）
+direction = trend_state_direction(highs, lows)  # "up" | "down" | "range"
 ```
 
 ## 测试
@@ -344,6 +386,8 @@ highs, lows = recent_trend_extremes(loaded.points, n=1)
 - 2026-10-02 实测（含日线折点极值用例，v5）：`338 passed, 1 xfailed`（15.43s；转折点用例 45 个）。
 - 2026-10-03 实测（account-service：账户域迁移 + v8 账户行 + 跨片段净值链用例）：
   `344 passed, 1 xfailed`（14.07s）。
+- 2026-10-03 实测（trend-state-v9：三分支分类 + v9 日线行 + 审计独立复算 + n=2 跳过用例）：
+  `345 passed, 1 xfailed`（14.01s；转折点用例含 `trend_state_direction` 直测）。
 
 ## 已知边界（未验证项）
 
@@ -352,8 +396,8 @@ highs, lows = recent_trend_extremes(loaded.points, n=1)
 - 本包不做实时订阅、不做模型/决策，也不定义最终模型输入格式（非目标）；
   `board-state`（盘面状态读取）是首个状态 building block（研究 building block，非最终格式）。
 - episode 训练数据生成已在真实片段上端到端运行（2026-10-01 首轮 `run-c1cb097177a3`；
-  当前产物 `run-c364ea4a30ac`（v8 状态：账户行六键 + 跨片段净值链）；
-  详细结果见主 README §5「首轮真实数据」）。
+  当前产物 `run-de0026683ce6`（v9 状态：日线行涨势/跌势各 2 项 + 三分支趋势状态；
+  21/21 片段全保留）；详细结果见主 README §5「首轮真实数据」）。
 - K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
   新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。
 - 转折点发射语义于 2026-09-26 变更（甲口径：`up`/`down` 点 `timestamp`/`bar_index` =
@@ -362,6 +406,8 @@ highs, lows = recent_trend_extremes(loaded.points, n=1)
   `prepare` 再生成（无兼容层）。
 - 转折点 CSV 于 2026-10-02 扩展（11 → 13 列）：新增 `trend_extreme_price` /
   `trend_extreme_bar_index`（up/down 点的当次趋势段实际极值，检测触发序列不变），
-  并新增数据层子函数 `recent_trend_extremes`（最近 n 个高/低点段极值，含段长）。
+  并新增数据层子函数 `recent_trend_extremes`（最近 n 个高/低点段极值，含段长）与
+  `trend_state_direction`（v9 三分支趋势状态分类，2026-10-03；纯比较，输入
+  `recent_trend_extremes(…, n=2)` 的两个时间倒序元组）。
   旧 11 列文件 `load_turning_points` 按「缺少必需列」拒绝，须重新
   `python -m dataset turning-points` 再生成（无兼容层）。

@@ -12,6 +12,12 @@
   v8 起传入 ``account_inputs_by_segment``（T6b 接线）时对每决策点的账户行三值
   （净值/今日/回撤）经 :func:`_independent_account_values` 独立复算并逐值比对
   （防自证/tamper 防护；缺省 ``None`` 保持旧行为）；
+  v9 起传入 ``daily_rows_by_symbol``（T4 接线）时对日线行做**全内容**独立复算——
+  涨势/跌势各最近 2 个折点（编号 -1/-2：段极值比值 + 段长）+ 对称三分支趋势状态
+  （判据内联重写）+ 状态时长（决策交易日 T 的 1d 行号 − 最近可用折点确认根行号），
+  经 :func:`_independent_trend_context` / :func:`_independent_daily_line_v9` 独立拼装
+  后逐值比对（不调用 ``recent_trend_extremes``/``trend_state_direction``/
+  ``_usable_trend_context``，防自证；缺省 ``None`` 保持 v5/v8 单极值旧行为）；
 * :func:`check_account_chain` 跨片段账户净值链硬校验（首评估片段起点净值 = 100、
   逐对「下一片段起点净值 = 前一片段末结算净值」精确比对，跳过片段链冻结穿过）；
 * :func:`_independent_account_values` 由 TradeEvent 轨迹 + K 线 + 初始（净值, 峰值）
@@ -76,10 +82,15 @@ GOLD_LABEL_KINDS = frozenset(
 #: bar 序号与量/持仓量比值并入现价行（持仓量只保留收盘）+ 联动行 na 占位；
 #: v8 起账户行扩展净值/今日（净值 = NET_VALUE_BASE × equity，跨片段链式延续；
 #: 今日 = 片段内权益变化，每片段重置），AUDIT_SCHEMA 保持 v1：payload 为纯增量变更
-#: （account_carry / today_pnl 为纯增量键），演进标记由 state_template 承载）
+#: （account_carry / today_pnl 为纯增量键），演进标记由 state_template 承载；
+#: v9 起日线行趋势项升级为涨势/跌势各最近 2 个折点（编号时间倒序 -1/-2：段极值比值 +
+#: 段长「时长=n根」）+ 对称三分支趋势状态与状态时长（最近可用折点确认根 → 决策交易日
+#: T 的 1d 行号差），daily_trend_extremes 值升为 recent_2up_2down 口径、新增
+#: daily_trend_state 键（三分支判据 + 时长口径），AUDIT_SCHEMA 仍保持 v1：
+#: daily_trend_state 为纯增量键，演进标记继续由 state_template 承载）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v8:decision_bar_only+board_state+daily_trend_extremes+account_net_value",
+    "state_template": "marketsense.episode_state.v9:decision_bar_only+board_state+daily_trend_extremes+account_net_value",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "net_value_base_100:equity=100*(1+cum_ratio_pnl),1_lot=1_notional,no_multiplier,no_fees",
@@ -88,7 +99,8 @@ FROZEN_DECISIONS: Mapping[str, str] = {
     "reversal_condition_2": "stop_reached_first_or_scan_end_without_exceeding_current_bar",
     "board_state_prev_day": "daily_file_1d_prev_trading_day_over_segment_first_open",
     "board_state_today": "segment_bars_cumulative_extrema_through_decision_bar",
-    "daily_trend_extremes": "daily_tp_csv_confirmed_date_lt_trade_date__recent_1up_1down_over_segment_first_open",
+    "daily_trend_extremes": "daily_tp_csv_confirmed_date_lt_trade_date__recent_2up_2down_over_segment_first_open",
+    "daily_trend_state": "symmetric_-1_vs_-2_extreme_price:up=both_gt,down=both_lt,else_range_incl_equal__duration=recent_pivot_confirm_to_trade_date_daily_open_bars",
     "account_carry": "net_value_and_peak_carry_across_segments_time_ordered_serial_replay",
     "today_pnl": "segment_equity_change_resets_per_segment",
     "question_template": "marketsense.episode_question.v1:concise_action_labels",
@@ -365,6 +377,158 @@ def _independent_trend_extremes(
 
 
 @dataclass(frozen=True)
+class IndependentTrendContext:
+    """审计侧 v9 日线行趋势内容的独立复算结果（与生成侧 ``UsableTrendContext`` 同语义、
+    不同实现，不共享类型与选择逻辑，防自证）。
+
+    * ``highs``/``lows``：最近 2 个 up/down 折点段极值（:class:`TrendExtreme`，
+      **时间倒序**，``[0]`` = 编号 -1 最近、``[1]`` = 编号 -2 次近；段长由点序列独立推导）；
+    * ``state_duration``：趋势状态时长（日线根数）= 决策交易日 T 在 1d 文件中的
+      0 基行号 − 最近可用折点（不分方向）确认根 ``bar_index``（恒 ≥ 1）；
+    * ``direction``：对称三分支分类 ``"up"|"down"|"range"``（判据内联重写，
+      **不调用** :func:`dataset.turning_points.trend_state_direction`）。
+    """
+
+    highs: tuple[TrendExtreme, TrendExtreme]
+    lows: tuple[TrendExtreme, TrendExtreme]
+    state_duration: int
+    direction: str
+
+
+def _independent_trade_date_daily_index(
+    daily_rows: tuple[tuple[Any, float, float, float], ...], trade_date: Any
+) -> int | None:
+    """独立解析决策交易日 ``trade_date`` 在 1d 日线行元组中的 0 基行号（缺行 → ``None``）。
+
+    与生成侧 ``_trade_date_daily_index`` 同语义、不同实现（审计自行遍历，不调用
+    生成侧 helper）；只用 T 的**行号**（T 是交易日这件事在 T 开盘即知），不读取
+    T 日线 OHLC 值，无未来信息。
+    """
+    index = 0
+    for row_date, *_ in daily_rows:
+        if row_date == trade_date:
+            return index
+        index += 1
+    return None
+
+
+def _independent_trend_context(
+    points: tuple[TurningPoint, ...],
+    trade_date: dt.date,
+    trade_date_daily_index: int,
+) -> IndependentTrendContext | None:
+    """独立实现的 v9 可用折点趋势上下文（全内容独立重算，防自证）。
+
+    与生成侧 ``_usable_trend_context`` 同语义、**不调用其实现**（也不调用
+    ``recent_trend_extremes``/``trend_state_direction``）：
+
+    * 过滤确认根日期（``timestamp`` 日历日）严格早于 ``trade_date`` 的 up/down 点；
+    * 可用 up/down 任一侧 ``< 2`` → ``None``（调用方报不一致；生成侧该片段应已
+      被跳过、记录不应存在）；
+    * 各取最近 2 个（时间倒序），段长由点序列独立推导（up/down 点的段起点 = 序列中
+      上一个 up/down 点的触发根，无前序 → 0；过滤后为前缀，与全序列推导一致）；
+    * ``state_duration`` = ``trade_date_daily_index − usable[-1].bar_index``（usable 为
+      时间序前缀，末元素即最近可用折点，不分方向）；确认日严格早于 T 且折点与 1d
+      行号同源 ⇒ 恒 ≥ 1，违反即同源不变式被破坏 → ``DatasetError``（不静默）；
+    * 三分支分类内联重写：两方向 -1 段极值均严格大于 -2 → "up"；均严格小于 →
+      "down"；其余（含任一方向相等）→ "range"（绝对价格层比较，与比值序等价）。
+
+    :raises DatasetError: 可用 up/down 折点缺当次趋势极值字段（文件损坏，硬错误）；
+        状态时长 ``< 1``（折点 ``bar_index`` 与 1d 行号不同源）
+    """
+    usable = tuple(
+        point
+        for point in points
+        if point.kind in ("up", "down") and point.timestamp.date() < trade_date
+    )
+    highs: list[TrendExtreme] = []
+    lows: list[TrendExtreme] = []
+    previous_trigger: int | None = None
+    for point in usable:
+        if point.trend_extreme_price is None or point.trend_extreme_bar_index is None:
+            raise DatasetError(
+                f"审计：可用 up/down 折点缺当次趋势极值字段（kind={point.kind}, "
+                f"bar_index={point.bar_index}）"
+            )
+        segment_start = 0 if previous_trigger is None else previous_trigger
+        extreme = TrendExtreme(
+            kind=point.kind,
+            trend_extreme_price=point.trend_extreme_price,
+            trend_extreme_bar_index=point.trend_extreme_bar_index,
+            segment_length=point.bar_index - segment_start,
+        )
+        (highs if point.kind == "up" else lows).append(extreme)
+        previous_trigger = point.bar_index
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+    # 时间倒序（最近优先）：各自取最近 2 个后反转（[0] = 编号 -1、[1] = 编号 -2）
+    recent_highs = tuple(reversed(highs[-2:]))
+    recent_lows = tuple(reversed(lows[-2:]))
+    # 状态时长：最近可用折点（不分方向，usable 为时间序前缀 → 末元素即最近）确认根
+    # → 决策交易日 T 的 1d 行号差；恒 ≥ 1（同源不变式，与生成侧同一硬门独立重写）
+    state_duration = trade_date_daily_index - usable[-1].bar_index
+    if state_duration < 1:
+        raise DatasetError(
+            f"审计：趋势状态时长 < 1（trade_date={trade_date}，"
+            f"daily_index={trade_date_daily_index}，"
+            f"最近可用折点 bar_index={usable[-1].bar_index}）；"
+            "折点 CSV 的 bar_index 与 1d 文件行号必须同源（同一 1d 内容生成）"
+        )
+    # 三分支判据内联重写（不调用 trend_state_direction）：两方向 -1 均严格 > -2 → up；
+    # 均严格 < -2 → down；其余（含任一方向相等，判据不含等号）→ range
+    high_higher = recent_highs[0].trend_extreme_price > recent_highs[1].trend_extreme_price
+    high_lower = recent_highs[0].trend_extreme_price < recent_highs[1].trend_extreme_price
+    low_higher = recent_lows[0].trend_extreme_price > recent_lows[1].trend_extreme_price
+    low_lower = recent_lows[0].trend_extreme_price < recent_lows[1].trend_extreme_price
+    if high_higher and low_higher:
+        direction = "up"
+    elif high_lower and low_lower:
+        direction = "down"
+    else:
+        direction = "range"
+    return IndependentTrendContext(
+        highs=recent_highs,
+        lows=recent_lows,
+        state_duration=state_duration,
+        direction=direction,
+    )
+
+
+def _independent_daily_line_v9(
+    prev_daily: tuple[float, float, float],
+    reference: Bar,
+    precision: int,
+    context: IndependentTrendContext,
+) -> str:
+    """独立拼装 v9 格式期望日线行（与生成侧 ``_daily_line`` 同格式、不同实现，防自证）。
+
+    昨日高/低/收 + 涨势/跌势各最近 2 个折点（编号时间倒序 -1/-2：段极值比值 +
+    段长「时长=n根」）+ 对称三分支趋势状态与状态时长（比值分母 = 片段首根开盘价、
+    6 位小数与 v5/v8 同口径；分母 ≤ 0 时逐值写 ``na``；段长/时长为整数不入比值口径）。
+    三分支标签映射与键序在此独立固定：涨势 -1/-2 → 跌势 -1/-2 → 趋势 → 时长。
+    """
+    prev_high, prev_low, prev_close = prev_daily
+    label = {"up": "涨势中", "down": "跌势中", "range": "震荡"}.get(context.direction)
+    if label is None:
+        raise DatasetError(f"审计：未知趋势状态分类: {context.direction!r}")
+
+    def _ratio(price: float) -> str:
+        return format_ratio_value(ratio_or_none(price, reference.open), precision)
+
+    return (
+        "日线: "
+        f"昨日高={_ratio(prev_high)}"
+        f" 昨日低={_ratio(prev_low)}"
+        f" 昨日收={_ratio(prev_close)}"
+        f" 涨势(-1, 最高={_ratio(context.highs[0].trend_extreme_price)}, 时长={context.highs[0].segment_length}根)"
+        f" 涨势(-2, 最高={_ratio(context.highs[1].trend_extreme_price)}, 时长={context.highs[1].segment_length}根)"
+        f" 跌势(-1, 最低={_ratio(context.lows[0].trend_extreme_price)}, 时长={context.lows[0].segment_length}根)"
+        f" 跌势(-2, 最低={_ratio(context.lows[1].trend_extreme_price)}, 时长={context.lows[1].segment_length}根)"
+        f" 趋势={label} 时长={context.state_duration}根"
+    )
+
+
+@dataclass(frozen=True)
 class AccountReplayInputs:
     """账户行独立复算的逐片段入参（v8/T6b；与 :func:`_independent_account_values`
     参数一一对应，``bars`` 由 ``check_state_leakage`` 的 ``bars_by_segment`` 提供，
@@ -519,20 +683,31 @@ def check_state_leakage(
     trend_points_by_symbol: Mapping[str, tuple[TurningPoint, ...]],
     symbols_by_segment: Mapping[str, str],
     account_inputs_by_segment: Mapping[str, AccountReplayInputs] | None = None,
+    daily_rows_by_symbol: Mapping[str, tuple[tuple[Any, float, float, float], ...]] | None = None,
 ) -> None:
     """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的数据计算。
 
     * 记录里的现价/日线/日内三行必须等于按 ≤ 决策 K 线的数据**独立重算**的结果 →
       状态若误用下一根/其它根会失败（v7 起 ``bar`` 序号与量/持仓量比值在现价行内，
       同受此检查；联动行为 ``na`` 常量占位，按常量比对）；
-    * 日线行 trend 四值必须等于按「确认根日期严格早于决策交易日」过滤后的
-      最近 1 up + 1 down 折点独立重算（T 日及之后确认的折点若被误用即被检出）；
+    * 日线行趋势内容必须等于按「确认根日期严格早于决策交易日」过滤后的可用折点
+      独立重算（T 日及之后确认的折点若被误用即被检出）：
+      - 传入 ``daily_rows_by_symbol``（v9/T4 接线，symbol → 1d 日线行元组
+        ``(交易日, 高, 低, 收)``，与生成侧 ``_daily_rows`` 同构）时做 **v9 全内容**
+        独立复算：涨势/跌势各最近 2 个折点（编号 -1/-2：段极值比值 + 段长）+
+        对称三分支趋势状态（判据内联重写）+ 状态时长（T 的 1d 行号 − 最近可用
+        折点确认根行号，缺 T 行/同源不变式破坏 → ``DatasetError``），
+        经 :func:`_independent_trend_context`/:func:`_independent_daily_line_v9`
+        独立拼装后与 state 文本逐值比对（不调用生成侧选择/序列化实现，防自证）；
+      - 缺省 ``None`` 保持 v5/v8 旧行为（单极值复算 + v8 格式日线行，既有调用点
+        零破坏）；
     * 账户行三值（净值/今日/回撤）：传入 ``account_inputs_by_segment``（v8/T6b 接线）
       时由 :func:`_independent_account_values` 独立复算并与 state 文本逐值比对，
       任一值被篡改/与重放不一致即 ``DatasetError``（防自证/tamper 防护）；缺省
       ``None`` 保持旧行为（账户行不参与复算比对）；
     * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量，也不得出现上一交易日
-      日线的绝对价格与该记录可用折点的绝对极值价（它们只能以比值出现）。
+      日线的绝对价格与该记录可用折点的绝对极值价（它们只能以比值出现；v9 起可用
+      折点含涨势/跌势 -1/-2 共 4 个入选极值，全部在扫描范围内）。
     """
     account_values_cache: dict[str, dict[int, tuple[float, float, float]]] = {}
     for record in records:
@@ -562,27 +737,62 @@ def check_state_leakage(
         )
         assert points is not None
         trade_date = _independent_bar_trade_date(bars, bar)
-        extremes = _independent_trend_extremes(points, trade_date)
-        _require(
-            extremes is not None,
-            f"审计缺少片段 {segment_id!r} 决策交易日 {trade_date} 的可用日线折点"
-            "（确认日早于该交易日的 up/down 需各 ≥1）",
-        )
-        assert extremes is not None
-        trend_up_extreme, trend_dn_extreme = extremes
+        if daily_rows_by_symbol is None:
+            # v5/v8 旧行为（缺省 None，既有调用点零破坏）：单极值（最近 1 up + 1 down）
+            # 复算 + v8 格式日线行
+            extremes = _independent_trend_extremes(points, trade_date)
+            _require(
+                extremes is not None,
+                f"审计缺少片段 {segment_id!r} 决策交易日 {trade_date} 的可用日线折点"
+                "（确认日早于该交易日的 up/down 需各 ≥1）",
+            )
+            assert extremes is not None
+            trend_up_extreme, trend_dn_extreme = extremes
+            expected_daily_line = _independent_daily_line(
+                prev_daily,
+                reference,
+                price_precision,
+                trend_up_extreme,
+                trend_dn_extreme,
+            )
+        else:
+            # v9（T4）：日线行全内容独立复算（涨势/跌势各 2 项编号极值 + 三分支趋势
+            # 状态 + 状态时长），不调用生成侧选择/序列化实现（防自证）
+            daily_rows = daily_rows_by_symbol.get(symbol)
+            _require(
+                daily_rows is not None,
+                f"审计缺少 symbol {symbol!r} 的 1d 日线行元组"
+                "（v9 日线行无法独立重算）",
+            )
+            assert daily_rows is not None
+            trade_date_daily_index = _independent_trade_date_daily_index(
+                daily_rows, trade_date
+            )
+            _require(
+                trade_date_daily_index is not None,
+                f"审计：记录 {record['id']} 决策交易日 {trade_date} 在 1d 日线文件中无行"
+                "（缺该行的片段生成时应已被跳过，记录不应存在）",
+            )
+            assert trade_date_daily_index is not None
+            trend_context = _independent_trend_context(
+                points, trade_date, trade_date_daily_index
+            )
+            _require(
+                trend_context is not None,
+                f"审计缺少片段 {segment_id!r} 决策交易日 {trade_date} 的可用日线折点"
+                "（确认日早于该交易日的 up/down 需各 ≥2；缺折点片段生成时应已被跳过）",
+            )
+            assert trend_context is not None
+            expected_daily_line = _independent_daily_line_v9(
+                prev_daily,
+                reference,
+                price_precision,
+                trend_context,
+            )
         expected_lines = (
             ("现价", _independent_px_line(bar, reference, price_precision)),
             ("联动", "联动: na"),
-            (
-                "日线",
-                _independent_daily_line(
-                    prev_daily,
-                    reference,
-                    price_precision,
-                    trend_up_extreme,
-                    trend_dn_extreme,
-                ),
-            ),
+            ("日线", expected_daily_line),
             ("日内", _independent_intraday_line(prefix, bar_index, reference, price_precision)),
         )
         for line_label, expected in expected_lines:
@@ -650,6 +860,8 @@ def check_state_leakage(
             for point in points
             if point.kind in ("up", "down") and point.timestamp.date() < trade_date
         )
+        # 可用折点绝对极值价扫描（含 v9 入选的涨势/跌势 -1/-2 共 4 个极值，
+        # 范围为全部可用 up/down 折点，是入选集的超集）
         extreme_prices = [
             point.trend_extreme_price
             for point in usable

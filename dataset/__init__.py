@@ -45,6 +45,7 @@ from dataset.turning_points import (
     relative_metrics,
     resolve_initial_direction,
     save_turning_points,
+    trend_state_direction,
 )
 from dataset.validator import ValidationReport, Violation, validate_ohlcv
 
@@ -94,6 +95,7 @@ __all__ = [
     "find_turning_points",
     "relative_metrics",
     "recent_trend_extremes",
+    "trend_state_direction",
     "save_turning_points",
     "load_turning_points",
     # Provider

@@ -31,8 +31,10 @@ from dataset.market_episode.nanojev_records import (
     QUESTION_ID,
     STATE_SCHEMA,
     BoardStateValues,
+    UsableTrendContext,
     _bar_trade_date,
-    _usable_trend_extremes,
+    _trade_date_daily_index,
+    _usable_trend_context,
     build_record,
     generate_dataset,
     render_state,
@@ -50,11 +52,15 @@ from dataset.storage import save_ohlcv
 from dataset.tests.market_episode_fixtures import (
     DAILY_ROWS,
     DAILY_TP_DOWN,
+    DAILY_TP_DOWN2,
     DAILY_TP_UP,
+    DAILY_TP_UP2,
+    RENDER_TREND_CONTEXT,
     SYMBOL,
     bars,
     build_two_day_workspace,
     build_workspace,
+    daily_rows_map,
     daily_trend_points_map,
     frame,
     segment_record,
@@ -134,15 +140,16 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
         today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     assert state == (
         f"{STATE_SCHEMA} \n "
         "账户: 持仓=空仓 净值=100.000000 今日=0.000000 回撤=0.000000 \n "
         "日线: 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000 "
-        "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5 \n "
+        "涨势(-1, 最高=40.200000, 时长=7根) 涨势(-2, 最高=40.100000, 时长=4根) "
+        "跌势(-1, 最低=39.800000, 时长=5根) 跌势(-2, 最低=39.700000, 时长=2根) "
+        "趋势=涨势中 时长=3根 \n "
         "日内: 今高=1.002000 今低=0.998000 \n "
         "联动: na \n "
         "现价: 开=1.000000 高=1.002000 低=0.998000 收=1.000000 bar=0 成交量比=1.000000 持仓量比=1.000000 \n "
@@ -162,15 +169,16 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
         today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     assert state == (
         f"{STATE_SCHEMA} \n "
         "账户: 持仓=持空 开仓价=0.998500 止损价=1.000500 净值=100.000000 今日=0.000000 回撤=0.001500 \n "
         "日线: 昨日高=2.010000 昨日低=1.980000 昨日收=1.990000 "
-        "trend_up=4.020000 trend_up_len=7 trend_dn=3.980000 trend_dn_len=5 \n "
+        "涨势(-1, 最高=4.020000, 时长=7根) 涨势(-2, 最高=4.010000, 时长=4根) "
+        "跌势(-1, 最低=3.980000, 时长=5根) 跌势(-2, 最低=3.970000, 时长=2根) "
+        "趋势=涨势中 时长=3根 \n "
         "日内: 今高=1.010000 今低=0.999500 \n "
         "联动: na \n "
         "现价: 开=1.000000 高=1.010000 低=1.000500 收=1.008000 bar=1 成交量比=1.000000 持仓量比=1.001996 \n "
@@ -193,8 +201,7 @@ def test_render_state_marks_undefined_denominators_as_na() -> None:
         today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
     zero_oi_state = render_state(
         bar=zero_oi[1],
@@ -205,8 +212,7 @@ def test_render_state_marks_undefined_denominators_as_na() -> None:
         today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     assert "成交量比=na" in state  # v7：量比在现价行，volume=0 → na
@@ -229,8 +235,7 @@ def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar
         price_precision=6,
         board_state=BoardStateValues(prev_day_high=2010.0, prev_day_low=1980.0,
                                      prev_day_close=1990.0, today_high=1010.0, today_low=999.5),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     for absolute in ("1000.000000", "1010.000000", "999.500000", "1008.000000"):
@@ -241,8 +246,8 @@ def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar
 def test_v5_daily_line_trend_values_match_independent_hand_calc() -> None:
     """v5 字节级锁定：trend 四值 = 折点段极值 ÷ 片段首根开盘（6 位）+ 段长整数直出。
 
-    手算（分母 = 片段首根开盘 100）：up 段极值 4020 → 40.200000（段长 7）；
-    down 段极值 3980 → 39.800000（段长 5）。"""
+    手算（分母 = 片段首根开盘 100）：涨势 -1 极值 4020 → 40.200000（段长 7）；
+    跌势 -1 极值 3980 → 39.800000（段长 5）；趋势状态 = 涨势中（时长 3 根）。"""
     bar_list = bars(_PATTERN)
     record = build_record(
         segment=_segment(),
@@ -250,18 +255,15 @@ def test_v5_daily_line_trend_values_match_independent_hand_calc() -> None:
         point=DecisionPoint(0, ACTION_OPEN_LONG, "opportunity", True, None, 0.0, 6.28, 0.0),
         price_precision=6,
         prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
-        trend_up_extreme=TrendExtreme(
-            kind="up", trend_extreme_price=4020.0, trend_extreme_bar_index=12, segment_length=7
-        ),
-        trend_dn_extreme=TrendExtreme(
-            kind="down", trend_extreme_price=3980.0, trend_extreme_bar_index=5, segment_length=5
-        ),
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     assert record["state"].startswith(STATE_SCHEMA)
     assert (
         "日线: 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000 "
-        "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
+        "涨势(-1, 最高=40.200000, 时长=7根) 涨势(-2, 最高=40.100000, 时长=4根) "
+        "跌势(-1, 最低=39.800000, 时长=5根) 跌势(-2, 最低=39.700000, 时长=2根) "
+        "趋势=涨势中 时长=3根"
     ) in record["state"]
 
 
@@ -279,8 +281,7 @@ def test_daily_line_prev_values_unchanged_since_v4() -> None:
         today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     # v4→v8：键名中文化（昨日高/昨日低/昨日收），数值逐字不变
@@ -326,8 +327,7 @@ def test_build_record_maps_ids_split_questions_and_gold() -> None:
         point=flat_point,
         price_precision=6,
         prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
     holding_record = build_record(
         segment=segment,
@@ -335,8 +335,7 @@ def test_build_record_maps_ids_split_questions_and_gold() -> None:
         point=holding_point,
         price_precision=6,
         prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     assert flat_record["id"] == flat_record["state_id"] == "seg-train:0"
@@ -378,8 +377,7 @@ def test_build_record_rejects_action_outside_position_criteria() -> None:
             point=bad_point,
             price_precision=6,
             prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
-            trend_up_extreme=DAILY_TP_UP,
-            trend_dn_extreme=DAILY_TP_DOWN,
+            trend_context=RENDER_TREND_CONTEXT,
         )
 
 
@@ -403,8 +401,7 @@ def test_build_record_board_state_uses_prev_daily_and_prefix_extrema() -> None:
         ),
         price_precision=6,
         prev_day_ohlc=(_BOARD["prev_day_high"], _BOARD["prev_day_low"], _BOARD["prev_day_close"]),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
 
     # prev：2010/1980/1990 ÷ 首根开盘 100；today：前缀 [0..1] 极值 110/99.8 ÷ 100
@@ -598,8 +595,7 @@ def test_check_no_absolute_values_exempts_account_line_only() -> None:
         today_pnl=0.0,
         price_precision=6,
         board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
-        trend_up_extreme=DAILY_TP_UP,
-        trend_dn_extreme=DAILY_TP_DOWN,
+        trend_context=RENDER_TREND_CONTEXT,
     )
     assert "净值=100.000000" in state  # 账户行净值与首根开盘绝对价同数字
 
@@ -764,11 +760,15 @@ def test_generate_dataset_skips_segments_without_prev_daily_and_reports(
     ]
     assert dev_rows
     for row in dev_rows:
-        # v5/v7 日线行全行：prev = 首日日线行 ÷ 次日片段首根开盘 100；v7 键名中文化；
-        # trend 四值 = 默认夹具折点段极值（up 4020→40.2 段长 7；down 3980→39.8 段长 5）
+        # v9 日线行全行：prev = 首日日线行 ÷ 次日片段首根开盘 100；trend = 默认夹具 4 点
+        # （确认日 2024-01-01 严格早于交易日 01-03，bar_index=0 → 段长恒 0）：
+        # 涨势(-1/-2) = 4040/4020 → 40.4/40.2，跌势(-1/-2) = 3990/3980 → 39.9/39.8；
+        # 高抬高价 + 低抬低价 → 趋势=涨势中；时长 = T 行号 1 − 最近折点 bar_index 0 = 1
         assert (
             "日线: 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000 "
-            "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
+            "涨势(-1, 最高=40.400000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
+            "跌势(-1, 最低=39.900000, 时长=0根) 跌势(-2, 最低=39.800000, 时长=0根) "
+            "趋势=涨势中 时长=1根"
         ) in row["state"]
     train_rows = [
         json.loads(line)
@@ -834,39 +834,48 @@ def test_generate_dataset_rejects_empty_train_dev_test_splits(tmp_path: Path) ->
 
 
 def test_daily_trend_points_fixture_round_trip(tmp_path: Path) -> None:
-    """夹具：默认 TP CSV 经 ``load_turning_points`` 回读（与生产同路径），点集与
-    默认极值常量一致（down@bar5 段长 5；up@bar12 段长 7）。"""
+    """夹具：默认 TP CSV 经 ``load_turning_points`` 回读（与生产同路径），点集经
+    ``_usable_trend_context`` 与 v9 常量一致（确认日 2024-01-01、bar_index=0 →
+    段长恒 0；时间倒序 [0] = 第二组（*2 常量）、[1] = 第一组）。"""
     workspace = build_workspace(tmp_path, _ROWS)
     points_map = daily_trend_points_map(workspace)
     (points,) = points_map.values()
-    assert [point.kind for point in points] == ["start", "down", "up"]
-    up_extreme, dn_extreme = _usable_trend_extremes(
-        points, trade_date=pd.Timestamp("2024-01-02").date()
-    )
-    assert up_extreme == DAILY_TP_UP
-    assert dn_extreme == DAILY_TP_DOWN
+    assert [point.kind for point in points] == ["start", "down", "up", "down", "up"]
+    trade_date = pd.Timestamp("2024-01-02").date()
+    daily_index = _trade_date_daily_index(daily_rows_map(workspace)[SYMBOL], trade_date)
+    context = _usable_trend_context(points, trade_date, daily_index)
+    assert context is not None
+    assert context.highs == (DAILY_TP_UP2, DAILY_TP_UP)
+    assert context.lows == (DAILY_TP_DOWN2, DAILY_TP_DOWN)
+    assert context.state_duration == 1  # T 行号 1 − 最近可用折点 bar_index 0
 
 
 def test_trend_points_confirmed_on_or_after_trade_date_are_not_usable(tmp_path: Path) -> None:
-    """泄漏边界：确认日 == 决策交易日的折点不可用（trend_dn 取更早 down）；
-    T 日及之后确认折点的极值价不得出现在 State(T)。"""
+    """泄漏边界：确认日 == 决策交易日的折点不可用（各方向只取确认日严格早于
+    交易日的折点）；T 日及之后确认折点的极值价不得出现在 State(T)。"""
     workspace = build_workspace(
         tmp_path,
         _ROWS,
         daily_tp_rows=[
             {"kind": "down", "timestamp": "2024-01-01 21:05:00+08:00", "price": 3980.0,
-             "bar_index": 5, "volume": 120, "oi": 5010,
-             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 5},
+             "bar_index": 0, "volume": 120, "oi": 5010,
+             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 0},
             {"kind": "up", "timestamp": "2024-01-01 21:35:00+08:00", "price": 4020.0,
-             "bar_index": 12, "volume": 130, "oi": 5020,
-             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 12},
-            # 确认日 == 决策交易日 2024-01-02（不可用）
+             "bar_index": 0, "volume": 130, "oi": 5020,
+             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 0},
+            {"kind": "down", "timestamp": "2024-01-01 22:05:00+08:00", "price": 3990.0,
+             "bar_index": 0, "volume": 140, "oi": 5030,
+             "trend_extreme_price": 3990.0, "trend_extreme_bar_index": 0},
+            {"kind": "up", "timestamp": "2024-01-01 22:35:00+08:00", "price": 4040.0,
+             "bar_index": 0, "volume": 150, "oi": 5040,
+             "trend_extreme_price": 4040.0, "trend_extreme_bar_index": 0},
+            # 确认日 == 决策交易日 2024-01-02（不可用；v9 同源不变式 bar_index = 1d 行号）
             {"kind": "down", "timestamp": "2024-01-02 09:05:00+08:00", "price": 4500.0,
-             "bar_index": 20, "volume": 140, "oi": 5030,
-             "trend_extreme_price": 4500.0, "trend_extreme_bar_index": 20},
+             "bar_index": 1, "volume": 140, "oi": 5030,
+             "trend_extreme_price": 4500.0, "trend_extreme_bar_index": 1},
             {"kind": "up", "timestamp": "2024-01-02 09:35:00+08:00", "price": 4600.0,
-             "bar_index": 25, "volume": 150, "oi": 5040,
-             "trend_extreme_price": 4600.0, "trend_extreme_bar_index": 25},
+             "bar_index": 1, "volume": 150, "oi": 5040,
+             "trend_extreme_price": 4600.0, "trend_extreme_bar_index": 1},
         ],
     )
     result = generate_dataset(
@@ -885,10 +894,14 @@ def test_trend_points_confirmed_on_or_after_trade_date_are_not_usable(tmp_path: 
     ]
     assert records
     for record in records:
-        # 可用折点 = 确认日 01-01 的 down/up（首根开盘 100）：4020→40.2 段长 7、3980→39.8 段长 5
+        # 可用折点 = 确认日 01-01 的 4 点（首根开盘 100，bar_index=0 → 段长恒 0）：
+        # 涨势 4040/4020 → 40.4/40.2、跌势 3990/3980 → 39.9/39.8；两向皆抬 → 涨势中、
+        # 时长 = T 行号 1 − 最近折点 bar_index 0 = 1
         assert (
             "日线: 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000 "
-            "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
+            "涨势(-1, 最高=40.400000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
+            "跌势(-1, 最低=39.900000, 时长=0根) 跌势(-2, 最低=39.800000, 时长=0根) "
+            "趋势=涨势中 时长=1根"
         ) in record["state"]
         # 确认日 == 决策交易日的折点极值价（4500/4600 ÷ 100）不得出现
         assert "45.000000" not in record["state"]
@@ -916,16 +929,23 @@ def test_generate_dataset_skips_segments_without_usable_trend_points(tmp_path: P
         symbol=SYMBOL, period="1d", output_dir=data_dir,
     )
     # 折点均确认于 01-02：== seg-train 决策交易日（不可用 → 跳过）；
-    # < seg-dev/seg-test 决策交易日 01-03（可用 → 正常产出）
+    # < seg-dev/seg-test 决策交易日 01-03（可用 → 正常产出）；
+    # v9 同源不变式：bar_index = 1d 文件行号（01-02 = 行 1）
     write_daily_turning_points(
         data_dir.parent / "turning_points" / f"{SYMBOL}_1d.csv",
         rows=[
             {"kind": "down", "timestamp": "2024-01-02 09:05:00+08:00", "price": 3980.0,
-             "bar_index": 5, "volume": 120, "oi": 5010,
-             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 5},
+             "bar_index": 1, "volume": 120, "oi": 5010,
+             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 1},
             {"kind": "up", "timestamp": "2024-01-02 09:35:00+08:00", "price": 4020.0,
-             "bar_index": 12, "volume": 130, "oi": 5020,
-             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 12},
+             "bar_index": 1, "volume": 130, "oi": 5020,
+             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 1},
+            {"kind": "down", "timestamp": "2024-01-02 10:05:00+08:00", "price": 3990.0,
+             "bar_index": 1, "volume": 140, "oi": 5030,
+             "trend_extreme_price": 3990.0, "trend_extreme_bar_index": 1},
+            {"kind": "up", "timestamp": "2024-01-02 10:35:00+08:00", "price": 4040.0,
+             "bar_index": 1, "volume": 150, "oi": 5040,
+             "trend_extreme_price": 4040.0, "trend_extreme_bar_index": 1},
         ],
     )
     manifest = write_manifest(
@@ -956,7 +976,7 @@ def test_generate_dataset_skips_segments_without_usable_trend_points(tmp_path: P
     assert [entry["segment_id"] for entry in skipped] == ["seg-train"]
     assert skipped[0]["reason"].startswith("trade_date=2024-01-02")
     assert set(result.audit["trend_extremes"]["source_versions"]) == {SYMBOL}
-    # 非跳过片段（交易日 01-03，首根开盘 100）的记录含 v5 日线行：trend = 01-02 确认折点
+    # 非跳过片段（交易日 01-03，首根开盘 100）的记录含 v9 日线行：trend = 01-02 确认折点
     dev_rows = [
         json.loads(line)
         for line in (result.run_dir / "dev.jsonl").read_text(encoding="utf-8").splitlines()
@@ -964,9 +984,14 @@ def test_generate_dataset_skips_segments_without_usable_trend_points(tmp_path: P
     ]
     assert dev_rows
     for row in dev_rows:
+        # v9 日线行：prev = 01-02 日线行 ÷ 100；trend = 01-02 确认 4 点（首点无前序
+        # 触发根 → 段长 = bar_index 1 − 0 = 1，其余段长 0）；
+        # 时长 = T（01-03）行号 2 − 最近折点 bar_index 1 = 1
         assert (
             "日线: 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000 "
-            "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
+            "涨势(-1, 最高=40.400000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
+            "跌势(-1, 最低=39.900000, 时长=0根) 跌势(-2, 最低=39.800000, 时长=1根) "
+            "趋势=涨势中 时长=1根"
         ) in row["state"]
 
 
@@ -986,7 +1011,7 @@ def test_generate_dataset_rejects_workspace_without_usable_trend_points(tmp_path
         ],
     )
 
-    with pytest.raises(DatasetError, match="所有片段都缺少可用日线转折点"):
+    with pytest.raises(DatasetError, match="所有片段都被跳过"):
         generate_dataset(
             load_segments(workspace.manifest),
             symbols=load_symbols_config(workspace.symbols_path),
@@ -1009,7 +1034,7 @@ def test_generate_dataset_rejects_workspace_with_up_side_missing(tmp_path: Path)
         ],
     )
 
-    with pytest.raises(DatasetError, match="所有片段都缺少可用日线转折点"):
+    with pytest.raises(DatasetError, match="所有片段都被跳过"):
         generate_dataset(
             load_segments(workspace.manifest),
             symbols=load_symbols_config(workspace.symbols_path),
@@ -1083,16 +1108,23 @@ def test_night_bars_use_next_trading_day_for_trend_points(tmp_path: Path) -> Non
         ).reset_index(drop=True),
         symbol=SYMBOL, period="1d", output_dir=data_dir,
     )
-    # 折点确认日 = 夜盘历日 01-01（== 夜盘 bar 日历日，但 < 其归属交易日 01-02）
+    # 折点确认日 = 夜盘历日 01-01（== 夜盘 bar 日历日，但 < 其归属交易日 01-02；
+    # v9 同源不变式：bar_index = 1d 文件行号，01-01 = 行 0）
     write_daily_turning_points(
         data_dir.parent / "turning_points" / f"{SYMBOL}_1d.csv",
         rows=[
             {"kind": "down", "timestamp": "2024-01-01 22:00:00+08:00", "price": 3980.0,
-             "bar_index": 5, "volume": 120, "oi": 5010,
-             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 5},
-            {"kind": "up", "timestamp": "2024-01-01 23:00:00+08:00", "price": 4020.0,
-             "bar_index": 12, "volume": 130, "oi": 5020,
-             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 12},
+             "bar_index": 0, "volume": 120, "oi": 5010,
+             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 0},
+            {"kind": "up", "timestamp": "2024-01-01 22:30:00+08:00", "price": 4020.0,
+             "bar_index": 0, "volume": 130, "oi": 5020,
+             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 0},
+            {"kind": "down", "timestamp": "2024-01-01 23:00:00+08:00", "price": 3990.0,
+             "bar_index": 0, "volume": 140, "oi": 5030,
+             "trend_extreme_price": 3990.0, "trend_extreme_bar_index": 0},
+            {"kind": "up", "timestamp": "2024-01-01 23:30:00+08:00", "price": 4040.0,
+             "bar_index": 0, "volume": 150, "oi": 5040,
+             "trend_extreme_price": 4040.0, "trend_extreme_bar_index": 0},
         ],
     )
     manifest = write_manifest(
@@ -1128,9 +1160,13 @@ def test_night_bars_use_next_trading_day_for_trend_points(tmp_path: Path) -> Non
     assert deaths["seg-test"] == [0]
     for line in (result.run_dir / "train.jsonl").read_text(encoding="utf-8").splitlines():
         row = json.loads(line)
+        # v9 日线行：prev = 01-01 日线行 ÷ 100；trend = 确认日 01-01 的 4 点
+        # （段长恒 0）；时长 = T（01-02）行号 1 − 最近折点 bar_index 0 = 1
         assert (
             "日线: 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000 "
-            "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
+            "涨势(-1, 最高=40.400000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
+            "跌势(-1, 最低=39.900000, 时长=0根) 跌势(-2, 最低=39.800000, 时长=0根) "
+            "趋势=涨势中 时长=1根"
         ) in row["state"]
 
 
@@ -1158,15 +1194,22 @@ def test_multi_day_segment_later_trade_date_sees_later_confirmed_points(tmp_path
         data_dir.parent / "turning_points" / f"{SYMBOL}_1d.csv",
         rows=[
             {"kind": "down", "timestamp": "2024-01-01 22:00:00+08:00", "price": 3980.0,
-             "bar_index": 5, "volume": 120, "oi": 5010,
-             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 5},
-            {"kind": "up", "timestamp": "2024-01-01 23:00:00+08:00", "price": 4020.0,
-             "bar_index": 12, "volume": 130, "oi": 5020,
-             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 12},
+             "bar_index": 0, "volume": 120, "oi": 5010,
+             "trend_extreme_price": 3980.0, "trend_extreme_bar_index": 0},
+            {"kind": "up", "timestamp": "2024-01-01 22:30:00+08:00", "price": 4020.0,
+             "bar_index": 0, "volume": 130, "oi": 5020,
+             "trend_extreme_price": 4020.0, "trend_extreme_bar_index": 0},
+            {"kind": "down", "timestamp": "2024-01-01 23:00:00+08:00", "price": 3990.0,
+             "bar_index": 0, "volume": 140, "oi": 5030,
+             "trend_extreme_price": 3990.0, "trend_extreme_bar_index": 0},
+            {"kind": "up", "timestamp": "2024-01-01 23:30:00+08:00", "price": 4040.0,
+             "bar_index": 0, "volume": 150, "oi": 5040,
+             "trend_extreme_price": 4040.0, "trend_extreme_bar_index": 0},
             # 后确认的 up 点（01-02 夜盘，历日 01-02）：交易日 01-03/01-04 的 bar 可用
+            # （v9 同源不变式：bar_index = 1d 文件行号，01-02 = 行 1）
             {"kind": "up", "timestamp": "2024-01-02 21:00:00+08:00", "price": 4600.0,
-             "bar_index": 20, "volume": 140, "oi": 5030,
-             "trend_extreme_price": 4600.0, "trend_extreme_bar_index": 20},
+             "bar_index": 1, "volume": 140, "oi": 5030,
+             "trend_extreme_price": 4600.0, "trend_extreme_bar_index": 1},
         ],
     )
     manifest = write_manifest(
@@ -1197,13 +1240,20 @@ def test_multi_day_segment_later_trade_date_sees_later_confirmed_points(tmp_path
         if line
     ]
     by_bar = {row["metadata"]["bar_index"]: row for row in train_rows}
-    # 01-02 的 bar（bar_index 0-3）：可用折点 = 确认日 01-01 的 down/up（4020→40.2 段长 7）
+    # 01-02 的 bar（bar_index 0-3）：可用折点 = 确认日 01-01 的 4 点（段长恒 0）：
+    # 涨势 4040/4020、跌势 3990/3980；两向皆抬 → 涨势中；时长 = T 行号 1 − 0 = 1
     for bar_index in range(0, 4):
         assert (
-            "trend_up=40.200000 trend_up_len=7 trend_dn=39.800000 trend_dn_len=5"
+            "涨势(-1, 最高=40.400000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
+            "跌势(-1, 最低=39.900000, 时长=0根) 跌势(-2, 最低=39.800000, 时长=0根) "
+            "趋势=涨势中 时长=1根"
         ) in by_bar[bar_index]["state"]
     # 01-03 的入选 bar（bar_index 4，交易日 01-03）：up 01-02 21:00 已确认
-    # （< 决策交易日 01-03）→ 4600→46.0 段长 8（后一交易日可用前一日之后确认的折点）
+    # （< 决策交易日 01-03）→ 涨势(-1) = 4600→46.0 段长 1（触发根 bar1 − 前序触发根 bar0），
+    # 涨势(-2) = 4040→40.4 段长 0；后一交易日可用前一日之后确认的折点；
+    # 时长 = T（01-03）行号 2 − 最近折点 bar_index 1 = 1
     assert (
-        "trend_up=46.000000 trend_up_len=8 trend_dn=39.800000 trend_dn_len=5"
+        "涨势(-1, 最高=46.000000, 时长=1根) 涨势(-2, 最高=40.400000, 时长=0根) "
+        "跌势(-1, 最低=39.900000, 时长=0根) 跌势(-2, 最低=39.800000, 时长=0根) "
+        "趋势=涨势中 时长=1根"
     ) in by_bar[4]["state"]

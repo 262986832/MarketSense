@@ -704,10 +704,11 @@ def test_state_leakage_detects_tampered_account_line(tmp_path: Path) -> None:
 
 
 def test_state_leakage_linkage_line_independent_recompute(tmp_path: Path) -> None:
-    """v10 联动行：传入 ``bars_by_symbol``（两级容器）后全部正常记录通过。
+    """v11 无联动品种：主段 ``<主显示名>（突破=<主值>）`` 独立复算全部通过。
 
     期望值按夹具 K 线手算（_PATTERN 每段前 2 根：
-    bar0=(1000, 1000.5, 999.5, 1000)、bar1=(1000, 1010, 1000, 1009)）：
+    bar0=(1000, 1000.5, 999.5, 1000)、bar1=(1000, 1010, 1000, 1009)；主显示名 =
+    夹具 symbol ``TEST.sym`` 去交易所前缀 → ``sym``）：
     - 片段首根（bar0）：可用根数 1 < 2 → ``突破=na``；
     - bar1：bar1.high=1010 > bar0.high=1000.5 且 bar1.close=1009 > bar0.close=1000
       → 信号 +1；n=2 → 单信号权重 1 → momentum = 1·(+1)/1 = 1.0 → ``突破=1.000000``。
@@ -728,15 +729,16 @@ def test_state_leakage_linkage_line_independent_recompute(tmp_path: Path) -> Non
 
     first = next(record for record in records if parse_state_id(record["state_id"])[1] == 0)
     second = next(record for record in records if parse_state_id(record["state_id"])[1] == 1)
-    assert "联动: 突破=na" in first["state"]  # 片段首根 → 可用根数不足 → na
-    assert "联动: 突破=1.000000" in second["state"]  # 手算 +1（见 docstring 算式）
+    assert "联动: sym（突破=na）" in first["state"]  # 片段首根 → 可用根数不足 → na
+    assert "联动: sym（突破=1.000000）" in second["state"]  # 手算 +1（见 docstring 算式）
 
 
 def test_state_leakage_detects_tampered_linkage_line(tmp_path: Path) -> None:
-    """v10 联动行 tamper 防护：突破动量实算值 / na 占位任一被篡改 → DatasetError。
+    """v11 主段 tamper 防护：突破动量实算值 / na 占位任一被篡改 → DatasetError。
 
-    另锁定 ``bars_by_symbol`` 缺省 None 的 v9 旧行为：联动行按 ``联动: na`` 常量
-    占位比对（v9 格式记录可过；v10 格式记录在该缺省下报错）。
+    另锁定 ``bars_by_symbol`` 缺省 None 的 v11 行为：主品种突破值复算源回退
+    ``bars_by_segment`` 的片段序列（生成侧同源同值）→ v11 格式记录仍通过；
+    v9 旧格式（``联动: na`` 常量占位）不再兼容 → 报错。
     """
     workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(tmp_path)
     kwargs = dict(
@@ -759,20 +761,21 @@ def test_state_leakage_detects_tampered_linkage_line(tmp_path: Path) -> None:
     with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
         check_state_leakage(tampered, **kwargs)
 
-    # 篡改片段首根 na 占位（bar0）→ 期望 na 不再匹配 → DatasetError
+    # 篡改片段首根 na 占位（bar0，期望 ``sym（突破=na）``）→ 期望 na 不再匹配 → DatasetError
     tampered = [copy.deepcopy(record) for record in records]
     first = next(record for record in tampered if parse_state_id(record["state_id"])[1] == 0)
-    first["state"] = first["state"].replace("联动: 突破=na", "联动: 突破=9.999999", 1)
+    first["state"] = first["state"].replace("联动: sym（突破=na）", "联动: sym（突破=9.999999）", 1)
     with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
         check_state_leakage(tampered, **kwargs)
 
-    # 缺省 bars_by_symbol=None → v9 旧行为：联动行按 `联动: na` 常量占位比对——
-    # 构造 v9 格式联动行记录（全部决策点联动行还原为 na 常量）→ 通过
+    # v11：缺省 bars_by_symbol=None → 主品种突破值复算源回退 bars_by_segment 的
+    # 片段序列（与生成侧同源同值）→ 原始 v11 格式记录在该缺省下仍通过
+    check_state_leakage(records, **dict(kwargs, bars_by_symbol=None))
+
+    # 同一批记录改回 v9 旧格式（``联动: na`` 常量占位）→ v11 期望主段
+    # ``<主显示名>（突破=<值>）`` 不再匹配 → DatasetError（v9 格式兼容已随 v11 移除）
     v9_style = [copy.deepcopy(record) for record in records]
     for record in v9_style:
-        record["state"] = re.sub(r"联动: 突破=\S+", "联动: na", record["state"], count=1)
-    check_state_leakage(v9_style, **dict(kwargs, bars_by_symbol=None))
-
-    # 同一批 v10 格式记录在 None 缺省下报错（None 只兼容 v9 格式联动行）
+        record["state"] = re.sub(r"联动: \S+", "联动: na", record["state"], count=1)
     with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
-        check_state_leakage(records, **dict(kwargs, bars_by_symbol=None))
+        check_state_leakage(v9_style, **dict(kwargs, bars_by_symbol=None))

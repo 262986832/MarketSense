@@ -88,6 +88,7 @@ _EPISODE_KEYS: Final[tuple[str, ...]] = (
     "flat_sample_band_minutes",
     "breakthrough_window",
     "breakthrough_period",
+    "linkage_symbols",
 )
 #: episode 参数在 ``episode`` 段中的键名
 _PARAM_KEYS: Final[tuple[str, ...]] = (
@@ -170,6 +171,9 @@ class EpisodeParams:
     breakthrough_window: int = 20
     #: 联动行突破动量的 K 线粒度（1m 直接用决策序列；5m/15m/1h 重采样；1d 拒绝）
     breakthrough_period: str = "1m"
+    #: 联动品种清单（``交易所.合约`` 格式，保序；空 = 无联动品种）。
+    #: 联动品种只算突破值/相关度，不参与交易标签（tick_size 不要求）。
+    linkage_symbols: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -179,6 +183,7 @@ class EpisodeParams:
             "flat_sample_band_minutes": self.flat_sample_band_minutes,
             "breakthrough_window": self.breakthrough_window,
             "breakthrough_period": self.breakthrough_period,
+            "linkage_symbols": list(self.linkage_symbols),
         }
 
 
@@ -502,6 +507,27 @@ def load_episode_params(section: Mapping[str, Any], *, where: str) -> EpisodePar
         raise ConfigError(
             f"{where} 的 breakthrough_period 必须为 {allowed} 之一，实际: {period!r}"
         ) from None
+    linkage_symbols: tuple[str, ...] = ()
+    if "linkage_symbols" in section:
+        raw_linkage = section["linkage_symbols"]
+        if not isinstance(raw_linkage, list):
+            raise ConfigError(f"{where} 的 linkage_symbols 必须为字符串列表")
+        parsed_symbols: list[str] = []
+        seen_symbols: set[str] = set()
+        for position, element in enumerate(raw_linkage):
+            if not isinstance(element, str):
+                raise ConfigError(f"{where} 的 linkage_symbols[{position}] 必须为字符串")
+            symbol = element.strip()
+            if symbol.count(".") != 1 or not all(symbol.split(".")):
+                raise ConfigError(
+                    f"{where} 的 linkage_symbols[{position}] 必须为 `交易所.合约` 格式"
+                    f"（含且仅含一个点，两端非空），实际: {element!r}"
+                )
+            if symbol in seen_symbols:
+                raise ConfigError(f"{where} 的 linkage_symbols 含重复元素: {symbol!r}")
+            seen_symbols.add(symbol)
+            parsed_symbols.append(symbol)
+        linkage_symbols = tuple(parsed_symbols)
     return EpisodeParams(
         drawdown_threshold=float(drawdown),
         reward_risk_threshold=float(reward_risk),
@@ -509,6 +535,7 @@ def load_episode_params(section: Mapping[str, Any], *, where: str) -> EpisodePar
         flat_sample_band_minutes=int(band),
         breakthrough_window=int(window),
         breakthrough_period=str(period),
+        linkage_symbols=linkage_symbols,
     )
 
 

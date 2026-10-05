@@ -131,6 +131,18 @@ MarketSense 是一个**研究型**项目，研究问题：
   新 run run-d14277ebcf70
   （`STATE_SCHEMA = marketsense.episode_state.v10`；完整语义见
   `artifacts/linkage-breakthrough/02-design/tech-design.md`）。
+  2026-10-05 拍板状态模板升 v11（linkage-symbol 任务）：联动行升品种化联动——
+  `联动: v2701（突破=<主值>）, sc2611（突破=<sc值>） 相关度=<r>`；联动品种清单
+  配置化（`episode.linkage_symbols`，首例 INE.sc2611）；联动品种突破值与主品种
+  同口径（三态+线性加权，窗口/粒度共用），但 K 线 = **与主品种窗口时间戳对齐的
+  交集序列**（取同样时间，否则无意义）；相关度 = 皮尔逊 r（纯 Python 内联，
+  有效对 <2 或零方差 → na）；缺数据 → na（不跨片段延伸，不静默补数据，
+  不要求联动品种 tick_size）；sc2611 1m 数据免费版窗口 09-04 23:21 起
+  （09-01~09-04 train 前段联动值大部分 na，已拍板接受）；显示名 = 去交易所前缀
+  原样保留；审计同步（`_independent_linkage_symbol` 全内联 + `linkage_bars_by_symbol`
+  + `linkage_symbol` 审计键 + state_template 追加 +linkage_symbol 标记）
+  （`STATE_SCHEMA = marketsense.episode_state.v11`；完整语义见
+  `artifacts/linkage-symbol/02-design/tech-design.md`）。
   完整语义与实现阶段冻结项见 `artifacts/nanojev-training-data/02-design/tech-design.md`。
 - **首轮真实数据（2026-10-01 生成；2026-10-02 v2~v7 状态模板 + 候选文案精简；
   2026-10-03 v8 账户行六键 + 跨片段净值链；同日 v9 日线行趋势项升级；

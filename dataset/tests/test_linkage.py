@@ -18,9 +18,13 @@ from dataset.account import Bar
 from dataset.errors import ConfigError, DatasetError
 from dataset.market_episode.linkage import (
     ResampledBar,
+    align_bars_by_timestamp,
     breakthrough_momentum,
     breakthrough_signal,
+    linkage_breakthrough_momentum,
+    pearson_correlation,
     resample_bars,
+    signal_pairs_from_aligned,
 )
 from dataset.market_episode.segments import (
     EpisodeParams,
@@ -373,3 +377,182 @@ class TestBreakthroughParams:
         )
         with pytest.raises(ConfigError, match="1m, 5m, 15m, 1h"):
             load_episode_config(workspace.config_path)
+
+
+# --------------------------------------------------------------------------- #
+# T3：时间戳交集对齐 + 联动突破值 + 皮尔逊相关度 + 对照信号对
+# --------------------------------------------------------------------------- #
+
+_BASE_TS = pd.Timestamp("2024-01-02 21:00:00+08:00")
+
+
+def _ts(offset: int) -> str:
+    return (_BASE_TS + pd.Timedelta(minutes=offset)).isoformat()
+
+
+#: 主品种 6 根价路径：全窗口相邻对信号 = [+1, 0, -1, 0, +1]
+_PRIMARY_ROWS: list[tuple[float, float, float, float]] = [
+    (10, 10, 10, 10),  # t0 (21:00)
+    (10, 11, 10, 11),  # t1 → sig(t0,t1)=+1（高↑ 收↑）
+    (11, 11, 11, 11),  # t2 → sig(t1,t2)=0（高=）
+    (11, 12, 10.5, 10.5),  # t3 → sig(t2,t3)=-1（低↓ 收↓；高↑ 但 收↓）
+    (10.5, 10.5, 10.5, 10.5),  # t4 → sig(t3,t4)=0（低=）
+    (10.5, 11.5, 10.5, 11.5),  # t5 → sig(t4,t5)=+1
+]
+
+#: 联动品种：缺 t2 分钟 + 独有 t9 分钟（永不入选）；交集序列 t0,t1,t3,t4,t5
+_SECONDARY_ROWS: list[tuple[float, float, float, float]] = [
+    (20, 20, 20, 20),  # t0
+    (20, 21, 20, 21),  # t1 → sig(t0,t1)=+1
+    (20.5, 21, 19.5, 19.5),  # t3 → sig(t1,t3)=-1（低 19.5<20 且收 19.5<21）
+    (19.5, 19.5, 19.5, 19.5),  # t4 → sig(t3,t4)=0（低=）
+    (19.5, 20.5, 19.5, 20.5),  # t5 → sig(t4,t5)=+1
+    (20.5, 21, 20.5, 21),  # t9（secondary 独有分钟）
+]
+
+
+def _aligned_bars(window: int = 6) -> tuple[tuple[Bar, Bar], ...]:
+    primary = _minute_bars([_ts(offset) for offset in range(6)], _PRIMARY_ROWS)
+    secondary = _minute_bars([_ts(offset) for offset in (0, 1, 3, 4, 5, 9)], _SECONDARY_ROWS)
+    return align_bars_by_timestamp(primary, secondary, window)
+
+
+def test_primary_rows_signal_baseline() -> None:
+    """主品种价路径自检：全窗口动量 = (1·1+2·0+3·(−1)+4·0+5·1)/15 = 0.2。"""
+    bars = _minute_bars([_ts(offset) for offset in range(6)], _PRIMARY_ROWS)
+    assert breakthrough_momentum(bars, window=20, duration_seconds=60) == pytest.approx(0.2)
+
+
+def test_align_keeps_intersection_in_order() -> None:
+    aligned = _aligned_bars()
+    assert len(aligned) == 5  # 缺 t2 被剔除；secondary 独有 t9 永不入选
+    for primary, secondary in aligned:
+        assert primary.timestamp == secondary.timestamp
+    assert [pair[0].timestamp for pair in aligned] == [_ts(offset) for offset in (0, 1, 3, 4, 5)]
+
+
+def test_align_window_truncates_to_primary_tail() -> None:
+    aligned = _aligned_bars(window=3)
+    assert [pair[0].timestamp for pair in aligned] == [_ts(offset) for offset in (3, 4, 5)]
+    assert all(p.timestamp == s.timestamp for p, s in aligned)
+
+    single = _aligned_bars(window=2)
+    assert [pair[0].timestamp for pair in single] == [_ts(offset) for offset in (4, 5)]
+
+
+def test_align_empty_primary_returns_empty() -> None:
+    assert align_bars_by_timestamp([], [], window=5) == ()
+
+
+def test_align_rejects_invalid_window() -> None:
+    bars = _minute_bars([_ts(0)], [(10, 10, 10, 10)])
+    with pytest.raises(DatasetError, match="window 必须 ≥ 1"):
+        align_bars_by_timestamp(bars, bars, window=0)
+
+
+def test_linkage_momentum_locked_value() -> None:
+    """3 对 → 2 个信号手算：sig(s0,s1)=+1、sig(s1,s2)=−1 → (1·1+2·(−1))/3 = −1/3。"""
+    times = [_ts(offset) for offset in (0, 1, 2)]
+    secondary = _minute_bars(
+        times, [(10, 10, 10, 10), (10, 11, 10, 11), (10, 10.8, 9.5, 9.5)]
+    )
+    primary = _minute_bars(times, [(1, 1, 1, 1)] * 3)
+    aligned = tuple(zip(primary, secondary))
+    assert linkage_breakthrough_momentum(aligned) == pytest.approx(-1 / 3)
+
+
+def test_linkage_momentum_on_default_intersection() -> None:
+    """默认交集（5 对 → 4 信号）：(1·1+2·(−1)+3·0+4·1)/10 = 0.3。"""
+    assert linkage_breakthrough_momentum(_aligned_bars()) == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize("aligned", [(), _aligned_bars(window=1)], ids=["empty", "single"])
+def test_linkage_momentum_returns_none_without_pair(aligned: tuple) -> None:
+    assert linkage_breakthrough_momentum(aligned) is None
+
+
+def test_signal_pairs_locked_value_and_intersection_consistency() -> None:
+    pairs = signal_pairs_from_aligned(_aligned_bars())
+    # 主品种侧 (t1,t3) 跨过被剔除的 t2 → 交集口径为 0（全窗口序列在同位置邻对为 −1）
+    assert pairs == ((1, 1), (0, -1), (0, 0), (1, 1))
+    # 与主品种独立信号一致性：primary 侧信号 = 交集序列上直接计算的相邻对信号
+    primary_intersection = [p for p, _ in _aligned_bars()]
+    independent = [
+        breakthrough_signal(primary_intersection[i - 1], primary_intersection[i])
+        for i in range(1, len(primary_intersection))
+    ]
+    assert [p for p, _ in pairs] == independent
+    assert signal_pairs_from_aligned(_aligned_bars(window=1)) == ()
+    assert signal_pairs_from_aligned(()) == ()
+
+
+def test_pearson_locked_values() -> None:
+    assert pearson_correlation([1, 0, -1], [1, 0, -1]) == pytest.approx(1.0)
+    assert pearson_correlation([1, 0, -1], [-1, 0, 1]) == pytest.approx(-1.0)
+    assert pearson_correlation([1, -1, 1, -1], [1, 1, -1, -1]) == pytest.approx(0.0)
+    # 交集实例：primary [1,0,0,1] vs secondary [1,-1,0,1] → r = 1.5/√2.75
+    aligned = _aligned_bars()
+    xs = [p for p, _ in signal_pairs_from_aligned(aligned)]
+    ys = [s for _, s in signal_pairs_from_aligned(aligned)]
+    assert pearson_correlation(xs, ys) == pytest.approx(0.904534, abs=1e-6)
+
+
+def test_pearson_undefined_returns_none() -> None:
+    assert pearson_correlation([], []) is None  # 无相邻信号对
+    assert pearson_correlation([1], [2]) is None  # 单元素
+    assert pearson_correlation([5, 5, 5], [1, 2, 3]) is None  # x 零方差
+    assert pearson_correlation([1, 2, 3], [7, 7, 7]) is None  # y 零方差
+
+
+def test_pearson_length_mismatch_rejected() -> None:
+    with pytest.raises(DatasetError, match="长度必须一致"):
+        pearson_correlation([1, 2], [1])
+
+
+# --------------------------------------------------------------------------- #
+# T2：linkage_symbols 配置校验 + YAML 透传
+# --------------------------------------------------------------------------- #
+
+
+class TestLinkageSymbolsParams:
+    def test_default_empty_tuple_and_as_dict_list(self) -> None:
+        params = EpisodeParams()
+        assert params.linkage_symbols == ()
+        assert params.as_dict()["linkage_symbols"] == []
+
+    def test_valid_override_preserves_order(self) -> None:
+        params = load_episode_params(
+            {"linkage_symbols": ["INE.sc2611", "DCE.v2701"]}, where="测试配置段"
+        )
+        assert params.linkage_symbols == ("INE.sc2611", "DCE.v2701")
+        assert params.as_dict()["linkage_symbols"] == ["INE.sc2611", "DCE.v2701"]
+
+    @pytest.mark.parametrize(
+        "raw, message",
+        [
+            ("INE.sc2611", "必须为字符串列表"),  # 非列表（裸字符串）
+            (123, "必须为字符串列表"),  # 非列表
+            (["INEsc2611"], "交易所.合约"),  # 无点
+            (["INE.sc.2611"], "交易所.合约"),  # 多点
+            ([""], "交易所.合约"),  # 空段
+            (["INE."], "交易所.合约"),  # 合约端空
+            ([".sc2611"], "交易所.合约"),  # 交易所端空
+            (["INE.sc2611", 123], "必须为字符串"),  # 元素非字符串
+            (["INE.sc2611", "INE.sc2611"], "重复元素"),  # 重复（报错，不去重）
+        ],
+    )
+    def test_invalid_rejected(self, raw: object, message: str) -> None:
+        with pytest.raises(ConfigError, match=message):
+            load_episode_params({"linkage_symbols": raw}, where="测试配置段")
+
+    def test_yaml_passthrough(self, tmp_path: Path) -> None:
+        workspace = build_workspace(
+            tmp_path, _ROWS, episode={"linkage_symbols": ["INE.sc2611"]}
+        )
+        config = load_episode_config(workspace.config_path)
+        assert config.params.linkage_symbols == ("INE.sc2611",)
+
+    def test_yaml_defaults_when_absent(self, tmp_path: Path) -> None:
+        workspace = build_workspace(tmp_path, _ROWS)
+        config = load_episode_config(workspace.config_path)
+        assert config.params.linkage_symbols == ()

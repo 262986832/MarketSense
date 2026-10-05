@@ -34,6 +34,7 @@ import bisect
 import datetime as dt
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,9 +94,15 @@ GOLD_LABEL_KINDS = frozenset(
 #: breakthrough_period），state_template 追加 +breakthrough_momentum 标记并新增
 #: breakthrough 键，既有 daily_trend_extremes/daily_trend_state 键不变，
 #: AUDIT_SCHEMA 仍保持 v1（联动行为行内替换，非新增节））
+#: v11 起联动行升为品种化联动（无联动品种 = ``联动: <主显示名>（突破=<主值>）``；
+#: 有联动品种 = 每联动品种 ``，<联动显示名>（突破=<联动值>）`` 段（全角逗号连接）+
+#: 首个联动品种 `` 相关度=<r>``；交集对齐（主品种窗口 × 联动品种按时间戳保序交集）+
+#: secondary 侧三态加权 + 主/联动相邻对三态信号皮尔逊 r（有效对 < 2 或零方差 → na）；
+#: 显示名 = 去交易所前缀原样保留），state_template 追加 +linkage_symbol 标记并新增
+#: linkage_symbol 键（breakthrough 键保留不动），AUDIT_SCHEMA 仍保持 v1）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v10:decision_bar_only+board_state+daily_trend_extremes+account_net_value+breakthrough_momentum",
+    "state_template": "marketsense.episode_state.v11:decision_bar_only+board_state+daily_trend_extremes+account_net_value+breakthrough_momentum+linkage_symbol",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "net_value_base_100:equity=100*(1+cum_ratio_pnl),1_lot=1_notional,no_multiplier,no_fees",
@@ -107,6 +114,7 @@ FROZEN_DECISIONS: Mapping[str, str] = {
     "daily_trend_extremes": "daily_tp_csv_confirmed_date_lt_trade_date__recent_2up_2down_over_segment_first_open",
     "daily_trend_state": "symmetric_-1_vs_-2_extreme_price:up=both_gt,down=both_lt,else_range_incl_equal__duration=recent_pivot_confirm_to_trade_date_daily_open_bars",
     "breakthrough": "three_state_high_close_symmetric__linear_weights_1_to_k__closed_bar_window",
+    "linkage_symbol": "same_timestamp_intersection__three_state_pearson__na_on_undefined",
     "account_carry": "net_value_and_peak_carry_across_segments_time_ordered_serial_replay",
     "today_pnl": "segment_equity_change_resets_per_segment",
     "question_template": "marketsense.episode_question.v1:concise_action_labels",
@@ -354,6 +362,100 @@ def _independent_breakthrough_momentum(
         numerator += weight * signal
         denominator += weight
     return numerator / denominator
+
+
+def _linkage_display_name(symbol: str) -> str:
+    """联动行品种显示名（与生成侧同规则独立实现，不 import）：去交易所前缀后
+    **原样保留**（``DCE.v2701`` → ``v2701``；无 ``.`` 前缀原样返回）。"""
+    return symbol.split(".", 1)[1] if "." in symbol else symbol
+
+
+def _three_state_signal(
+    prev: tuple[float, float, float], cur: tuple[float, float, float]
+) -> int:
+    """三态信号（严格比较，相等 → 0）：+1 若 cur.high > prev.high 且 cur.close >
+    prev.close；-1 若 cur.low < prev.low 且 cur.close < prev.close；其余 0。
+    入参 = (high, low, close) 三元组（供联动行交集序列上主/联动两侧共用）。"""
+    if cur[0] > prev[0] and cur[2] > prev[2]:
+        return 1
+    if cur[1] < prev[1] and cur[2] < prev[2]:
+        return -1
+    return 0
+
+
+def _independent_pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+    """皮尔逊相关系数 r（纯 Python 内联重写，不调用 linkage.pearson_correlation）。
+
+    ``r = Σ((x-x̄)(y-ȳ)) / √(Σ(x-x̄)²·Σ(y-ȳ)²)``；有效对 < 2 或任一序列零方差
+    → ``None``（渲染层映射 ``na``，不静默取 0）；两序列长度不一致 → ``DatasetError``。"""
+    if len(xs) != len(ys):
+        raise DatasetError(
+            f"审计独立复算：皮尔逊相关度两序列长度必须一致: {len(xs)} != {len(ys)}"
+        )
+    if len(xs) < 2:
+        return None
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    covariance = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    variance_x = sum((x - mean_x) ** 2 for x in xs)
+    variance_y = sum((y - mean_y) ** 2 for y in ys)
+    if variance_x == 0 or variance_y == 0:
+        return None
+    return covariance / math.sqrt(variance_x * variance_y)
+
+
+def _independent_linkage_symbol(
+    primary_bars: tuple[Bar, ...], secondary_bars: tuple[Bar, ...], window: int
+) -> tuple[float | None, float | None]:
+    """独立内联重算联动品种突破值与主/联动信号相关度（v11；**不调用**
+    ``dataset.market_episode.linkage`` 的任何计算函数，交集对齐/三态判据/加权/
+    皮尔逊全部内联重写，防自证）。
+
+    * 交集对齐：主品种窗口 = ``primary_bars`` 末尾 ``min(window, len)`` 根
+      （与生成侧 ``align_bars_by_timestamp`` 同口径），对齐键 = 时间戳**值**比较
+      （epoch 秒整数；与 linkage 模块的 ``pd.Timestamp`` 键不同型不同实现）；
+      只保留双方都存在的时间戳（保序）；
+    * 联动值：对齐对的 secondary 侧相邻对三态信号线性加权（权重 1..n-1；
+      对数 < 2 → ``None``）；
+    * 相关度：同一交集序列上主/联动相邻对信号的皮尔逊 r（有效对 < 2 或
+      任一序列零方差 → ``None``）。
+
+    返回 ``(secondary_momentum, pearson_r)``；空窗口 → ``(None, None)``。
+    """
+    if window < 1:
+        raise DatasetError(f"审计独立复算：window 必须 ≥ 1，实际: {window}")
+    count = min(window, len(primary_bars))
+    if count < 1:
+        return (None, None)
+    secondary_by_ts = {
+        int(pd.Timestamp(item.timestamp).value): item for item in secondary_bars
+    }
+    pairs: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+    for bar in primary_bars[-count:]:
+        secondary = secondary_by_ts.get(int(pd.Timestamp(bar.timestamp).value))
+        if secondary is not None:
+            pairs.append(
+                (
+                    (bar.high, bar.low, bar.close),
+                    (secondary.high, secondary.low, secondary.close),
+                )
+            )
+    if len(pairs) < 2:
+        return (None, None)
+    numerator = 0.0
+    denominator = 0
+    primary_signals: list[int] = []
+    secondary_signals: list[int] = []
+    for weight in range(1, len(pairs)):
+        prev_primary, prev_secondary = pairs[weight - 1]
+        cur_primary, cur_secondary = pairs[weight]
+        numerator += weight * _three_state_signal(prev_secondary, cur_secondary)
+        denominator += weight
+        primary_signals.append(_three_state_signal(prev_primary, cur_primary))
+        secondary_signals.append(_three_state_signal(prev_secondary, cur_secondary))
+    momentum = numerator / denominator
+    correlation = _independent_pearson(primary_signals, secondary_signals)
+    return (momentum, correlation)
 
 
 def _independent_daily_line(
@@ -763,6 +865,7 @@ def check_state_leakage(
     bars_by_symbol: Mapping[str, Mapping[str, tuple[Bar, ...]]] | None = None,
     breakthrough_window: int = 20,
     breakthrough_duration_seconds: int = 60,
+    linkage_bars_by_symbol: Mapping[str, Mapping[str, tuple[Bar, ...]]] | None = None,
 ) -> None:
     """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的数据计算。
 
@@ -791,8 +894,16 @@ def check_state_leakage(
       周期秒 = ``breakthrough_duration_seconds``（生产侧由 EpisodeParams 派生同源透传），
       三态判据/聚合/加权全部内联重写，不调用 linkage 模块函数防自证）并与 state 文本
       逐值比对（首根/可用根数 < 2 → ``突破=na`` 同样比对），不一致 → ``DatasetError``
-      （消息含 segment/bar 定位）；缺省 ``None`` 保持 v9 旧行为（联动行按 ``na``
-      常量占位比对，既有调用点零破坏）；
+      （消息含 segment/bar 定位）；
+    * 联动行（v11/T5 接线）：传入 ``linkage_bars_by_symbol``（联动 symbol →
+      segment_id → 该片段完整 1m 序列的两级容器，同 ``bars_by_symbol`` 模式）时，
+      对每决策点独立复算联动行**全行**：主值（v10 口径不变）+ 每联动品种段
+      ``，<联动显示名>（突破=<联动值>）``（:func:`_independent_linkage_symbol`
+      交集对齐 + secondary 三态加权，全内联重写）+ 首个联动品种
+      `` 相关度=<r>``（同一交集序列上主/联动信号皮尔逊 r），逐值比对，
+      不一致 → ``DatasetError``；缺省 ``None``（或空容器）= 无联动品种格式比对
+      （v11 无联动品种格式也含主品种突破值，主值由 ``bars_by_symbol`` 或
+      ``bars_by_segment`` 的片段序列独立复算）；
     * 状态文本中不得出现决策 K 线及其邻根的**绝对**价格/量，也不得出现上一交易日
       日线的绝对价格与该记录可用折点的绝对极值价（它们只能以比值出现；v9 起可用
       折点含涨势/跌势 -1/-2 共 4 个入选极值，全部在扫描范围内）。
@@ -878,10 +989,11 @@ def check_state_leakage(
                 trend_context,
             )
         if bars_by_symbol is None:
-            # v5~v9 旧行为（缺省 None，既有调用点零破坏）：联动行按常量占位比对
-            expected_linkage = "联动: na"
+            # v11：主品种突破值复算源缺省 = bars_by_segment 的片段序列（生产侧与
+            # bars_by_symbol 同源同值；v9 旧「联动: na」常量比对已随 v11 行格式变化移除）
+            primary_prefix = prefix
         else:
-            # v10（T4）：联动行突破动量独立复算（三态判据 + 加权内联重写，不调用
+            # v10/v11：联动行突破动量独立复算（三态判据 + 加权内联重写，不调用
             # linkage 模块函数防自证）；容器 = symbol → segment_id → 片段完整 1m 序列
             # （同 symbol 多片段各自独立，不跨片段延伸）；复算对 bars[: bar_index + 1]
             # （≤ 决策 K 线）切片，防泄漏上界与生成侧同口径
@@ -899,14 +1011,48 @@ def check_state_leakage(
                 f"（记录 {record['id']} 联动行无法独立复算）",
             )
             assert segment_bars is not None
-            momentum = _independent_breakthrough_momentum(
-                segment_bars[: bar_index + 1],
-                breakthrough_window,
-                breakthrough_duration_seconds,
-            )
+            primary_prefix = segment_bars[: bar_index + 1]
+        momentum = _independent_breakthrough_momentum(
+            primary_prefix,
+            breakthrough_window,
+            breakthrough_duration_seconds,
+        )
+        linkage_parts = [
+            f"{_linkage_display_name(symbol)}"
+            f"（突破={format_ratio_value(momentum, price_precision)}）"
+        ]
+        if linkage_bars_by_symbol:
+            # v11：联动品种段 + 首个联动品种相关度（交集对齐 + secondary 三态加权 +
+            # 皮尔逊 r 全内联独立重算，见 _independent_linkage_symbol；对齐键 =
+            # 时间戳值比较；防泄漏上界与生成侧同口径 = bars[: bar_index + 1]）
+            linkage_r: float | None = None
+            for link_position, (link_symbol, link_segments) in enumerate(
+                linkage_bars_by_symbol.items()
+            ):
+                link_segment_bars = link_segments.get(segment_id)
+                _require(
+                    link_segment_bars is not None,
+                    f"审计缺少联动品种 {link_symbol!r} 片段 {segment_id!r} 的 1m K 线"
+                    f"（记录 {record['id']} 联动行无法独立复算）",
+                )
+                assert link_segment_bars is not None
+                link_momentum, link_r = _independent_linkage_symbol(
+                    primary_prefix, link_segment_bars, breakthrough_window
+                )
+                linkage_parts.append(
+                    f"{_linkage_display_name(link_symbol)}"
+                    f"（突破={format_ratio_value(link_momentum, price_precision)}）"
+                )
+                if link_position == 0:
+                    linkage_r = link_r
             expected_linkage = (
-                f"联动: 突破={format_ratio_value(momentum, price_precision)}"
+                "联动: "
+                + "，".join(linkage_parts)
+                + f" 相关度={format_ratio_value(linkage_r, price_precision)}"
             )
+        else:
+            # v11 无联动品种格式（linkage_bars_by_symbol 缺省 None 或空容器）
+            expected_linkage = "联动: " + "，".join(linkage_parts)
         expected_lines = (
             ("现价", _independent_px_line(bar, reference, price_precision)),
             ("联动", expected_linkage),

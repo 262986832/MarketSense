@@ -41,11 +41,11 @@ up/down 折点各 ≥2 + 新增缺决策交易日日线行跳过原因），其�
 2026-10-03 用户拍板，见 ``artifacts/trend-state-v9/02-design/tech-design.md``）**
 
 ```text
-marketsense.episode_state.v10
+marketsense.episode_state.v11
 账户: 持仓=空仓 净值=<..> 今日=<..> 回撤=<..>
 日线: 昨日高=<..> 昨日低=<..> 昨日收=<..> 涨势(-1, 最高=<..>, 时长=<n>根) 涨势(-2, 最高=<..>, 时长=<n>根) 跌势(-1, 最低=<..>, 时长=<n>根) 跌势(-2, 最低=<..>, 时长=<n>根) 趋势=<涨势中|跌势中|震荡> 时长=<n>根
 日内: 今高=<..> 今低=<..>
-联动: 突破=<momentum|na>
+联动: <主显示名>（突破=<momentum|na>）[，<联动显示名>（突破=<..>）][ 相关度=<r|na>]
 现价: 开=<..> 高=<..> 低=<..> 收=<..> bar=<片段内 0 基序号> 成交量比=<..> 持仓量比=<..>
 盘口: na
 ```
@@ -57,6 +57,15 @@ v10：联动行升为突破动量（``联动: 突破=<momentum|na>``；momentum 
 三态判据 + 权重 1..N-1 线性加权，只用已收盘 K 线/桶；首根/可用根数 < 2 → ``na``；
 窗口/周期 = ``EpisodeParams.breakthrough_window/breakthrough_period``，见
 ``artifacts/linkage-breakthrough/02-design/tech-design.md``）。
+
+v11：联动行升为品种化联动（2026-10-04 拍板设计，见
+``artifacts/linkage-symbol/02-design/tech-design.md``）：无联动品种 =
+``联动: <主显示名>（突破=<主值>）``（主值 = v10 连续窗口突破动量口径不变）；
+有联动品种 = 每联动品种一段 ``，<联动显示名>（突破=<联动值>）``（全角逗号连接）+
+首个联动品种 `` 相关度=<r>``（同一交集序列上主/联动相邻对三态信号的皮尔逊 r；
+有效信号对 < 2 或任一序列零方差 → ``na``）。显示名 = 去交易所前缀**原样保留**
+（``DCE.v2701`` → ``v2701``、``INE.sc2611`` → ``sc2611``，大小写与配置一致，
+不引入大小写改写；任务决定，change-report 披露）。三段 na 语义独立判定。
 
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
@@ -137,7 +146,7 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 
 from dataset.board_state import DAY_END, NIGHT_START
-from dataset.errors import DatasetError
+from dataset.errors import DataLoadError, DatasetError
 from dataset.periods import resolve_duration_seconds
 from dataset.storage import file_sha256, load_ohlcv
 from dataset.turning_points import (
@@ -168,7 +177,13 @@ from dataset.market_episode.labels import (
     SegmentOutcome,
     evaluate_segment,
 )
-from dataset.market_episode.linkage import breakthrough_momentum
+from dataset.market_episode.linkage import (
+    align_bars_by_timestamp,
+    breakthrough_momentum,
+    linkage_breakthrough_momentum,
+    pearson_correlation,
+    signal_pairs_from_aligned,
+)
 from dataset.market_episode.replay import (
     Bar,
     LONG,
@@ -176,6 +191,7 @@ from dataset.market_episode.replay import (
     SHORT,
     ReplayAccount,
     TradeEvent,
+    bars_from_frame,
     format_ratio_value,
     load_segment_bars,
     px_ratio_line,
@@ -215,7 +231,13 @@ from dataset.market_episode.segments import (
 #: 加权 + 只用已收盘 K 线/桶；首根/可用根数 < 2 → ``na``；窗口/周期 =
 #: EpisodeParams.breakthrough_window/breakthrough_period，其余五行与 v9 逐字节同构，
 #: 见 artifacts/linkage-breakthrough/02-design/tech-design.md）
-STATE_SCHEMA = "marketsense.episode_state.v10"
+#: v11 联动行升为品种化联动：无联动品种 = ``联动: <主显示名>（突破=<主值>）``
+#: （主值 = v10 连续窗口口径不变）；有联动品种 = 每联动品种
+#: ``，<联动显示名>（突破=<联动值>）`` 段（全角逗号连接）+ 首个联动品种
+#: `` 相关度=<r>``（同一交集序列上主/联动相邻对三态信号的皮尔逊 r，无定义 → na）；
+#: 显示名 = 去交易所前缀原样保留（大小写与配置一致）；三段 na 独立判定，
+#: 2026-10-04 拍板，见 artifacts/linkage-symbol/02-design/tech-design.md）
+STATE_SCHEMA = "marketsense.episode_state.v11"
 #: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
 QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
@@ -443,6 +465,14 @@ def _intraday_line(
     )
 
 
+def _linkage_display_name(symbol: str) -> str:
+    """联动行品种显示名：去交易所前缀后**原样保留**（``DCE.v2701`` → ``v2701``、
+    ``INE.sc2611`` → ``sc2611``，大小写与配置一致，不引入大小写改写；
+    无 ``.`` 前缀的 symbol 原样返回）。任务决定（2026-10-04）：忠实配置原文，
+    若需 ``SC2611`` 大写显示后续一行改（change-report 披露）。"""
+    return symbol.split(".", 1)[1] if "." in symbol else symbol
+
+
 def render_state(
     *,
     bar: Bar,
@@ -457,8 +487,10 @@ def render_state(
     breakthrough_bars: Sequence[Bar] = (),
     breakthrough_window: int = 20,
     breakthrough_duration_seconds: int = 60,
+    primary_symbol: str = "",
+    linkage_symbol_bars: Mapping[str, Sequence[Bar]] | None = None,
 ) -> str:
-    """确定性状态文本（v10 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
+    """确定性状态文本（v11 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
 
     只做「决策 K 线单根 + 仓位 + 净值 + 今日 + 回撤 + 盘面状态 + 日线折点趋势上下文」
     的序列化：函数签名决定它无法访问决策 K 线之后的任何 bar（``board_state`` 的今日值与
@@ -476,6 +508,19 @@ def render_state(
     1m 逐根天然收盘，非 1m 由重采样 ``is_closed`` 排除未收满桶）；
     首根/可用根数 < 2 → ``na``（缺省空序列同）。缺省窗口/周期 = EpisodeParams 默认口径，
     生产调用方（build_record）必须显式透传 params 派生值。
+
+    v11：联动行升为品种化联动——``primary_symbol``（主品种 symbol，显示名去交易所
+    前缀原样保留）与 ``linkage_symbol_bars``（symbol → 联动品种**片段窗口内**的
+    完整 1m 序列；不要求调用方预切片到 T——交集对齐以主品种窗口（已截至 T）
+    时间戳为准，联动品种仅取相同时间戳，天然上界 ≤ T，无未来泄漏）：
+    无联动品种 = ``联动: <主显示名>（突破=<主值>）``；有联动品种 = 每联动品种
+    ``，<联动显示名>（突破=<联动值>）`` 段（交集对齐 = 主品种窗口（同 v10 窗口）与
+    联动品种按时间戳保序交集；联动值 = 交集序列 secondary 侧三态加权；
+    ``dataset.market_episode.linkage``）+ 首个联动品种 `` 相关度=<r>``
+    （同一交集序列上主/联动相邻对三态信号的皮尔逊 r）。三段 na 语义独立判定：
+    主值 na（首根/可用根数不足）、联动值 na（交集对 < 2）、相关度 na
+    （有效信号对 < 2 或任一序列零方差）。多联动品种：相关度只对首个联动品种
+    （单品种任务；多品种格式设计留白）。
     """
     account_values = (
         f"净值={format_ratio_value(net_value, price_precision)}"
@@ -492,14 +537,45 @@ def render_state(
             f"{label} 开仓价={format_ratio_value(position.entry_ratio, price_precision)}"
             f" 止损价={format_ratio_value(position.stop_ratio, price_precision)}"
         )
-    # v10 联动行：突破动量（momentum ∈ [-1, +1]，非比值；首根/可用根数不足 → na）。
-    # breakthrough_bars 必须已截至决策 K 线 T（含）：build_record 传 bars[: bar_index + 1]，
-    # 防泄漏上界由调用方切片保证；momentum 函数内只用已收盘数据（1m 逐根天然收盘；
-    # 非 1m 由 resample_bars 的 is_closed 排除未收满桶），正负号照常（负值自然带 - 号）。
+    # v10/v11 联动行：主值 = 突破动量（momentum ∈ [-1, +1]，非比值；首根/可用根数
+    # 不足 → na）。breakthrough_bars 必须已截至决策 K 线 T（含）：build_record 传
+    # bars[: bar_index + 1]，防泄漏上界由调用方切片保证；momentum 函数内只用已收盘
+    # 数据（1m 逐根天然收盘；非 1m 由 resample_bars 的 is_closed 排除未收满桶），
+    # 正负号照常（负值自然带 - 号）。
+    # v11 品种化联动：主段 ``<主显示名>（突破=<主值>）``（v10 连续窗口口径不变）；
+    # 有联动品种时每品种一段 ``，<联动显示名>（突破=<联动值>）``（全角逗号连接；
+    # 联动值 = 交集序列 secondary 侧三态加权，交集按主品种时间戳天然上界）+
+    # 首个联动品种 `` 相关度=<r>``（同一交集序列上主/联动相邻对信号的皮尔逊 r）。
+    # 三段 na 独立判定（format_ratio_value(None) → na）。
     momentum = breakthrough_momentum(
         breakthrough_bars, breakthrough_window, breakthrough_duration_seconds
     )
-    linkage_line = f"联动: 突破={format_ratio_value(momentum, price_precision)}"
+    linkage_parts = [
+        f"{_linkage_display_name(primary_symbol)}"
+        f"（突破={format_ratio_value(momentum, price_precision)}）"
+    ]
+    correlation: float | None = None
+    if linkage_symbol_bars:
+        for link_position, (link_symbol, link_bars) in enumerate(
+            linkage_symbol_bars.items()
+        ):
+            aligned = align_bars_by_timestamp(
+                breakthrough_bars, link_bars, breakthrough_window
+            )
+            link_value = linkage_breakthrough_momentum(aligned)
+            linkage_parts.append(
+                f"{_linkage_display_name(link_symbol)}"
+                f"（突破={format_ratio_value(link_value, price_precision)}）"
+            )
+            if link_position == 0:
+                signal_pairs = signal_pairs_from_aligned(aligned)
+                correlation = pearson_correlation(
+                    [primary for primary, _ in signal_pairs],
+                    [secondary for _, secondary in signal_pairs],
+                )
+    linkage_line = "联动: " + "，".join(linkage_parts)
+    if linkage_symbol_bars:
+        linkage_line += f" 相关度={format_ratio_value(correlation, price_precision)}"
     return " \n ".join(
         (
             STATE_SCHEMA,
@@ -528,6 +604,7 @@ def build_record(
     trend_context: UsableTrendContext,
     breakthrough_window: int = 20,
     breakthrough_duration_seconds: int = 60,
+    linkage_symbol_bars: Mapping[str, Sequence[Bar]] | None = None,
 ) -> dict[str, Any]:
     """把一个入选决策点映射为 NanoJev 训练记录。
 
@@ -542,7 +619,11 @@ def build_record(
     周期秒数（生产调用方由 ``params.breakthrough_window`` /
     ``resolve_duration_seconds(params.breakthrough_period)`` 传入；缺省 = EpisodeParams
     默认口径 20/60；联动行动量对 ``bars[: point.bar_index + 1]``（≤ 决策 K 线）计算，
-    防泄漏上界同上）。
+    防泄漏上界同上）；
+    ``linkage_symbol_bars``（v11）＝联动品种 → 该片段**窗口内**的完整 1m 序列
+    （生产调用方由 generate_dataset 按片段 start~end 切片传入；交集对齐以主品种
+    截至 T 的窗口时间戳为上界，防泄漏在 render_state 内成立；缺省 None =
+    无联动品种格式）。
     """
     bar = bars[point.bar_index]
     prefix = bars[: point.bar_index + 1]
@@ -565,6 +646,8 @@ def build_record(
         breakthrough_bars=prefix,
         breakthrough_window=breakthrough_window,
         breakthrough_duration_seconds=breakthrough_duration_seconds,
+        primary_symbol=segment.symbol,
+        linkage_symbol_bars=linkage_symbol_bars,
     )
     criteria = FLAT_CRITERIA if point.position is None else HELD_CRITERIA
     if point.action not in criteria:
@@ -802,11 +885,30 @@ def generate_dataset(
     # 1d/未知周期已由 EpisodeParams 校验拒绝）
     breakthrough_duration_seconds = resolve_duration_seconds(params.breakthrough_period)
 
+    # v11：联动品种 1m LoadedOHLCV 按 symbol 缓存（启动时一次性加载；CSV 缺失 → 硬错误）
+    linkage_frames_by_symbol: dict[str, Any] = {}
+    # v11：联动品种 1m 数据启动时一次性加载（配置声明了联动品种就必须有数据，
+    # 不静默降级；CSV 不存在 → DatasetError（含 fetch 命令提示））
+    for link_symbol in params.linkage_symbols:
+        try:
+            linkage_frames_by_symbol[link_symbol] = load_ohlcv(
+                link_symbol, "1m", data_dir=data_dir
+            )
+        except DataLoadError as error:
+            raise DatasetError(
+                f"联动品种 {link_symbol!r} 的 1m K 线 CSV 不存在或不可读：请先执行 "
+                f"`python -m dataset fetch --symbol {link_symbol} --period 1m "
+                f"--start <start> --end <end>` 落盘（data_dir={data_dir}）"
+            ) from error
+
     outcomes: dict[str, SegmentOutcome] = {}
     bars_by_segment: dict[str, tuple[Bar, ...]] = {}
     # v10：1m K 线按 symbol → segment_id 两级缓存（同 symbol 多片段各自独立序列，
     # 不跨片段延伸），供 check_state_leakage 审计侧联动行独立复算
     bars_by_symbol: dict[str, dict[str, tuple[Bar, ...]]] = {}
+    # v11：联动行审计独立复算入参（联动 symbol → segment_id → 片段完整 1m 序列，
+    # 同 bars_by_symbol 模式；片段窗口切片同主品种规则，窗口内无数据 → 空序列 → na）
+    linkage_bars_by_symbol: dict[str, dict[str, tuple[Bar, ...]]] = {}
     records_by_split: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLIT_ROLES}
     daily_loaded_by_symbol: dict[str, Any] = {}
     # v9：日线行元组按 symbol 缓存（上一交易日查找与决策交易日行号查找共用同源行序）
@@ -840,6 +942,32 @@ def generate_dataset(
         prev_daily_by_segment[segment.segment_id] = prev
         bars, source_version = load_segment_bars(segment, data_dir=data_dir)
         bars_by_symbol.setdefault(segment.symbol, {})[segment.segment_id] = bars
+        # v11：联动品种片段窗口切片（同主品种规则 start <= t <= end）；窗口内无数据
+        # → 空序列（渲染 na，如 sc2611 数据起点晚于片段）；审计入参两级容器同步填充；
+        # 时间列严格升序且唯一校验同主品种口径（拒绝静默排序）
+        segment_linkage_bars: dict[str, tuple[Bar, ...]] = {}
+        for link_symbol, loaded_link in linkage_frames_by_symbol.items():
+            link_frame = loaded_link.df
+            link_stamps = link_frame["timestamp"]
+            link_selected = link_frame.loc[
+                (link_stamps >= segment.start) & (link_stamps <= segment.end)
+            ]
+            if link_selected.empty:
+                link_bars: tuple[Bar, ...] = ()
+            else:
+                link_ordered = link_selected["timestamp"]
+                if not bool(link_ordered.is_monotonic_increasing) or not bool(
+                    link_ordered.is_unique
+                ):
+                    raise DatasetError(
+                        f"联动品种 {link_symbol} 片段 {segment.segment_id} 的 K 线时间列"
+                        "必须严格升序且唯一（拒绝静默排序）"
+                    )
+                link_bars = bars_from_frame(link_selected.reset_index(drop=True))
+            segment_linkage_bars[link_symbol] = link_bars
+            linkage_bars_by_symbol.setdefault(link_symbol, {})[segment.segment_id] = (
+                link_bars
+            )
         # v8（T5b）：净值链节传递——本片段起点 = 上一评估片段末结算净值/峰值
         # （净值尺度 ÷ NET_VALUE_BASE 换算为 equity 尺度；首片段 = 100/100）
         outcome = evaluate_segment(
@@ -939,6 +1067,7 @@ def generate_dataset(
                     trend_context=context,
                     breakthrough_window=params.breakthrough_window,
                     breakthrough_duration_seconds=breakthrough_duration_seconds,
+                    linkage_symbol_bars=segment_linkage_bars or None,
                 )
             )
 
@@ -992,6 +1121,9 @@ def generate_dataset(
         bars_by_symbol=bars_by_symbol,
         breakthrough_window=params.breakthrough_window,
         breakthrough_duration_seconds=breakthrough_duration_seconds,
+        # v11：联动行独立复算入参（联动 symbol → segment_id → 片段完整 1m 序列；
+        # 无联动品种配置 → None = 无联动品种格式比对）
+        linkage_bars_by_symbol=linkage_bars_by_symbol or None,
     )
 
     segments_text = _dump_json([segment.canonical() for segment in segments])

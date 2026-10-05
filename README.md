@@ -656,6 +656,21 @@ sidecar 含语义说明、1m/1d 来源指纹、交易日与跳过日清单；无
 
 输出：终端打印点数、x/y 范围与保存路径；PNG 为 12×5 英寸、150 dpi 的折线图。
 
+#### `scripts/plot_state.py`：单决策点 state 快照图
+
+`scripts/plot_state.py` 把 run 中任一决策点的 `marketsense.episode_state.v11` state 文本
+渲染成确定性快照 PNG（顶部逐 token 回显 state 六行 + 片段 1m 蜡烛图与
+日线/日内水平参考线 + 决策 K 线高亮 + 联动子图与账户/盘口文字块），
+用于逐键核对模型所见状态与原始盘面；仅支持 v11，缺数据/非法参数可读报错。
+解释器同上用 base conda 的 `/opt/anaconda3/bin/python`（需 matplotlib），完整参数与
+确定性保证见脚本 docstring：
+
+```bash
+# 默认示例：run-8886261c37d7 / dev / DCE.v2701-td20260921-dev / bar 19
+# 输出 <run>/plots/state-<segment>-bar<bar>.png
+/opt/anaconda3/bin/python scripts/plot_state.py
+```
+
 ### 7.4 NanoJev 训练/推理环境要求与 CPU 冒烟验证（2026-10-01 实测）
 
 `NanoJev/` 的训练与推理入口**硬性要求 CUDA**，与本机内存无关：

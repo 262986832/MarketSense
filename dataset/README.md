@@ -144,7 +144,7 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 
 - 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
   同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
-- **状态文本模板（v10）**：`marketsense.episode_state.v10`，7 行：`账户:`、`日线:`、
+- **状态文本模板（v11）**：`marketsense.episode_state.v11`，7 行：`账户:`、`日线:`、
   `日内:`、`联动:`、`现价:`、`盘口:`（na 占位）；
   v7 拍板：训练 state 文本键名中文化；日内行 `bar=` 序号与联动行量/持仓量比值并入现价行
   （持仓量只保留收盘时刻，开盘时刻丢弃）；联动行变为 `na` 常量占位。
@@ -336,14 +336,19 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   （链入口因 train 9 片段回参而前移，绝对净值不同）；独立复算 dev+test 1541/1541 条
   日线行趋势内容与折点 CSV + 1d CSV 重算一致；真实数据双跑 sha256 一致；
   见主 README §5「首轮真实数据」）。
-  v10（联动行升突破动量 `联动: 突破=<momentum|na>`，2026-10-04）**当前产物**
-  `run-d14277ebcf70`（DCE.v2701 2026-09 全月，**train 4188 / dev 886 / test 655** 全部非空，
+  v10（联动行升突破动量 `联动: 突破=<momentum|na>`，2026-10-04）`run-d14277ebcf70`
+  （DCE.v2701 2026-09 全月，**train 4188 / dev 886 / test 655** 全部非空，
   NanoJev `--validate-only` 通过；与 v9 run 逐值比对**仅联动行变化**：`突破=na` 6 条
   （= bar0 有记录的片段，首根无历史语义），非 na 值域 [-1,1] mean 0.0337；净值链
   100 → 155.041756 → 160.000608 → 166.489676 与 v9 一致；三轮生成 sha256 幂等；
   见主 README §5「首轮真实数据」）。
+  v11（联动行升品种化联动 `联动: v2701（突破=<主值>）, sc2611（突破=<sc值>） 相关度=<r>`，2026-10-05）**当前产物**
+  `run-8886261c37d7`（DCE.v2701 2026-09 全月，**train 4188 / dev 886 / test 655** 全部非空，
+  NanoJev `--validate-only` 通过；与 v10 run 逐值比对 5729/5729 仅第 0 行 schema 与第 4 行联动行变化，
+  主段值逐值一致，账户链 21 段逐段相等；sc2611 1m 数据免费版窗口 09-04 23:21 起，09-01~09-04 联动值 na 属预期；
+  三轮生成快照逐文件 diff 一致；见主 README §5「首轮真实数据」）。
   v2/v3/v4 run 的 5729 条记录 board_state 值均与 `dataset board-state` CSV 全量交叉核对一致。
-  磁盘现存 **6 个 run**（上述 v5/v6/v7/v8/v9 + 当前 v10；更早的 v1~v4 run 已由用户会话清理）。
+  磁盘现存 **7 个 run**（上述 v5/v6/v7/v8/v9/v10 + 当前 v11；更早的 v1~v4 run 已由用户会话清理）。
 
 契约硬门（只读执行第三方脚本）：
 
@@ -487,6 +492,8 @@ momentum = breakthrough_momentum(bars, window=20, duration_seconds=60)  # float 
   `345 passed, 1 xfailed`（14.01s；转折点用例含 `trend_state_direction` 直测）。
 - 2026-10-04 实测（linkage-breakthrough：突破动量纯函数 32 用例 + 审计 v10 锁定用例）：
   `379 passed, 1 xfailed`（pytest 终态 0 failed）。
+- 2026-10-05 实测（linkage-symbol：品种化联动 26 用例 + 审计 v11 锁定用例）：
+  `405 passed, 1 xfailed`（pytest 终态 0 failed）。
 
 ## 已知边界（未验证项）
 
@@ -495,7 +502,7 @@ momentum = breakthrough_momentum(bars, window=20, duration_seconds=60)  # float 
 - 本包不做实时订阅、不做模型/决策，也不定义最终模型输入格式（非目标）；
   `board-state`（盘面状态读取）是首个状态 building block（研究 building block，非最终格式）。
 - episode 训练数据生成已在真实片段上端到端运行（2026-10-01 首轮 `run-c1cb097177a3`；
-  当前产物 `run-d14277ebcf70`（v10 状态：联动行突破动量；日线行为 v9 的涨势/跌势各 2 项 +
+  当前产物 `run-8886261c37d7`（v11 状态：联动行品种化联动；日线行为 v9 的涨势/跌势各 2 项 +
   三分支趋势状态；21/21 片段全保留）；详细结果见主 README §5「首轮真实数据」）。
 - K 线契约于 2026-09-24 扩展：新增固定持仓量列（`open_oi`/`close_oi`），转折点 CSV
   新增 `volume/oi/相对值` 列；旧格式落盘文件需重新 `fetch` + `turning-points` 再生成。

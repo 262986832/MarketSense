@@ -19,6 +19,7 @@ from dataset.market_episode.audit import (
     AccountReplayInputs,
     check_audit_consistency,
     check_no_absolute_values,
+    check_outcome_sidecar,
     check_records,
     check_split_isolation,
     check_state_leakage,
@@ -27,6 +28,7 @@ from dataset.market_episode.audit import (
 )
 from dataset.market_episode.labels import evaluate_segment
 from dataset.market_episode.nanojev_records import (
+    OUTCOMES_FILENAME,
     BoardStateValues,
     generate_dataset,
     render_state,
@@ -840,3 +842,140 @@ def test_state_leakage_detects_tampered_linkage_line(tmp_path: Path) -> None:
         record["state"] = re.sub(r"联动: \S+", "联动: na", record["state"], count=1)
     with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
         check_state_leakage(v9_style, **dict(kwargs, bars_by_symbol=None))
+
+
+# --------------------------------------------------------------------------- #
+# utility-trainer（T2）：outcome 旁挂硬校验（独立复算 / 恒等式 / 覆盖）
+# --------------------------------------------------------------------------- #
+
+#: 与 audit 既有用例一致的最小模式：开多 → 持有 → 程序止损离场 → 空仓（每段 4 根）
+_SIDE_PATTERN = [
+    (100, 100.2, 99.8, 100),
+    (100, 110, 100, 109),
+    (100, 100.2, 99.8, 100),
+    (100, 110, 100, 109),
+]
+
+
+def _generate_with_sidecar(tmp_path: Path):
+    """生成含 outcome 旁挂的最小工作区（开仓记录 → 旁挂行 1:1）。"""
+    workspace = build_workspace(tmp_path, _SIDE_PATTERN)
+    segments = load_segments(workspace.manifest)
+    symbols = load_symbols_config(workspace.symbols_path)
+    result = generate_dataset(
+        segments,
+        symbols=symbols,
+        data_dir=workspace.data_dir,
+        params=EpisodeParams(flat_sample_band_minutes=2),
+        output_dir=tmp_path / "out",
+    )
+    sidecar_rows = [
+        json.loads(line)
+        for line in (result.run_dir / OUTCOMES_FILENAME)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line
+    ]
+    records_by_split = {}
+    for split in SPLIT_ROLES:
+        path = result.run_dir / f"{split}.jsonl"
+        records_by_split[split] = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+    return result, records_by_split, sidecar_rows, workspace
+
+
+def _sidecar_check_inputs(workspace):
+    """从工作区重建 check_outcome_sidecar 的独立输入（事件流 / K 线 / tick）。"""
+    segments = load_segments(workspace.manifest)
+    bars_by_segment = {
+        segment.segment_id: load_segment_bars(segment, data_dir=workspace.data_dir)[0]
+        for segment in segments
+    }
+    outcomes_by_segment = {
+        segment.segment_id: evaluate_segment(
+            segment,
+            bars_by_segment[segment.segment_id],
+            tick_size=1.0,
+            params=EpisodeParams(flat_sample_band_minutes=2),
+        )
+        for segment in segments
+    }
+    return {
+        "outcomes_by_segment": outcomes_by_segment,
+        "bars_by_segment": bars_by_segment,
+        "tick_size_by_segment": {segment_id: 1.0 for segment_id in outcomes_by_segment},
+    }
+
+
+def test_check_outcome_sidecar_happy_path_returns_node(tmp_path: Path) -> None:
+    result, records_by_split, sidecar_rows, workspace = _generate_with_sidecar(tmp_path)
+    assert sidecar_rows, "最小工作区应产生至少一条开仓旁挂行"
+
+    node = check_outcome_sidecar(
+        records_by_split=records_by_split,
+        sidecar_rows=sidecar_rows,
+        **_sidecar_check_inputs(workspace),
+    )
+
+    assert set(node) == {"by_split", "per_segment"}
+    assert node["by_split"] == result.outcome_row_counts
+    assert sum(entry["open_records"] for entry in node["per_segment"]) == len(sidecar_rows)
+    for entry in node["per_segment"]:
+        identity = entry["outcome_sum"] + entry["reverse_open_pnl_sum"]
+        assert identity == pytest.approx(entry["realized_pnl_ratio"], abs=1e-9)
+
+
+def test_check_outcome_sidecar_detects_tamper_and_coverage_break(tmp_path: Path) -> None:
+    result, records_by_split, sidecar_rows, workspace = _generate_with_sidecar(tmp_path)
+    kwargs = dict(
+        records_by_split=records_by_split,
+        **_sidecar_check_inputs(workspace),
+    )
+
+    # 篡改 outcome 值 → 独立复算逐值比对检出
+    tampered = [dict(row) for row in sidecar_rows]
+    tampered[0] = {**tampered[0], "outcome": tampered[0]["outcome"] * 2}
+    with pytest.raises(DatasetError, match="outcome 与独立复算不一致"):
+        check_outcome_sidecar(sidecar_rows=tampered, **kwargs)
+
+    # 篡改 exit_reason → 精确比对检出
+    tampered = [dict(row) for row in sidecar_rows]
+    tampered[0] = {**tampered[0], "exit_reason": "death"}
+    with pytest.raises(DatasetError, match="exit_reason 与独立复算不一致"):
+        check_outcome_sidecar(sidecar_rows=tampered, **kwargs)
+
+    # 丢弃一行 → 事件流 decision 开仓缺旁挂行（双向覆盖）检出
+    with pytest.raises(DatasetError, match="缺少旁挂行"):
+        check_outcome_sidecar(sidecar_rows=sidecar_rows[1:], **kwargs)
+
+    # 伪造未知 bar 行 → 事件流中无对应开仓事件检出
+    fake = {**sidecar_rows[0], "id": f"{sidecar_rows[0]['segment_id']}:999", "bar_index": 999}
+    with pytest.raises(DatasetError, match="无对应 decision 开仓事件"):
+        check_outcome_sidecar(sidecar_rows=[*sidecar_rows, fake], **kwargs)
+
+    # id 与 segment_id/bar_index 不一致 → schema 检出
+    broken = [dict(row) for row in sidecar_rows]
+    broken[0] = {**broken[0], "id": "nope:0"}
+    with pytest.raises(DatasetError, match="id 与 segment_id/bar_index 不一致"):
+        check_outcome_sidecar(sidecar_rows=broken, **kwargs)
+
+
+def test_check_audit_consistency_validates_outcomes_node(tmp_path: Path) -> None:
+    result, records_by_split, _, _ = _generate_with_sidecar(tmp_path)
+    payload = result.audit
+    # 一致的 outcomes 节 → 通过
+    check_audit_consistency(payload, records_by_split)
+    # by_split 与开仓记录数不一致 → 检出
+    bad = copy.deepcopy(payload)
+    split = next(split for split in SPLIT_ROLES if bad["outcomes"]["by_split"][split] > 0)
+    bad["outcomes"]["by_split"][split] += 1
+    with pytest.raises(DatasetError, match="outcomes.by_split"):
+        check_audit_consistency(bad, records_by_split)
+    # per_segment 求和与 by_split 求和不一致 → 检出
+    bad = copy.deepcopy(payload)
+    bad["outcomes"]["per_segment"][0]["open_records"] += 1
+    with pytest.raises(DatasetError, match="per_segment.open_records 求和"):
+        check_audit_consistency(bad, records_by_split)

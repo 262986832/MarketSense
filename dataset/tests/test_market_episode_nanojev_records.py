@@ -28,6 +28,7 @@ from dataset.market_episode.nanojev_records import (
     AUDIT_FILENAME,
     FLAT_CRITERIA,
     HELD_CRITERIA,
+    OUTCOMES_FILENAME,
     QUESTION_ID,
     STATE_SCHEMA,
     BoardStateValues,
@@ -35,11 +36,24 @@ from dataset.market_episode.nanojev_records import (
     _bar_trade_date,
     _trade_date_daily_index,
     _usable_trend_context,
+    build_outcome_rows,
     build_record,
     generate_dataset,
+    pair_open_close_events,
     render_state,
 )
-from dataset.market_episode.replay import PositionSnapshot, bars_from_frame
+from dataset.market_episode.replay import (
+    LONG,
+    SHORT,
+    PositionSnapshot,
+    REASON_DECISION,
+    REASON_REVERSE_CLOSE,
+    REASON_REVERSE_OPEN,
+    REASON_STOP,
+    Bar,
+    TradeEvent,
+    bars_from_frame,
+)
 from dataset.market_episode.segments import (
     SPLIT_ROLES,
     SEGMENT_SCHEMA,
@@ -1272,3 +1286,256 @@ def test_multi_day_segment_later_trade_date_sees_later_confirmed_points(tmp_path
         "跌势(-1, 最低=39.900000, 时长=0根) 跌势(-2, 最低=39.800000, 时长=0根) "
         "趋势=涨势中 时长=1根"
     ) in by_bar[4]["state"]
+
+
+# --------------------------------------------------------------------------- #
+# utility-trainer（T1）：outcome 旁挂（pairing + 行构建 + 落盘/审计接线）
+# --------------------------------------------------------------------------- #
+
+#: 旁挂行的精确键集合
+_OUTCOME_ROW_KEYS = {
+    "id",
+    "segment_id",
+    "bar_index",
+    "split",
+    "action",
+    "direction",
+    "outcome",
+    "risk_ratio",
+    "r_multiple",
+    "exit_bar_index",
+    "exit_reason",
+}
+
+
+def _bar(index: int, *, open_: float = 100.0, high: float = 101.0, low: float = 99.0, close: float = 100.5) -> Bar:
+    return Bar(
+        index=index,
+        timestamp=f"2026-01-0{index + 1}T21:00:00",
+        open=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=10,
+        open_oi=1,
+        close_oi=1,
+    )
+
+
+def _open_event(bar_index: int, direction: str, *, reason: str = REASON_DECISION) -> TradeEvent:
+    return TradeEvent(
+        bar_index=bar_index,
+        side="buy" if direction == LONG else "sell",
+        direction=direction,
+        reason=reason,
+        price=100.0,
+        price_ratio=1.0,
+        pnl_ratio=None,
+    )
+
+
+def _close_event(bar_index: int, direction: str, pnl: float, *, reason: str = REASON_STOP) -> TradeEvent:
+    return TradeEvent(
+        bar_index=bar_index,
+        side="sell" if direction == LONG else "buy",
+        direction=direction,
+        reason=reason,
+        price=99.0,
+        price_ratio=0.99,
+        pnl_ratio=pnl,
+    )
+
+
+def test_pair_open_close_events_pairs_in_order() -> None:
+    events = [
+        _open_event(0, LONG),
+        _close_event(3, LONG, -0.02),
+        _open_event(4, SHORT, reason=REASON_REVERSE_OPEN),
+        _close_event(6, SHORT, 0.01, reason=REASON_REVERSE_CLOSE),
+    ]
+
+    pairs = pair_open_close_events(events)
+
+    assert [(open_.bar_index, close.bar_index) for open_, close in pairs] == [(0, 3), (4, 6)]
+    assert pairs[0][0].reason == REASON_DECISION
+    assert pairs[1][0].reason == REASON_REVERSE_OPEN
+
+
+def test_pair_open_close_events_rejects_broken_sequences() -> None:
+    # 平仓无栈可弹
+    with pytest.raises(DatasetError, match="栈空"):
+        pair_open_close_events([_close_event(0, LONG, 0.01)])
+    # 开仓叠加（栈深 > 1）
+    with pytest.raises(DatasetError, match="栈深 > 1"):
+        pair_open_close_events([_open_event(0, LONG), _open_event(1, SHORT)])
+    # 事件流末尾未配对开仓
+    with pytest.raises(DatasetError, match="未配对"):
+        pair_open_close_events([_open_event(0, LONG)])
+
+
+def test_build_outcome_rows_covers_only_decision_opens() -> None:
+    segment = Segment(
+        segment_id="seg",
+        symbol=SYMBOL,
+        period="1m",
+        start=pd.Timestamp("2026-01-01 21:00:00"),
+        end=pd.Timestamp("2026-01-01 21:03:00"),
+        split_role="train",
+    )
+    bars = (
+        _bar(0, high=101.0, low=99.0),
+        _bar(1),
+        _bar(2),
+    )
+    events = [
+        _open_event(0, LONG),
+        # 真实反手顺序：先 reverse_close 平多，再 reverse_open 开空（同 bar）
+        _close_event(2, LONG, -0.02, reason=REASON_REVERSE_CLOSE),
+        _open_event(2, SHORT, reason=REASON_REVERSE_OPEN),
+        _close_event(2, SHORT, 0.01, reason=REASON_STOP),
+    ]
+
+    rows = build_outcome_rows(
+        segment=segment,
+        bars=bars,
+        events=events,
+        tick_size=1.0,
+        decision_points=(),
+    )
+
+    # 仅 decision 开仓产出旁挂行；reverse_open 不产出
+    assert len(rows) == 1
+    row = rows[0]
+    assert set(row) == _OUTCOME_ROW_KEYS
+    assert row["id"] == f"{segment.segment_id}:0"
+    assert row["segment_id"] == segment.segment_id
+    assert row["bar_index"] == 0
+    assert row["split"] == "train"
+    assert row["action"] == ACTION_OPEN_LONG
+    assert row["direction"] == LONG
+    assert row["outcome"] == -0.02
+    # risk_ratio = (高 − 低 + tick) / 首根开盘 = (101 − 99 + 1) / 100
+    assert row["risk_ratio"] == pytest.approx((101.0 - 99.0 + 1.0) / 100.0, abs=1e-15)
+    assert row["r_multiple"] == pytest.approx(row["outcome"] / row["risk_ratio"], abs=1e-15)
+    assert row["exit_bar_index"] == 2
+    assert row["exit_reason"] == REASON_REVERSE_CLOSE
+
+
+def test_build_outcome_rows_rejects_nonpositive_risk_and_bad_bar() -> None:
+    segment = Segment(
+        segment_id="seg",
+        symbol=SYMBOL,
+        period="1m",
+        start=pd.Timestamp("2026-01-01 21:00:00"),
+        end=pd.Timestamp("2026-01-01 21:03:00"),
+        split_role="train",
+    )
+    # tick_size ≤ 0 被拒（防御性：tick>0 且高≥低 ⇒ risk_ratio 恒正）
+    with pytest.raises(DatasetError, match="tick_size 必须为正数"):
+        build_outcome_rows(
+            segment=segment,
+            bars=(_bar(0, high=100.0, low=100.0),),
+            events=[_open_event(0, LONG)],
+            tick_size=0.0,
+            decision_points=(),
+        )
+    with pytest.raises(DatasetError, match="越界"):
+        build_outcome_rows(
+            segment=segment,
+            bars=(_bar(0),),
+            events=[_open_event(3, LONG), _close_event(3, LONG, 0.01)],
+            tick_size=1.0,
+            decision_points=(),
+        )
+
+
+def test_build_outcome_rows_cross_checks_decision_points() -> None:
+    segment = Segment(
+        segment_id="seg",
+        symbol=SYMBOL,
+        period="1m",
+        start=pd.Timestamp("2026-01-01 21:00:00"),
+        end=pd.Timestamp("2026-01-01 21:03:00"),
+        split_role="train",
+    )
+    bars = (_bar(0), _bar(1))
+    # decision 开仓事件 bar0，但该 bar 无 selected 开仓决策点 → 不一一对应
+    with pytest.raises(DatasetError, match="不一一对应"):
+        build_outcome_rows(
+            segment=segment,
+            bars=bars,
+            events=[_open_event(0, LONG), _close_event(0, LONG, 0.01)],
+            tick_size=1.0,
+            decision_points=(
+                DecisionPoint(
+                    bar_index=0,
+                    action=ACTION_STAY_FLAT,
+                    selection="all",
+                    selected=False,
+                    position=None,
+                    drawdown=0.0,
+                    reward_risk_long=None,
+                    reward_risk_short=None,
+                ),
+            ),
+        )
+
+
+def test_generate_dataset_writes_outcome_sidecar_matching_open_records(tmp_path: Path) -> None:
+    workspace, result = _generate(tmp_path)
+    import hashlib
+
+    sidecar_path = result.run_dir / OUTCOMES_FILENAME
+    assert sidecar_path.is_file()
+    rows = [
+        json.loads(line)
+        for line in sidecar_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+    records: list[dict] = []
+    for split in SPLIT_ROLES:
+        path = result.run_dir / f"{split}.jsonl"
+        records.extend(
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line
+        )
+    open_ids_by_split = {
+        split: {
+            record["id"]
+            for record in records
+            if record["split"] == split
+            and record["gold"][QUESTION_ID] in (ACTION_OPEN_LONG, ACTION_OPEN_SHORT)
+        }
+        for split in SPLIT_ROLES
+    }
+    row_ids_by_split = {split: set() for split in SPLIT_ROLES}
+    for row in rows:
+        assert set(row) == _OUTCOME_ROW_KEYS
+        assert row["id"] == f"{row['segment_id']}:{row['bar_index']}"
+        assert row["exit_bar_index"] >= row["bar_index"]
+        assert row["risk_ratio"] > 0
+        assert row["r_multiple"] == pytest.approx(
+            row["outcome"] / row["risk_ratio"], abs=1e-12
+        )
+        row_ids_by_split[row["split"]].add(row["id"])
+
+    # 覆盖：逐 split 开仓记录 id 集合 == 旁挂行 id 集合
+    assert row_ids_by_split == open_ids_by_split
+    assert result.outcome_row_counts == {
+        split: len(row_ids_by_split[split]) for split in SPLIT_ROLES
+    }
+    assert sum(result.outcome_row_counts.values()) == len(rows)
+
+    # 审计接线：outputs 槽位 + outcomes 节（sha256/聚合与文件一致）
+    sidecar_sha = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
+    assert result.audit["outputs"]["outcome_sidecar"] == sidecar_sha
+    outcomes_node = result.audit["outcomes"]
+    assert outcomes_node["sidecar_sha256"] == sidecar_sha
+    assert outcomes_node["by_split"] == result.outcome_row_counts
+    per_segment = outcomes_node["per_segment"]
+    assert sum(entry["open_records"] for entry in per_segment) == len(rows)
+    for entry in per_segment:
+        identity = entry["outcome_sum"] + entry["reverse_open_pnl_sum"]
+        assert identity == pytest.approx(entry["realized_pnl_ratio"], abs=1e-9)

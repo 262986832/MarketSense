@@ -644,6 +644,49 @@ sidecar 含语义说明、1m/1d 来源指纹、交易日与跳过日清单；无
 窗口首根抽查（9-1 = 8-31 21:00 夜盘、9-21 = 9-18 周五夜盘、9-28 = 09:00 中秋无夜盘）符合归属规则；
 两次运行 CSV+sidecar 字节一致。
 
+#### 9. `outcomes.jsonl` outcome 旁挂与 `trainer/` utility 训练器
+
+**① outcome 旁挂文件**（2026-10-07 新增；`episode-generate` 恒产出，无开关）：
+
+- 每条 `gold ∈ {open_long, open_short}` 的入选决策记录一行，覆盖全部有记录的 split
+  （非开仓记录无行）；run-828447b7fd1e 实测 27 行（train 19 / dev 4 / test 4）。
+- 行字段（11 键，`sort_keys` 落盘）：连接/归属 `id`（= `{segment_id}:{bar_index}`）、
+  `segment_id`、`bar_index`、`split`、`action`、`direction`；效用值 `outcome`
+  （= 配对平仓事件的 `pnl_ratio`，D6 冻结口径）、`risk_ratio`（= (决策 K 线高−低+tick)
+  /首根开盘）、`r_multiple`（= outcome/risk_ratio）；溯源 `exit_bar_index`、`exit_reason`。
+- 配对规则（确定性）：按事件流序单栈配对；outcome = 该开仓事件弹栈平仓事件的 `pnl_ratio`。
+- **`{split}.jsonl` 逐字节不变**（sidecar 为派生数据，不入 run_id 哈希；同输入重生成
+  → 同 run_id + 多出该文件）；NanoJev 原生校验/训练行为不变。
+- 审计同步（`AUDIT_SCHEMA` 仍 v1，纯增量）：`frozen_decisions.outcome_sidecar` 标记 +
+  顶层 `outcomes` 节（`by_split` / `per_segment` 聚合 / `sidecar_sha256`）+ 落盘前硬校验
+  （逐记录独立复算容差 1e-12、每片段恒等式 `fsum(开仓 outcome) + fsum(reverse_open pnl)
+  == realized_pnl_ratio` 容差 1e-9、逐 split 覆盖一致；违规 raise 不写任何产物）。
+
+**② `trainer/` utility 训练器**（新顶层包，自包含，不 import dataset/NanoJev；
+架构同构参考 NanoJev DecisionModel——**只读参考，实现独立于 NanoJev 代码**）：
+
+```bash
+# 纯 stdlib 数据校验 + 逐类（open/flat/hold/exit）计数/权重均值/总权重拉力报告（CPU 可跑）
+python -m trainer --data data/nanojev_dataset/run-828447b7fd1e --validate-only
+
+# CPU 自检（不下载模型）：权重边界/加权 CE/方向惩罚梯度符号/数值梯度/tiny backbone 1 步
+# 注意：--self-check 与 --train 需要 torch（本机用 ~/.venvs/nanojev-smoke 环境，见 §7.4）
+~/.venvs/nanojev-smoke/bin/python -m trainer --self-check
+
+# 真实训练（CUDA 硬门；本机无 CUDA 不可训练，报错并指引 §7.4）
+~/.venvs/nanojev-smoke/bin/python -m trainer --data RUN_DIR --train --output-dir NEW_DIR
+```
+
+- 损失 = 效用加权 CE（完整题 softmax、padding 剔除、题均归一）+ 方向惩罚
+  （仅开仓记录、λ=0 关闭；不乘记录权重）。权重默认：`w = clip(1+0.5·clip(r,−1,3), 0.5, 2.5)`
+  （`--utility-alpha 0.5 --r-cap 3.0 --weight-min 0.5 --weight-max 2.5`），中性记录 w=1.0；
+  方向惩罚默认 `--direction-penalty-lambda 0.25`。
+- checkpoint（`config.json` 含 `set_head`/`max_length`/`schema_version`/`data_sha256`/`deps`
+  + `backbone_config/` + `tokenizer/` + `best.safetensors`）与 NanoJev `local_checkpoint_files`
+  期望对齐，可被其推理脚本只读加载；写入新目录、不覆盖已有 checkpoint。
+- 确定性：固定种子（默认 `--seed 17`），训练日志无墙钟时间；同种子双跑日志逐行一致、
+  最终权重 sha256 一致（单测断言）。
+
 ### 7.3 `scripts/plot_price_line.py`：转折点价格折线图（快速可视化）
 
 `scripts/plot_price_line.py` 是一个独立小脚本：把转折点 CSV

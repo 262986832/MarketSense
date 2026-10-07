@@ -61,6 +61,25 @@ MarketSense 是一个**研究型**项目，研究问题：
      ```
 
      语义与边界见 `README.md` §7.2 小节 8；已在真实数据上运行与交叉核对（2026-10-01）。
+  5. `trainer/`（顶层新包）：**MarketSense 自研训练器**（2026-10-07 utility-trainer 任务交付；
+     NanoJev 保持只读参考，本包不 import dataset/NanoJev）——模型与 NanoJev DecisionModel
+     架构同构（Qwen3-0.6B backbone + 决策头，state/question/candidates → 概率，
+     zero-token 解码），checkpoint 兼容 NanoJev 推理脚本只读加载；损失 = 效用加权 CE
+     （开仓记录权重 = clip(1+0.5·r_eff, 0.5, 2.5)，r_eff = R 倍数截断，中性记录 w=1）
+     + 方向惩罚附加项（λ·−log(1−p(反向))，λ 默认 0.25 可关）；数据侧配套旁挂产物
+     `outcomes.jsonl`（开仓记录交易结果，run-828447b7fd1e 27 行，`{split}.jsonl`
+     逐字节不变）。最小用法：
+
+     ```bash
+     # 前置：episode-generate 已生成带 outcomes.jsonl 的 run 目录
+     python -m trainer --data data/nanojev_dataset/run-828447b7fd1e --validate-only
+     python -m trainer --data data/nanojev_dataset/run-828447b7fd1e --self-check
+     # 真实训练硬性要求 CUDA（与 NanoJev 同）；torch 用例需 ~/.venvs/nanojev-smoke 环境
+     python -m trainer --data data/nanojev_dataset/run-828447b7fd1e --train --output <dir>
+     ```
+
+     用法与口径见 `README.md` §7.2 小节 9；测试 dataset 429+1 xfailed、trainer 85 passed；
+     同种子双跑产物 sha256 一致（CLI 级确定性留首次 CUDA 训练复核）。
 - **上一轮（research-task: nanojev-training-data）已冻结的口径**：
   每分钟一个决策；成交与止损锚定“刚收盘那根 K 线”（决策 K 线）高低点 ± 1 tick；
   固定 1 手、无动态仓位、无机械止盈止损；开仓/平仓/反手标签由**盈亏比规则真值**给出

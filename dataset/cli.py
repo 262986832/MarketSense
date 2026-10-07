@@ -31,6 +31,7 @@ from dataset.config import DatasetConfig, load_dataset_config
 from dataset.errors import DatasetError
 from dataset.market_episode import (
     AUDIT_FILENAME,
+    OUTCOMES_FILENAME,
     SPLIT_ROLES,
     generate_dataset,
     load_episode_config,
@@ -396,6 +397,13 @@ def _run_episode_generate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     print(f"已生成 episode 训练数据：{result.run_dir}（记录数 {counts}）")
+    outcome_total = sum(result.outcome_row_counts.values())
+    outcome_counts = ", ".join(
+        f"{split}={result.outcome_row_counts[split]}" for split in SPLIT_ROLES
+    )
+    print(
+        f"outcome 旁挂：{result.run_dir / OUTCOMES_FILENAME}（开仓行 {outcome_total}: {outcome_counts}）"
+    )
     print(f"审计文件：{result.run_dir / AUDIT_FILENAME}")
     return EXIT_OK
 

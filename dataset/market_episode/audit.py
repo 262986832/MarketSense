@@ -46,11 +46,17 @@ from dataset.board_state import DAY_END, NIGHT_START
 from dataset.errors import DatasetError
 from dataset.storage import file_sha256
 
-from dataset.market_episode.labels import SegmentOutcome
+from dataset.market_episode.labels import (
+    ACTION_OPEN_LONG,
+    ACTION_OPEN_SHORT,
+    SegmentOutcome,
+)
 from dataset.market_episode.replay import (
     Bar,
     DIRECTIONS,
     LONG,
+    REASON_DECISION,
+    REASON_REVERSE_OPEN,
     TradeEvent,
     format_ratio_value,
     ratio_or_none,
@@ -122,6 +128,7 @@ FROZEN_DECISIONS: Mapping[str, str] = {
     "account_carry": "net_value_and_peak_carry_across_segments_time_ordered_serial_replay",
     "today_pnl": "segment_equity_change_resets_per_segment",
     "question_template": "marketsense.episode_question.v1:concise_action_labels",
+    "outcome_sidecar": "sidecar_outcomes.jsonl:open_records_only__outcome=paired_close_pnl_ratio__risk=(h-l+tick)/first_open__r=outcome/risk",
 }
 
 
@@ -1226,6 +1233,286 @@ def check_account_chain(entries: Sequence[Any]) -> list[dict[str, Any]]:
     return chain
 
 
+#: outcome 旁挂行必需键（与生成侧约定同步；多/少键均不静默）
+_OUTCOME_ROW_REQUIRED_FIELDS = (
+    "id",
+    "segment_id",
+    "bar_index",
+    "split",
+    "action",
+    "direction",
+    "outcome",
+    "risk_ratio",
+    "r_multiple",
+    "exit_bar_index",
+    "exit_reason",
+)
+#: 逐记录复算容差（outcome/risk_ratio/r_multiple；两侧同源算术，余量充足）
+_OUTCOME_RECORD_TOLERANCE = 1e-12
+#: 逐片段恒等式容差（fsum 与顺序累加的末位差异远小于此）
+_OUTCOME_IDENTITY_TOLERANCE = 1e-9
+
+
+def _independent_outcome_pairs(
+    events: Iterable[TradeEvent],
+) -> list[tuple[TradeEvent, TradeEvent]]:
+    """开仓→平仓事件单栈配对（审计侧**内联重写**，不调用生成侧配对实现，防自证）。
+
+    语义与生成侧 :func:`dataset.market_episode.nanojev_records.pair_open_close_events`
+    同源同结果（账户单仓位 ⇒ 开/平严格交替），但实现独立：任一侧漂移/被篡改都会
+    在逐值比对中被检出。
+
+    :raises DatasetError: 平仓无栈可弹 / 开仓叠加 / 末尾未配对开仓
+    """
+    open_stack: list[TradeEvent] = []
+    pairs: list[tuple[TradeEvent, TradeEvent]] = []
+    for event in events:
+        if event.pnl_ratio is None:
+            if open_stack:
+                raise DatasetError(
+                    "审计 outcome 复算：开仓事件叠加（栈深 > 1）: "
+                    f"bar {event.bar_index} reason={event.reason!r}"
+                )
+            open_stack.append(event)
+        else:
+            if not open_stack:
+                raise DatasetError(
+                    "审计 outcome 复算：平仓事件无配对开仓事件（栈空）: "
+                    f"bar {event.bar_index} reason={event.reason!r}"
+                )
+            pairs.append((open_stack.pop(), event))
+    if open_stack:
+        raise DatasetError(
+            "审计 outcome 复算：存在未配对的开仓事件: "
+            f"bar {open_stack[0].bar_index} reason={open_stack[0].reason!r}"
+        )
+    return pairs
+
+
+def check_outcome_sidecar(
+    *,
+    records_by_split: Mapping[str, list[dict[str, Any]]],
+    sidecar_rows: Sequence[Mapping[str, Any]],
+    outcomes_by_segment: Mapping[str, SegmentOutcome],
+    bars_by_segment: Mapping[str, tuple[Bar, ...]],
+    tick_size_by_segment: Mapping[str, float],
+) -> dict[str, Any]:
+    """outcome 旁挂硬校验（utility-trainer 任务 T2；违规即 ``DatasetError``，不写产物）。
+
+    三重校验（风格同 ``check_account_chain`` / ``check_state_leakage``）：
+
+    1. **逐记录独立复算**：审计侧内联重写单栈配对 + outcome/risk_ratio/r_multiple
+       算术（不调用生成侧实现，防自证），与旁挂行逐条比对（容差 1e-12；
+       exit_bar_index/exit_reason/action/direction 精确比对）；双向覆盖：
+       旁挂行在事件流中无对应 decision 开仓、或事件流 decision 开仓缺少旁挂行均报错；
+    2. **逐片段恒等式**：``fsum(开仓记录 outcome) + fsum(reverse_open 仓位 pnl)
+       == realized_pnl_ratio``（容差 1e-9；每个平仓事件恰属一个开仓事件，
+       开仓仅 decision/reverse_open 两种 reason，恒等式精确成立）；
+    3. **覆盖一致**：逐 split，``{split}.jsonl`` 中 gold ∈ {open_long, open_short}
+       的记录 id 集合 == 旁挂行 id 集合（同时约束行自身 ``split`` 字段一致）。
+
+    通过后返回审计 ``outcomes`` 节（``by_split``/``per_segment``；聚合值 round 12，
+    沿用 account_chain 精度约定；``sidecar_sha256`` 由调用方补入）。
+    """
+    # ---- ① 审计侧独立复算（事件流 → 期望行值 + reverse_open 平仓盈亏）
+    expected_by_segment: dict[str, dict[int, dict[str, Any]]] = {}
+    reverse_pnls_by_segment: dict[str, list[float]] = {}
+    for segment_id, outcome in outcomes_by_segment.items():
+        bars = bars_by_segment.get(segment_id)
+        _require(bars is not None, f"审计 outcome 复算缺少片段 {segment_id!r} 的 K 线")
+        assert bars is not None
+        tick = float(tick_size_by_segment.get(segment_id, 0.0))
+        _require(
+            tick > 0,
+            f"审计 outcome 复算：片段 {segment_id!r} tick_size 必须为正数: {tick!r}",
+        )
+        reference = float(bars[0].open)
+        _require(
+            reference > 0,
+            f"审计 outcome 复算：片段 {segment_id!r} 首根开盘价必须为正数: {bars[0].open!r}",
+        )
+        expected: dict[int, dict[str, Any]] = {}
+        reverse_pnls: list[float] = []
+        for open_event, close_event in _independent_outcome_pairs(outcome.events):
+            if open_event.reason == REASON_DECISION:
+                _require(
+                    0 <= open_event.bar_index < len(bars),
+                    f"审计 outcome 复算：开仓事件决策 K 线序号越界: "
+                    f"{(segment_id, open_event.bar_index)}（片段共 {len(bars)} 根）",
+                )
+                bar = bars[open_event.bar_index]
+                risk_ratio = (
+                    float(bar.high) - float(bar.low) + tick
+                ) / reference
+                _require(
+                    math.isfinite(risk_ratio) and risk_ratio > 0,
+                    f"审计 outcome 复算：risk_ratio 必须为有限正数: "
+                    f"{(segment_id, open_event.bar_index)} risk_ratio={risk_ratio!r}",
+                )
+                pnl = float(close_event.pnl_ratio)
+                _require(
+                    math.isfinite(pnl),
+                    f"审计 outcome 复算：平仓 pnl_ratio 必须有限: "
+                    f"{(segment_id, close_event.bar_index)} pnl_ratio={pnl!r}",
+                )
+                expected[open_event.bar_index] = {
+                    "action": (
+                        ACTION_OPEN_LONG
+                        if open_event.direction == LONG
+                        else ACTION_OPEN_SHORT
+                    ),
+                    "direction": open_event.direction,
+                    "outcome": pnl,
+                    "risk_ratio": risk_ratio,
+                    "r_multiple": pnl / risk_ratio,
+                    "exit_bar_index": close_event.bar_index,
+                    "exit_reason": close_event.reason,
+                }
+            elif open_event.reason == REASON_REVERSE_OPEN:
+                pnl = float(close_event.pnl_ratio)
+                _require(
+                    math.isfinite(pnl),
+                    f"审计 outcome 复算：反手平仓 pnl_ratio 必须有限: "
+                    f"{(segment_id, close_event.bar_index)} pnl_ratio={pnl!r}",
+                )
+                reverse_pnls.append(pnl)
+            else:
+                raise DatasetError(
+                    f"审计 outcome 复算：未知开仓事件 reason（开仓仅 "
+                    f"decision/reverse_open 两种）: {(segment_id, open_event.bar_index)} "
+                    f"reason={open_event.reason!r}"
+                )
+        expected_by_segment[segment_id] = expected
+        reverse_pnls_by_segment[segment_id] = reverse_pnls
+
+    # ---- ② 旁挂行逐条 schema + 独立复算比对
+    seen_ids: set[str] = set()
+    rows_by_split = {split: 0 for split in SPLIT_ROLES}
+    outcomes_by_id: dict[str, list[float]] = {
+        segment_id: [] for segment_id in outcomes_by_segment
+    }
+    for position, row in enumerate(sidecar_rows):
+        where = f"审计 outcome sidecar 第 {position} 行"
+        _require(isinstance(row, dict), f"{where} 必须是 JSON 对象")
+        for key in _OUTCOME_ROW_REQUIRED_FIELDS:
+            _require(key in row, f"{where} 缺少键 {key!r}")
+        extra = set(row) - set(_OUTCOME_ROW_REQUIRED_FIELDS)
+        _require(not extra, f"{where} 出现未知键: {sorted(extra)}")
+        record_id = row["id"]
+        segment_id = row["segment_id"]
+        bar_index = row["bar_index"]
+        split = row["split"]
+        _require(
+            isinstance(record_id, str) and record_id.strip(),
+            f"{where} id 必须为非空字符串: {record_id!r}",
+        )
+        _require(record_id not in seen_ids, f"{where} id 重复: {record_id!r}")
+        seen_ids.add(record_id)
+        _require(
+            isinstance(segment_id, str) and segment_id in expected_by_segment,
+            f"{where} segment_id 未知或该片段无产出: {segment_id!r}",
+        )
+        _require(
+            isinstance(bar_index, int) and not isinstance(bar_index, bool),
+            f"{where} bar_index 必须为整数: {bar_index!r}",
+        )
+        _require(
+            record_id == f"{segment_id}:{bar_index}",
+            f"{where} id 与 segment_id/bar_index 不一致: {record_id!r}",
+        )
+        _require(
+            split in SPLIT_ROLES,
+            f"{where} split 非法: {split!r}",
+        )
+        expected = expected_by_segment[segment_id].get(bar_index)
+        _require(
+            expected is not None,
+            f"{where} 在事件流中无对应 decision 开仓事件: {record_id!r}",
+        )
+        assert expected is not None
+        for key in ("action", "direction", "exit_bar_index", "exit_reason"):
+            _require(
+                row[key] == expected[key],
+                f"{where} {key} 与独立复算不一致: {row[key]!r} ≠ {expected[key]!r}",
+            )
+        for key in ("outcome", "risk_ratio", "r_multiple"):
+            value = row[key]
+            _require(
+                isinstance(value, float)
+                and math.isfinite(value)
+                and abs(value - expected[key]) <= _OUTCOME_RECORD_TOLERANCE,
+                f"{where} {key} 与独立复算不一致（容差 {_OUTCOME_RECORD_TOLERANCE}）: "
+                f"{value!r} ≠ {expected[key]!r}",
+            )
+        rows_by_split[split] += 1
+        outcomes_by_id[segment_id].append(float(row["outcome"]))
+    for segment_id, expected_rows in expected_by_segment.items():
+        for bar_index in sorted(expected_rows):
+            _require(
+                f"{segment_id}:{bar_index}" in seen_ids,
+                f"审计 outcome sidecar：事件流 decision 开仓缺少旁挂行: "
+                f"{(segment_id, bar_index)}",
+            )
+
+    # ---- ③ 覆盖一致：逐 split 开仓记录 id 集合 == 旁挂行 id 集合
+    for split in SPLIT_ROLES:
+        records = records_by_split.get(split, [])
+        open_ids = {
+            record["id"]
+            for record in records
+            if any(
+                action in (ACTION_OPEN_LONG, ACTION_OPEN_SHORT)
+                for action in record.get("gold", {}).values()
+            )
+        }
+        row_ids = {
+            row["id"]
+            for row in sidecar_rows
+            if isinstance(row, dict) and row.get("split") == split
+        }
+        _require(
+            open_ids == row_ids,
+            f"审计 outcome sidecar：split {split!r} 覆盖不一致——开仓记录 "
+            f"{len(open_ids)} 条 vs 旁挂行 {len(row_ids)} 行；"
+            f"仅记录有: {sorted(open_ids - row_ids)[:8]}，"
+            f"仅旁挂有: {sorted(row_ids - open_ids)[:8]}",
+        )
+
+    # ---- ④ 逐片段恒等式 + 审计 outcomes 节
+    per_segment: list[dict[str, Any]] = []
+    for segment_id, outcome in outcomes_by_segment.items():
+        open_records = len(expected_by_segment[segment_id])
+        row_count = len(outcomes_by_id[segment_id])
+        _require(
+            open_records == row_count,
+            f"审计 outcome sidecar：片段 {segment_id!r} 开仓事件数 {open_records} "
+            f"与旁挂行数 {row_count} 不一致",
+        )
+        outcome_sum = math.fsum(outcomes_by_id[segment_id])
+        reverse_sum = math.fsum(reverse_pnls_by_segment[segment_id])
+        identity = outcome_sum + reverse_sum
+        realized = float(outcome.realized_pnl_ratio)
+        _require(
+            abs(identity - realized) <= _OUTCOME_IDENTITY_TOLERANCE,
+            f"审计 outcome sidecar：片段 {segment_id!r} 恒等式不成立（容差 "
+            f"{_OUTCOME_IDENTITY_TOLERANCE}）：fsum(开仓 outcome)={outcome_sum!r} + "
+            f"fsum(reverse_open pnl)={reverse_sum!r} ≠ realized_pnl_ratio={realized!r}",
+        )
+        per_segment.append(
+            {
+                "segment_id": segment_id,
+                "open_records": open_records,
+                "outcome_sum": round(outcome_sum, 12),
+                "reverse_open_pnl_sum": round(reverse_sum, 12),
+                "realized_pnl_ratio": round(realized, 12),
+            }
+        )
+    return {
+        "by_split": dict(rows_by_split),
+        "per_segment": per_segment,
+    }
+
+
 def _absolute_price_tokens(values, precision: int) -> set[str]:
     """绝对价格 token 集合（固定小数位形式与浮点 ``repr`` 形式）。"""
     tokens: set[str] = set()
@@ -1288,6 +1575,8 @@ def build_audit_payload(
     trend_source_versions: Mapping[str, str] | None = None,
     daily_source_versions: Mapping[str, str | None] | None = None,
     account_chain: Sequence[Mapping[str, Any]] | None = None,
+    outcomes_section: Mapping[str, Any] | None = None,
+    outcome_sidecar_sha256: str | None = None,
 ) -> dict[str, Any]:
     """构造审计文件内容（不含墙钟时间，保证双跑逐字节一致）。
 
@@ -1297,6 +1586,10 @@ def build_audit_payload(
     v8 起：新增可选 ``account_chain``（:func:`check_account_chain` 的归一化返回）——
     校验通过的每片段起点/末结算净值写入 per_segment 条目的 ``account_chain`` 节
     （净值 = ``NET_VALUE_BASE × equity``，纯增量键；未传入时不写该键，行为与 v7 一致）。
+    utility-trainer 起新增可选 ``outcomes_section``（:func:`check_outcome_sidecar`
+    校验通过后的返回值）+ ``outcome_sidecar_sha256``：顶层 ``outcomes`` 节
+    （``by_split``/``per_segment``/``sidecar_sha256``）与 ``outputs.outcome_sidecar``
+    sha256 槽位（纯增量；未传入时不写该键，行为与之前一致）。
     """
     chain_by_segment: dict[str, tuple[float, float]] = {}
     for position, chain_entry in enumerate(account_chain or ()):  # type: ignore[arg-type]
@@ -1362,7 +1655,7 @@ def build_audit_payload(
         }
         for split in SPLIT_ROLES
     }
-    return {
+    payload = {
         "schema": AUDIT_SCHEMA,
         "run_id": run_id,
         "input": dict(sorted(input_hashes.items())),
@@ -1394,7 +1687,14 @@ def build_audit_payload(
         },
         "per_split": per_split,
         "per_segment": per_segment,
-        "outputs": {"split_files": dict(sorted(split_digests.items()))},
+        "outputs": {
+            "split_files": dict(sorted(split_digests.items())),
+            **(
+                {"outcome_sidecar": outcome_sidecar_sha256}
+                if outcome_sidecar_sha256 is not None
+                else {}
+            ),
+        },
         "board_state": {
             "skipped_segments": [
                 {"segment_id": key, "reason": value}
@@ -1410,6 +1710,12 @@ def build_audit_payload(
             "source_versions": dict(sorted((trend_source_versions or {}).items())),
         },
     }
+    if outcomes_section is not None:
+        payload["outcomes"] = {
+            **dict(outcomes_section),
+            "sidecar_sha256": outcome_sidecar_sha256,
+        }
+    return payload
 
 
 def check_audit_consistency(
@@ -1462,6 +1768,39 @@ def check_audit_consistency(
         totals["selected"] == total_records,
         "审计 totals.selected 与记录数不一致",
     )
+    # utility-trainer（T2）：outcomes 节存在时的一致性交叉核验（可选；未传入则跳过）
+    if "outcomes" in payload:
+        outcomes_node = payload["outcomes"]
+        by_split = outcomes_node.get("by_split")
+        _require(
+            isinstance(by_split, dict),
+            "审计 outcomes.by_split 必须是映射",
+        )
+        for split in SPLIT_ROLES:
+            records = records_by_split.get(split, [])
+            open_count = sum(
+                1
+                for record in records
+                if any(
+                    action in (ACTION_OPEN_LONG, ACTION_OPEN_SHORT)
+                    for action in record.get("gold", {}).values()
+                )
+            )
+            _require(
+                by_split.get(split) == open_count,
+                f"审计 outcomes.by_split[{split}]={by_split.get(split)!r} "
+                f"与开仓记录数 {open_count} 不一致",
+            )
+        per_segment = outcomes_node.get("per_segment")
+        _require(
+            isinstance(per_segment, list),
+            "审计 outcomes.per_segment 必须是列表",
+        )
+        _require(
+            sum(entry["open_records"] for entry in per_segment)
+            == sum(by_split.get(split, 0) for split in SPLIT_ROLES),
+            "审计 outcomes.per_segment.open_records 求和与 by_split 求和不一致",
+        )
 
 
 def verify_determinism(
@@ -1511,6 +1850,7 @@ __all__ = [
     "check_account_chain",
     "check_audit_consistency",
     "check_no_absolute_values",
+    "check_outcome_sidecar",
     "check_record_ids_unique",
     "check_record_shape",
     "check_records",

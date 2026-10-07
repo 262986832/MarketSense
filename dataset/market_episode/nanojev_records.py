@@ -163,6 +163,7 @@ from dataset.market_episode.audit import (
     build_audit_payload,
     check_account_chain,
     check_audit_consistency,
+    check_outcome_sidecar,
     check_records,
     check_state_leakage,
 )
@@ -188,6 +189,8 @@ from dataset.market_episode.replay import (
     Bar,
     LONG,
     PositionSnapshot,
+    REASON_DECISION,
+    REASON_REVERSE_OPEN,
     SHORT,
     ReplayAccount,
     TradeEvent,
@@ -268,6 +271,24 @@ POSITION_LABELS: Mapping[str | None, str] = {
 GOLD_LABEL_KIND = "deterministic_truth"
 #: 审计文件名
 AUDIT_FILENAME = "audit.json"
+#: outcome 旁挂文件名（utility-trainer 任务：每条 gold ∈ {open_long, open_short} 决策
+#: 记录一行其交易最终结果；随 {split}.jsonl / audit.json 经同一原子写落盘；
+#: ``{split}.jsonl`` 字节不变，run_id 哈希输入不含 sidecar（派生数据不入指纹））
+OUTCOMES_FILENAME = "outcomes.jsonl"
+#: sidecar 行的固定键集合（落盘 ``sort_keys``；缺失/多余键属生成侧实现错误）
+OUTCOME_ROW_FIELDS: Mapping[str, type] = {
+    "id": str,
+    "segment_id": str,
+    "bar_index": int,
+    "split": str,
+    "action": str,
+    "direction": str,
+    "outcome": float,
+    "risk_ratio": float,
+    "r_multiple": float,
+    "exit_bar_index": int,
+    "exit_reason": str,
+}
 
 
 @dataclass(frozen=True)
@@ -281,6 +302,8 @@ class GenerationResult:
     audit: Mapping[str, Any]
     board_state_skipped: Mapping[str, str]
     trend_extreme_skipped: Mapping[str, str]
+    #: outcome 旁挂行数（按 split；utility-trainer 任务 T1，仅开仓记录）
+    outcome_row_counts: Mapping[str, int]
 
 
 @dataclass(frozen=True)
@@ -683,6 +706,146 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def pair_open_close_events(
+    events: Sequence[TradeEvent],
+) -> list[tuple[TradeEvent, TradeEvent]]:
+    """开仓→平仓事件**单栈配对**（纯函数；utility-trainer 任务 T1）。
+
+    账户固定 1 手、单仓位 ⇒ 事件流中开仓/平仓严格交替（开仓入栈、平仓弹栈，
+    栈深恒 ≤ 1），每笔平仓事件恰好了结栈顶那笔开仓 → 配对确定性。
+
+    :return: ``(开仓事件, 其配对平仓事件)`` 列表（事件流出现序）。
+    :raises DatasetError: 平仓事件无栈可弹 / 开仓事件叠加（栈深 > 1）/
+        事件流末尾仍有未配对开仓（均不静默）
+    """
+    stack: list[TradeEvent] = []
+    pairs: list[tuple[TradeEvent, TradeEvent]] = []
+    for event in events:
+        if event.pnl_ratio is None:
+            if stack:
+                raise DatasetError(
+                    "开仓事件叠加（栈深 > 1，账户单仓位约定被破坏）: "
+                    f"bar {event.bar_index} reason={event.reason!r}"
+                )
+            stack.append(event)
+        else:
+            if not stack:
+                raise DatasetError(
+                    f"平仓事件无配对开仓事件（栈空）: bar {event.bar_index} "
+                    f"reason={event.reason!r}"
+                )
+            pairs.append((stack.pop(), event))
+    if stack:
+        raise DatasetError(
+            f"存在未配对的开仓事件: bar {stack[0].bar_index} reason={stack[0].reason!r}"
+        )
+    return pairs
+
+
+def build_outcome_rows(
+    *,
+    segment: Segment,
+    bars: tuple[Bar, ...],
+    events: Sequence[TradeEvent],
+    tick_size: float,
+    decision_points: Sequence[DecisionPoint] = (),
+) -> list[dict[str, Any]]:
+    """构建一个片段的 outcome 旁挂行（utility-trainer 任务 T1；纯函数）。
+
+    仅覆盖 ``gold ∈ {open_long, open_short}`` 的入选决策记录：开仓事件中
+    ``reason == "decision"`` 者与开仓决策点一一对应（``evaluate_segment`` 仅开仓
+    分支以该 reason 开仓）；``reverse_open`` 开仓（反手）不产生记录、不产出旁挂行
+    （其平仓盈亏由审计恒等式单独核算）。行值语义：
+
+    * ``outcome`` = 配对平仓事件的 ``pnl_ratio``（D6 冻结口径：比值记账，分母 =
+      片段首根开盘价）；
+    * ``risk_ratio`` = (决策 K 线高 − 低 + tick) / 片段首根开盘（决策 K 线当日可知，
+      无未来数据）；
+    * ``r_multiple`` = outcome / risk_ratio（训练权重输入，R 计价与标签体系同口径）；
+    * ``exit_bar_index`` / ``exit_reason`` = 配对平仓事件归属。
+
+    :param decision_points: 生产路径传入 ``SegmentOutcome.decision_points``，
+        逐开仓事件交叉核验「同 bar 存在 selected 的开仓决策点且方向一致」
+        （一一对应防漂移；缺省空序列 = 不做该核验）。
+    :raises DatasetError: 决策 K 线越界 / risk_ratio 非有限正值 / outcome 非有限 /
+        开仓事件与决策点不对应（均不静默）
+    """
+    reference_open = float(bars[0].open)
+    if not reference_open > 0:
+        raise DatasetError(
+            f"片段首根开盘价必须为正数（比值表达的分母）: {bars[0].open!r}"
+        )
+    tick = float(tick_size)
+    if not tick > 0:
+        raise DatasetError(f"tick_size 必须为正数: {tick_size!r}")
+    points_by_bar = {point.bar_index: point for point in decision_points}
+    rows: list[dict[str, Any]] = []
+    for open_event, close_event in pair_open_close_events(events):
+        if open_event.reason != REASON_DECISION:
+            # 反手开仓（reverse_open）：无决策记录，不产出旁挂行
+            continue
+        if not 0 <= open_event.bar_index < len(bars):
+            raise DatasetError(
+                f"开仓事件决策 K 线序号越界: {open_event.bar_index}"
+                f"（片段 {segment.segment_id} 共 {len(bars)} 根）"
+            )
+        if decision_points:
+            point = points_by_bar.get(open_event.bar_index)
+            expected_action = (
+                ACTION_OPEN_LONG if open_event.direction == LONG else ACTION_OPEN_SHORT
+            )
+            if (
+                point is None
+                or not point.selected
+                or point.action != expected_action
+            ):
+                raise DatasetError(
+                    f"开仓事件与开仓决策点不一一对应: "
+                    f"{(segment.segment_id, open_event.bar_index)} "
+                    f"reason={open_event.reason!r} direction={open_event.direction!r}"
+                )
+        bar = bars[open_event.bar_index]
+        outcome = float(close_event.pnl_ratio)
+        risk_ratio = (float(bar.high) - float(bar.low) + tick) / reference_open
+        if not math.isfinite(risk_ratio) or risk_ratio <= 0:
+            raise DatasetError(
+                f"risk_ratio 必须为有限正数: {(segment.segment_id, open_event.bar_index)} "
+                f"risk_ratio={risk_ratio!r}"
+            )
+        if not math.isfinite(outcome):
+            raise DatasetError(
+                f"outcome 必须为有限数值: {(segment.segment_id, open_event.bar_index)} "
+                f"outcome={outcome!r}"
+            )
+        r_multiple = outcome / risk_ratio
+        if not math.isfinite(r_multiple):
+            raise DatasetError(
+                f"r_multiple 必须为有限数值: {(segment.segment_id, open_event.bar_index)} "
+                f"r_multiple={r_multiple!r}"
+            )
+        rows.append(
+            {
+                "id": f"{segment.segment_id}:{open_event.bar_index}",
+                "segment_id": segment.segment_id,
+                "bar_index": open_event.bar_index,
+                "split": segment.split_role,
+                "action": (
+                    ACTION_OPEN_LONG
+                    if open_event.direction == LONG
+                    else ACTION_OPEN_SHORT
+                ),
+                "direction": open_event.direction,
+                "outcome": outcome,
+                "risk_ratio": risk_ratio,
+                "r_multiple": r_multiple,
+                "exit_bar_index": close_event.bar_index,
+                "exit_reason": close_event.reason,
+            }
+        )
+    rows.sort(key=lambda row: row["bar_index"])
+    return rows
+
+
 def _dump_json(payload: Any, *, indent: int | None = None) -> str:
     return json.dumps(
         payload,
@@ -903,6 +1066,11 @@ def generate_dataset(
 
     outcomes: dict[str, SegmentOutcome] = {}
     bars_by_segment: dict[str, tuple[Bar, ...]] = {}
+    # utility-trainer（T1）：outcome 旁挂行（逐片段构建，按 split 累积；仅开仓记录）
+    outcome_rows_by_split: dict[str, list[dict[str, Any]]] = {
+        split: [] for split in SPLIT_ROLES
+    }
+    outcome_rows_by_segment: dict[str, list[dict[str, Any]]] = {}
     # v10：1m K 线按 symbol → segment_id 两级缓存（同 symbol 多片段各自独立序列，
     # 不跨片段延伸），供 check_state_leakage 审计侧联动行独立复算
     bars_by_symbol: dict[str, dict[str, tuple[Bar, ...]]] = {}
@@ -1056,6 +1224,16 @@ def generate_dataset(
         carry_peak_net_value = NET_VALUE_BASE * outcome.final_peak
         outcomes[segment.segment_id] = outcome
         bars_by_segment[segment.segment_id] = bars
+        # utility-trainer（T1）：本片段 outcome 旁挂行（事件流单栈配对；仅开仓记录）
+        segment_outcome_rows = build_outcome_rows(
+            segment=segment,
+            bars=bars,
+            events=outcome.events,
+            tick_size=float(symbols[segment.symbol]),
+            decision_points=outcome.decision_points,
+        )
+        outcome_rows_by_segment[segment.segment_id] = segment_outcome_rows
+        outcome_rows_by_split[segment.split_role].extend(segment_outcome_rows)
         for point, context in prepared:
             records_by_split[segment.split_role].append(
                 build_record(
@@ -1151,6 +1329,23 @@ def generate_dataset(
         )
     split_digests = {name: _sha256_text(text) for name, text in split_texts.items()}
 
+    # utility-trainer（T1/T2）：outcome 旁挂文本 + 落盘前硬校验（审计侧独立复算 /
+    # 逐片段恒等式 / 覆盖一致；违规 raise 不写出任何产物），校验返回审计 outcomes 节
+    outcome_rows = [
+        row for split in SPLIT_ROLES for row in outcome_rows_by_split[split]
+    ]
+    outcomes_text = "".join(_dump_json(row) + "\n" for row in outcome_rows)
+    outcomes_section = check_outcome_sidecar(
+        records_by_split=records_by_split,
+        sidecar_rows=outcome_rows,
+        outcomes_by_segment=outcomes,
+        bars_by_segment=bars_by_segment,
+        tick_size_by_segment={
+            segment_id: float(symbols[outcome.symbol])
+            for segment_id, outcome in outcomes.items()
+        },
+    )
+
     payload = build_audit_payload(
         run_id=run_id,
         params=params,
@@ -1168,11 +1363,14 @@ def generate_dataset(
             for symbol, loaded in daily_loaded_by_symbol.items()
         },
         account_chain=account_chain,
+        outcomes_section=outcomes_section,
+        outcome_sidecar_sha256=_sha256_text(outcomes_text),
     )
     check_audit_consistency(payload, records_by_split)
 
     files: dict[str, str] = dict(split_texts)
     files[AUDIT_FILENAME] = _dump_json(payload, indent=2) + "\n"
+    files[OUTCOMES_FILENAME] = outcomes_text
 
     run_dir = Path(output_dir) / run_id
     digests = _write_files_atomically(run_dir, files)
@@ -1184,6 +1382,9 @@ def generate_dataset(
         audit=payload,
         board_state_skipped=board_state_skipped,
         trend_extreme_skipped=trend_extreme_skipped,
+        outcome_row_counts={
+            split: len(outcome_rows_by_split[split]) for split in SPLIT_ROLES
+        },
     )
 
 
@@ -1192,6 +1393,7 @@ __all__ = [
     "FLAT_CRITERIA",
     "GOLD_LABEL_KIND",
     "HELD_CRITERIA",
+    "OUTCOMES_FILENAME",
     "POSITION_LABELS",
     "QUESTION_ID",
     "QUESTION_INSTRUCTIONS",
@@ -1199,7 +1401,9 @@ __all__ = [
     "STATE_SCHEMA",
     "BoardStateValues",
     "GenerationResult",
+    "build_outcome_rows",
     "build_record",
     "generate_dataset",
+    "pair_open_close_events",
     "render_state",
 ]

@@ -444,10 +444,12 @@ def test_generate_dataset_writes_all_splits_and_passes_mirror_validation(tmp_pat
 
     # v8 净值链（时间序串行回放）：三片段同型亏损使净值加性累计 100 → 97.8 → 95.6，
     # 第 3 片段 bar1 盯市回撤 (100 − 94.4)/100 = 5.6% ≥ 阈值 5% → 死亡吸收态
-    # （检出当根强平、episode 结束、当根不产决策样本）→ test 片段只产出 bar0 一条记录
+    # （检出当根强平、episode 结束、当根不产决策样本）→ test 片段只产出 bar0 一条记录。
+    # label-band-sampling：train/dev = 事件 + 前看（每段 bar0 = 开仓事件入选，
+    # bar1 = hold 非事件/非前导 → excluded_holding）→ 每片段只产 bar0 一条记录
     assert result.record_counts == {
-        "train": 2,
-        "dev": 2,
+        "train": 1,
+        "dev": 1,
         "calibration": 0,
         "test": 1,
         "ood": 0,
@@ -459,13 +461,13 @@ def test_generate_dataset_writes_all_splits_and_passes_mirror_validation(tmp_pat
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
         assert all(row["split"] == split for row in rows)
         records.extend(rows)
-    assert len(records) == 5
+    assert len(records) == 3
     _mirror_nanojev_validate(records)
 
     assert (result.run_dir / AUDIT_FILENAME).is_file()
     assert result.audit["schema"] == "marketsense.episode_audit.v1"
-    assert result.audit["totals"]["selected"] == 5
-    assert result.audit["per_split"]["train"] == {"records": 2, "questions": 2}
+    assert result.audit["totals"]["selected"] == 3
+    assert result.audit["per_split"]["train"] == {"records": 1, "questions": 1}
 
 
 def test_generate_dataset_records_follow_manifest_and_bar_order(tmp_path: Path) -> None:
@@ -476,8 +478,9 @@ def test_generate_dataset_records_follow_manifest_and_bar_order(tmp_path: Path) 
         for line in (result.run_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()
     ]
 
-    assert [row["id"] for row in train_rows] == ["seg-train:0", "seg-train:1"]
-    assert [row["gold"][QUESTION_ID] for row in train_rows] == [ACTION_OPEN_LONG, ACTION_HOLD]
+    # train 新采样：bar0 = 开仓事件入选；bar1 = hold 非事件/非前导 → 剩除
+    assert [row["id"] for row in train_rows] == ["seg-train:0"]
+    assert [row["gold"][QUESTION_ID] for row in train_rows] == [ACTION_OPEN_LONG]
 
 
 # --------------------------------------------------------------------------- #
@@ -518,9 +521,9 @@ def test_cross_segment_net_value_chain_carries_across_segments(tmp_path: Path) -
         output_dir=tmp_path / "out",
     )
 
-    assert result.record_counts["train"] == 3
-    assert result.record_counts["dev"] == 3
-    assert result.record_counts["test"] == 3
+    assert result.record_counts["train"] == 1  # bar0 = 开仓事件；bar1/bar2 hold → 剩除
+    assert result.record_counts["dev"] == 1
+    assert result.record_counts["test"] == 3  # test 维持平带：全入
     chain = {
         entry["segment_id"]: entry.get("account_chain")
         for entry in result.audit["per_segment"]
@@ -584,13 +587,14 @@ def test_drawdown_formula_locked_to_carried_peak_across_segments(tmp_path: Path)
     # seg-dev 首决策点：权益 1.058、峰值起点 = 上一片段末峰值 1.078（净值 107.8）
     # → 回撤 = (107.8 − 105.8) / 107.8 = 0.0185528…（若峰值不延续将得 0.000000）
     assert "回撤=0.018553" in by_id["seg-dev:0"]["state"]
-    # 同片段下一决策点（权益 1.046）：(107.8 − 104.6) / 107.8 = 0.0296846…（分母锁定
-    # 峰值而非当前净值：若误用权益作分母将得 0.011342）
-    assert "回撤=0.029685" in by_id["seg-dev:1"]["state"]
+    # 同公式在 seg-test 的第 2 个决策点（权益 1.104）：(113.6 − 110.4) / 113.6 =
+    # 0.0281690…（分母锁定峰值而非当前净值：若误用权益作分母将得 0.028986）
+    # —— seg-dev:1 同型点（0.029685）在 train/dev 新采样下剩除，改由 test 段验证
+    assert "回撤=0.028169" in by_id["seg-test:1"]["state"]
     # seg-test 首决策点：峰值起点 = seg-dev 末峰值 113.6 → (113.6 − 111.6) / 113.6 = 0.0176056…
     assert "回撤=0.017606" in by_id["seg-test:0"]["state"]
-    # 盯市权益超过延续峰值 → 峰值上移、回撤归零；seg-dev bar2：权益 1.136 > 1.078）
-    assert "净值=113.600000 今日=7.800000 回撤=0.000000" in by_id["seg-dev:2"]["state"]
+    # 盯市权益超过延续峰值 → 峰值上移、回撤归零；seg-test bar2：权益 1.194 > 1.136）
+    assert "净值=119.400000 今日=7.800000 回撤=0.000000" in by_id["seg-test:2"]["state"]
 
 
 def test_check_no_absolute_values_exempts_account_line_only() -> None:

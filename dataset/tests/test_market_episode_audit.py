@@ -371,17 +371,42 @@ def test_audit_payload_totals_match_scenario(tmp_path: Path) -> None:
 
     totals = result.audit["totals"]
     assert totals["segments"] == 3
-    assert totals["selected"] == len(records) == 6
+    # train/dev = 事件 + 前看（每段只利 bar0 开仓事件，bar1 hold → excluded_holding、
+    # bar3 空仓 → excluded_flat）；test = 平带（bar0 + bar1 入选，bar3 剩除）
+    assert totals["selected"] == len(records) == 4
     assert totals["stop_exits"] == 3
     assert totals["deaths"] == 0
-    assert totals["decision_points"] == totals["selected"] + totals["excluded_flat"]
+    assert totals["decision_points"] == 9
+    assert (
+        totals["decision_points"]
+        == totals["selected"] + totals["excluded_flat"] + totals["excluded_holding"]
+    )
     assert sum(1 for row in records if row["gold"]["next_action"] == "open_long") == 3
-    assert sum(1 for row in records if row["gold"]["next_action"] == "hold") == 3
+    assert sum(1 for row in records if row["gold"]["next_action"] == "hold") == 1
     assert result.audit["params"]["flat_sample_band_minutes"] == 2
+    assert result.audit["params"]["event_lookforward_open"] == 2
+    assert result.audit["params"]["event_lookforward_exit"] == 10
     assert result.audit["frozen_decisions"]["reference_price"] == "segment_first_bar_open"
     assert set(result.audit["outputs"]["split_files"]) == {
         f"{split}.jsonl" for split in SPLIT_ROLES
     }
+
+
+def test_audit_per_segment_records_excluded_holding(tmp_path: Path) -> None:
+    """逐片段审计含 excluded_holding，且恒等式在片段级成立；train 与 test
+    同型片段在双机制下产出不同计数（train 1 条、test 2 条）。"""
+    _, _, _, _, result, _, _ = _workspace_and_records(tmp_path)
+
+    per_segment = {entry["segment_id"]: entry for entry in result.audit["per_segment"]}
+    assert per_segment["seg-train"]["selected"] == 1
+    assert per_segment["seg-train"]["excluded_holding"] == 1
+    assert per_segment["seg-train"]["excluded_flat"] == 1
+    assert per_segment["seg-test"]["selected"] == 2
+    assert per_segment["seg-test"]["excluded_holding"] == 0
+    for entry in result.audit["per_segment"]:
+        assert entry["decision_points"] == (
+            entry["selected"] + entry["excluded_flat"] + entry["excluded_holding"]
+        )
 
 
 def test_check_audit_consistency_detects_tampered_counts(tmp_path: Path) -> None:
@@ -397,10 +422,46 @@ def test_check_audit_consistency_detects_question_count_mismatch() -> None:
     payload = {
         "per_split": {split: {"records": 0, "questions": 0} for split in SPLIT_ROLES},
         "per_segment": [],
-        "totals": {"selected": 0},
+        "totals": {"selected": 0, "decision_points": 0, "excluded_flat": 0,
+                   "excluded_holding": 0},
     }
     payload["per_split"]["train"]["questions"] = 1
 
+    with pytest.raises(DatasetError, match="不一致"):
+        check_audit_consistency(payload, {split: [] for split in SPLIT_ROLES})
+
+
+def test_check_audit_consistency_detects_identity_violation() -> None:
+    """恒等式硬门（两层级）：decision_points ≠ selected + excluded_flat +
+    excluded_holding → DatasetError（per_segment 求和与 totals 各查一道）。"""
+    base_totals = {"selected": 2, "decision_points": 3, "excluded_flat": 1,
+                   "excluded_holding": 0}
+
+    def _payload(totals: dict) -> dict:
+        return {
+            "per_split": {split: {"records": totals["selected"], "questions": totals["selected"]}
+                          for split in SPLIT_ROLES},
+            "per_segment": [],
+            "totals": totals,
+        }
+
+    # totals 级：holding 计数被篡改 → 恒等式破裂
+    tampered = dict(base_totals, excluded_holding=1)
+    with pytest.raises(DatasetError, match="不一致"):
+        check_audit_consistency(_payload(tampered), {split: [] for split in SPLIT_ROLES})
+
+    # per_segment 级：totals 一致但片段级恒等式破裂 → 同样拒绝
+    per_segment = [
+        {"segment_id": f"seg-{i}", "decision_points": 3, "selected": 2,
+         "excluded_flat": 1, "excluded_holding": 1}  # 3 ≠ 2 + 1 + 1
+        for i in range(3)
+    ]
+    payload = {
+        "per_split": {split: {"records": 6, "questions": 6} for split in SPLIT_ROLES},
+        "per_segment": per_segment,
+        "totals": {"selected": 6, "decision_points": 9, "excluded_flat": 3,
+                   "excluded_holding": 0},
+    }
     with pytest.raises(DatasetError, match="不一致"):
         check_audit_consistency(payload, {split: [] for split in SPLIT_ROLES})
 

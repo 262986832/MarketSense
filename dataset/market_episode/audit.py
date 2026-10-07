@@ -97,16 +97,20 @@ GOLD_LABEL_KINDS = frozenset(
 #: v11 起联动行升为品种化联动（无联动品种 = ``联动: <主显示名>（突破=<主值>）``；
 #: 有联动品种 = 每联动品种 ``，<联动显示名>（突破=<联动值>）`` 段（全角逗号连接）+
 #: 首个联动品种 `` 相关度=<r>``；交集对齐（主品种窗口 × 联动品种按时间戳保序交集）+
-#: secondary 侧三态加权 + 主/联动相邻对三态信号皮尔逊 r（有效对 < 2 或零方差 → na）；
+#: secondary 侧三态加权 + 主/联动相邻对三态信号皮尔逊 r（有效对 < 2 或零方差 → na）;
 #: 显示名 = 去交易所前缀原样保留），state_template 追加 +linkage_symbol 标记并新增
 #: linkage_symbol 键（breakthrough 键保留不动），AUDIT_SCHEMA 仍保持 v1）
+#: label-band-sampling 起（2026-10-06）采样机制升级为双机制：train/dev = 事件 +
+#: 紧邻其前 N 条决策记录（按标签类型 open/exit 分别配置），其余 split 维持机会分钟
+#: 周边 ± 平带；冻结决策键 ``flat_sample_band`` 替换为 ``event_lookforward_sampling``
+#: （状态文本不变：state_template 标记与 AUDIT_SCHEMA 均不动）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
     "state_template": "marketsense.episode_state.v11:decision_bar_only+board_state+daily_trend_extremes+account_net_value+breakthrough_momentum+linkage_symbol",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "net_value_base_100:equity=100*(1+cum_ratio_pnl),1_lot=1_notional,no_multiplier,no_fees",
-    "flat_sample_band": "configurable_minutes_around_opportunity_minutes",
+    "event_lookforward_sampling": "train_dev_event_plus_preceding_n_decision_records_by_label_type_other_splits_flat_band_around_opportunities",
     "initial_state": "first_bar_is_first_decision_point,flat,peak=initial_net_value",
     "reversal_condition_2": "stop_reached_first_or_scan_end_without_exceeding_current_bar",
     "board_state_prev_day": "daily_file_1d_prev_trading_day_over_segment_first_open",
@@ -1331,6 +1335,7 @@ def build_audit_payload(
             "decision_points": len(outcome.decision_points),
             "selected": len(outcome.selected),
             "excluded_flat": outcome.excluded_flat,
+            "excluded_holding": outcome.excluded_holding,
             "stop_exit_bars": list(outcome.stop_exits),
             "deaths": [event.bar_index for event in outcome.deaths],
             "death_forced_close": [event.forced_close for event in outcome.deaths],
@@ -1375,6 +1380,9 @@ def build_audit_payload(
             "selected": sum(len(outcome.selected) for outcome in outcomes.values()),
             "excluded_flat": sum(
                 outcome.excluded_flat for outcome in outcomes.values()
+            ),
+            "excluded_holding": sum(
+                outcome.excluded_holding for outcome in outcomes.values()
             ),
             "stop_exits": sum(len(outcome.stop_exits) for outcome in outcomes.values()),
             "deaths": sum(len(outcome.deaths) for outcome in outcomes.values()),
@@ -1429,18 +1437,29 @@ def check_audit_consistency(
         entry["selected"] for entry in payload["per_segment"]
     )
     decision_points = sum(entry["decision_points"] for entry in payload["per_segment"])
-    excluded = sum(entry["excluded_flat"] for entry in payload["per_segment"])
+    excluded_flat = sum(entry["excluded_flat"] for entry in payload["per_segment"])
+    excluded_holding = sum(entry["excluded_holding"] for entry in payload["per_segment"])
     _require(
         selected == total_records,
         f"审计 selected={selected} 与总记录数 {total_records} 不一致",
     )
     _require(
-        decision_points == selected + excluded,
-        f"审计 decision_points={decision_points} 与 selected+excluded="
-        f"{selected + excluded} 不一致",
+        decision_points == selected + excluded_flat + excluded_holding,
+        f"审计 decision_points={decision_points} 与 "
+        f"selected+excluded_flat+excluded_holding="
+        f"{selected + excluded_flat + excluded_holding} 不一致",
+    )
+    # totals 级同步（与 per_segment 求和逐键一致）
+    totals = payload["totals"]
+    _require(
+        totals["decision_points"]
+        == totals["selected"] + totals["excluded_flat"] + totals["excluded_holding"],
+        f"审计 totals.decision_points={totals['decision_points']} 与 "
+        f"totals.selected+excluded_flat+excluded_holding="
+        f"{totals['selected'] + totals['excluded_flat'] + totals['excluded_holding']} 不一致",
     )
     _require(
-        payload["totals"]["selected"] == total_records,
+        totals["selected"] == total_records,
         "审计 totals.selected 与记录数不一致",
     )
 

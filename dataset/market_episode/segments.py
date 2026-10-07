@@ -15,8 +15,12 @@
    （见 :mod:`dataset.market_episode.labels`）；
 4. 权益/回撤记账 = **比值化记账**：初始权益 1.0（= 1 单位名义），1 手 = 1 单位名义，
    不计合约乘数 / 保证金 / 手续费（1 tick 不利滑点已内嵌于成交模型）；
-5. (b) 采样带宽默认 **2 分钟**（``flat_sample_band_minutes``，可配置）；片段首根即
-   首个决策 K 线，账户初始空仓、权益峰值 = 初始权益；
+5. (b) 采样 = **双机制**（label-band-sampling 任务用户拍板，2026-10-06）：train/dev
+   = 事件（开仓/平仓/反手决策记录）+ 紧邻其前 N 条决策记录（按标签类型：open 类
+   ``event_lookforward_open`` 默认 2、exit 类 ``event_lookforward_exit`` 默认 10；
+   单位 = 决策记录条数）；test/calibration/ood 维持机会分钟周边 ±
+   ``flat_sample_band_minutes``（默认 2 分钟）平带；片段首根即首个决策 K 线，
+   账户初始空仓、权益峰值 = 初始权益；
 6. 反转条件②在前向扫描中的定义：**先到止损价 → 成立**；扫描到片段末既未超当前
    K 线也未触止损 → **同样成立**（持仓按片段末强平结算）。
 
@@ -86,6 +90,8 @@ _EPISODE_KEYS: Final[tuple[str, ...]] = (
     "reward_risk_threshold",
     "price_precision",
     "flat_sample_band_minutes",
+    "event_lookforward_open",
+    "event_lookforward_exit",
     "breakthrough_window",
     "breakthrough_period",
     "linkage_symbols",
@@ -96,6 +102,8 @@ _PARAM_KEYS: Final[tuple[str, ...]] = (
     "reward_risk_threshold",
     "price_precision",
     "flat_sample_band_minutes",
+    "event_lookforward_open",
+    "event_lookforward_exit",
     "breakthrough_window",
     "breakthrough_period",
 )
@@ -165,8 +173,16 @@ class EpisodeParams:
     reward_risk_threshold: float = 3.0
     #: 模型可见比值的小数位（冻结：6 位）
     price_precision: int = 6
-    #: (b) 采样带宽：机会分钟周边 ± N 个空仓分钟的"不做"样本
+    #: (b) 采样带宽（test/calibration/ood 生效）：机会分钟周边 ± N 个空仓分钟的
+    # "不做"样本
     flat_sample_band_minutes: int = 2
+    #: (b) 采样（train/dev 生效，label-band-sampling 任务拍板）：开仓类事件
+    # （open_long/open_short）前看的决策记录条数（默认 2）。单位 = 决策记录条数；
+    # 程序止损离场/死亡分钟不产生决策记录，不计入 N
+    event_lookforward_open: int = 2
+    #: (b) 采样（train/dev 生效）：离场类事件（close/reverse）前看的决策记录条数
+    # （默认 10）。单位与边界同 ``event_lookforward_open``
+    event_lookforward_exit: int = 10
     #: 联动行突破动量窗口（最近 N 根已收盘 K 线/桶的相邻对加权，默认 20）
     breakthrough_window: int = 20
     #: 联动行突破动量的 K 线粒度（1m 直接用决策序列；5m/15m/1h 重采样；1d 拒绝）
@@ -181,6 +197,8 @@ class EpisodeParams:
             "reward_risk_threshold": self.reward_risk_threshold,
             "price_precision": self.price_precision,
             "flat_sample_band_minutes": self.flat_sample_band_minutes,
+            "event_lookforward_open": self.event_lookforward_open,
+            "event_lookforward_exit": self.event_lookforward_exit,
             "breakthrough_window": self.breakthrough_window,
             "breakthrough_period": self.breakthrough_period,
             "linkage_symbols": list(self.linkage_symbols),
@@ -486,6 +504,12 @@ def load_episode_params(section: Mapping[str, Any], *, where: str) -> EpisodePar
     band = defaults.flat_sample_band_minutes
     if "flat_sample_band_minutes" in section:
         band = _nonnegative_int(section, "flat_sample_band_minutes", where=where)
+    event_open = defaults.event_lookforward_open
+    if "event_lookforward_open" in section:
+        event_open = _nonnegative_int(section, "event_lookforward_open", where=where)
+    event_exit = defaults.event_lookforward_exit
+    if "event_lookforward_exit" in section:
+        event_exit = _nonnegative_int(section, "event_lookforward_exit", where=where)
     window = defaults.breakthrough_window
     if "breakthrough_window" in section:
         window = _nonnegative_int(section, "breakthrough_window", where=where)
@@ -533,6 +557,8 @@ def load_episode_params(section: Mapping[str, Any], *, where: str) -> EpisodePar
         reward_risk_threshold=float(reward_risk),
         price_precision=int(precision),
         flat_sample_band_minutes=int(band),
+        event_lookforward_open=int(event_open),
+        event_lookforward_exit=int(event_exit),
         breakthrough_window=int(window),
         breakthrough_period=str(period),
         linkage_symbols=linkage_symbols,

@@ -371,3 +371,122 @@ def test_episode_generate_missing_turning_points_file_fails(tmp_path: Path, caps
     assert "转折点文件不存在" in captured.err
     assert str(workspace.turning_points_path) in captured.err
     assert not (tmp_path / "out").exists()
+
+
+# --------------------------------------------------------------------------- #
+# 采样参数 CLI 覆盖（label-band-sampling）：--event-lookforward-open/exit
+# --------------------------------------------------------------------------- #
+#: train 段 7 根：bar0-4 空仓 + bar5 大阳线开仓事件 + bar6 持有；窗口大小决定
+#: 多少条前导记录入选（N=2 → 3 条 / N=5 → 6 条）
+_OVERRIDE_ROWS = [
+    (100, 100.2, 99.8, 100),
+    (100, 100.3, 99.7, 100.1),
+    (100, 100.4, 99.6, 100.2),
+    (100, 100.5, 99.5, 100.3),
+    (100, 100.6, 99.4, 100.4),
+    (100, 110, 99, 109.5),
+    (110, 160, 109, 155),
+    # dev/test 段各 2 根：无机会分钟 → 无事件 → 全部剔除
+    (100, 110, 100, 109),
+    (100, 110, 100, 109),
+    (100, 110, 100, 109),
+    (100, 110, 100, 109),
+]
+
+
+def _episode_generate(capsys, tmp_path: Path, config_path: Path, manifest: Path,
+                      output_dir: Path, *extra_args: str):
+    code = main(
+        [
+            "episode-generate",
+            "--segments",
+            str(manifest),
+            "--config",
+            str(config_path),
+            "--output-dir",
+            str(output_dir),
+            *extra_args,
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == EXIT_OK, captured.err
+    (run_dir,) = sorted(output_dir.glob("run-*"))
+    audit = json.loads((run_dir / AUDIT_FILENAME).read_text(encoding="utf-8"))
+    train_rows = [
+        json.loads(line)
+        for line in (run_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    return audit, train_rows
+
+
+def test_episode_generate_cli_overrides_event_lookforward_config(
+    tmp_path: Path, capsys
+) -> None:
+    """CLI 覆盖配置文件（config event_lookforward_open=5 + CLI 2 → 审计 params=2），
+    且采样行为随覆盖改变（train 入选 3 条 vs 配置值下的 6 条）。"""
+    workspace = build_workspace(
+        tmp_path, _OVERRIDE_ROWS, episode={"event_lookforward_open": 5}
+    )
+    manifest = write_manifest(
+        tmp_path / "segments.jsonl",
+        [
+            segment_record("seg-train", "train", start_index=0, end_index=6),
+            segment_record("seg-dev", "dev", start_index=7, end_index=8),
+            segment_record("seg-test", "test", start_index=9, end_index=10),
+        ],
+    )
+
+    # 配置文件值 5：bar5 事件的前 5 条记录全部入选
+    audit_config, train_rows_config = _episode_generate(
+        capsys, tmp_path, workspace.config_path, manifest, tmp_path / "out-config"
+    )
+    assert audit_config["params"]["event_lookforward_open"] == 5
+    assert audit_config["params"]["event_lookforward_exit"] == 10
+    assert len(train_rows_config) == 6
+    assert train_rows_config[0]["id"] == "seg-train:0"
+
+    # CLI 2 覆盖配置 5：审计 params = 2，train 只入选事件前 2 条记录
+    audit_cli, train_rows_cli = _episode_generate(
+        capsys,
+        tmp_path,
+        workspace.config_path,
+        manifest,
+        tmp_path / "out-cli",
+        "--event-lookforward-open",
+        "2",
+    )
+    assert audit_cli["params"]["event_lookforward_open"] == 2
+    assert audit_cli["params"]["event_lookforward_exit"] == 10  # 未给 CLI → 配置/默认
+    assert len(train_rows_cli) == 3
+    assert [row["id"] for row in train_rows_cli] == [
+        "seg-train:3",
+        "seg-train:4",
+        "seg-train:5",
+    ]
+
+
+def test_episode_generate_rejects_negative_event_lookforward(
+    tmp_path: Path, capsys
+) -> None:
+    """负数窗口 → 用法错误（退出码 2），不产出任何产物。"""
+    workspace = build_workspace(tmp_path, _ROWS)
+    output_dir = tmp_path / "out"
+
+    code = main(
+        [
+            "episode-generate",
+            "--segments",
+            str(workspace.manifest),
+            "--config",
+            str(workspace.config_path),
+            "--output-dir",
+            str(output_dir),
+            "--event-lookforward-open",
+            "-1",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == EXIT_USAGE
+    assert "非负整数" in captured.err
+    assert not output_dir.exists()

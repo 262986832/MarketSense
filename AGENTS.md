@@ -144,25 +144,51 @@ MarketSense 是一个**研究型**项目，研究问题：
   + `linkage_symbol` 审计键 + state_template 追加 +linkage_symbol 标记）
   （`STATE_SCHEMA = marketsense.episode_state.v11`；完整语义见
   `artifacts/linkage-symbol/02-design/tech-design.md`）。
+  2026-10-06 拍板采样机制升级（label-band-sampling 任务；**非状态模板变更**，v11 行结构与
+  `STATE_SCHEMA`/`QUESTION_SCHEMA` 均不变）：train/dev 采样从「机会分钟 ±2 平带」升为
+  「事件记录 + 同片段紧邻其前 N 条决策记录」——事件 = gold ∈ {open_long, open_short}（open 类）
+  / {close, reverse}（exit 类），事件包含自身；前导窗口按标签类型配置（open 类默认 N=2、
+  exit 类默认 N=10，**单位 = 决策记录条数**：程序止损离场/死亡分钟不产生决策记录、不占窗口
+  槽位；窗口不跨片段；多重前导去重为单一 `event_lead`）；未被任何事件窗口覆盖的持仓分钟
+  剔除（审计新键 `excluded_holding`）；**test/calibration/ood 维持原 ±2 平带且产物逐字节不变**
+  （需求 D3 澄清：test 保持现状构建，非全时间线）。配置双入口：
+  `episode.event_lookforward_open/exit`（写 0 = 应急退到「仅事件记录」）+ CLI
+  `--event-lookforward-open/--event-lookforward-exit`（CLI 覆盖配置文件，非法值退出 2）。
+  审计同步：params 两键入 run_id 哈希、恒等式升级 `decision_points = selected +
+  excluded_flat + excluded_holding`（per_segment 求和与 totals 两级校验）、
+  `FROZEN_DECISIONS` 的 `flat_sample_band` 键替换为 `event_lookforward_sampling`
+  （`AUDIT_SCHEMA` 保持 v1）；账户域零改动（采样发生在 gold 回放与账户值计算之后）。
+  实测（run-828447b7fd1e）：train hold:(close+reverse) 从 117:1 降到恰 10:1（350:35），
+  稀有类零丢失（train 11/8/18/17、dev 11）；完整语义见
+  `artifacts/label-band-sampling/02-design/tech-design.md`。
   完整语义与实现阶段冻结项见 `artifacts/nanojev-training-data/02-design/tech-design.md`。
 - **首轮真实数据（2026-10-01 生成；2026-10-02 v2~v7 状态模板 + 候选文案精简；
   2026-10-03 v8 账户行六键 + 跨片段净值链；同日 v9 日线行趋势项升级；
-  2026-10-04 v10 联动行升突破动量；2026-10-05 v11 联动行升品种化联动，均通过契约校验）**：
+  2026-10-04 v10 联动行升突破动量；2026-10-05 v11 联动行升品种化联动；
+  2026-10-06 label-band-sampling 采样机制升级，均通过契约校验）**：
   DCE.v2701（PVC）2026-09 全月 21 个交易日片段（`data/segments/sep2026.jsonl`：
   train 9-1~9-18 / dev 9-21~9-24 / test 9-28~9-30，按时间顺序切分，夜盘归属其交易所交易日）→
-  当前产物 `data/nanojev_dataset/run-8886261c37d7/`（模板 v11：联动行升品种化联动
+  v11 模板 run `data/nanojev_dataset/run-8886261c37d7/`（联动行升品种化联动
   `联动: v2701（突破=<主值>）, sc2611（突破=<sc值>） 相关度=<r>`，主品种突破值与 v10
   逐值一致，其余五行与 v10 逐字节同构（v9：日线行趋势项升为涨势/跌势各 2 项 + 三分支趋势状态
   + 状态时长；账户行六键与 v8 同构；日内/现价/盘口沿用 v7），
   **train 4188 / dev 886 / test 655 = 5729**，全部非空；**21/21 片段全保留、0 告警**；
-  净值链 100 → train 末 155.041756 → dev 末 160.000608 → test 末 166.489676（deaths=0，与 v9/v10 一致）；
   与 v10 run 逐值比对：5729/5729 仅第 0 行 schema 标记与第 4 行联动行变化，主段值逐值一致，账户链 21 段逐段相等；
   sc2611 1m 数据免费版窗口 09-04 23:21 起，09-01~09-04 联动值为 na 属预期；
-  三轮生成快照逐文件 diff 一致，NanoJev 原生 `--validate-only` 契约硬门通过；
-  磁盘现存 7 个 run：当前 v11 run + `run-d14277ebcf70/`（模板 v10）+ `run-de0026683ce6/`（模板 v9）+
+  三轮生成快照逐文件 diff 一致。
+  **2026-10-06 起当前产物 `data/nanojev_dataset/run-828447b7fd1e/`**（label-band-sampling
+  采样机制升级，状态模板仍 v11）：**train 435 / dev 89 / test 655 = 1179**，全部非空、
+  21/21 片段全保留 0 告警；train hold:(close+reverse) = 350:35（恰 10:1，基线 117:1），
+  稀有类零丢失（open_long 11 / open_short 8 / close 18 / reverse 17；dev 11）；
+  `test.jsonl` 与 run-8886261c37d7 **sha256 逐字节一致**（账户域不受采样影响的实测锚点）；
+  净值链 100 → train 末 155.041756 → dev 末 160.000608 → test 末 166.489676（deaths=0，
+  与 v9/v10/v11 一致）；审计恒等式 7125 = 1179 + 1396 + 4550 两级成立；
+  同参数双跑同 run_id、产物 sha256 逐文件一致；NanoJev 原生 `--validate-only` 契约硬门通过。
+  磁盘现存 8 个 run：当前采样升级 run `run-828447b7fd1e` + v11 模板 run `run-8886261c37d7` +
+  `run-d14277ebcf70/`（模板 v10）+ `run-de0026683ce6/`（模板 v9）+
   历史 `run-c364ea4a30ac/`（模板 v8）、`run-4f1cd33a3cfe/`（模板 v7）、`run-6ae3e38289a3/`（模板 v6）、
   `run-7cbd6516d46f/`（模板 v5，更早的 v1~v4 run 已由用户会话清理）。
-  七个 run 的 NanoJev 原生 `--validate-only` 契约硬门均通过。`tick_size = 5` 为**用户确认值**
+  八个 run 的 NanoJev 原生 `--validate-only` 契约硬门均通过。`tick_size = 5` 为**用户确认值**
   （公开资料记载最小变动价位 1 元/吨，按用户确认执行，见 `dataset/config/symbols.local.yaml`）。
   Mac Intel 16G（无 CUDA）已完成数据通路三级 CPU 冒烟（`--self-check` / tokenize / 前向，
   全部通过）；**训练与推理入口硬性要求 CUDA，本机不可训练**（详见 `README.md` §7.4）。
@@ -175,7 +201,8 @@ MarketSense 是一个**研究型**项目，研究问题：
 
 > 已知未修复缺陷：空 split 静默通过（三个 `{split}.jsonl` 全 0 字节仍退出 0）——
 > 生成后必须自行确认 `train`/`dev`/`test` 非空，否则 NanoJev trainer 会拒绝
-> （2026-10-01 九月运行已自查非空：4188/886/655；该提醒仍适用于任何新清单）。
+> （2026-10-01 九月运行已自查非空：4188/886/655；2026-10-06 采样升级 run 已自查非空：
+> 435/89/655；该提醒仍适用于任何新清单）。
 > 详见 `artifacts/nanojev-training-data/04-test/test-report.md`。
 
 ---

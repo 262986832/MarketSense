@@ -328,6 +328,8 @@ def test_load_episode_params_defaults_and_overrides() -> None:
         "reward_risk_threshold": 3.0,
         "price_precision": 6,
         "flat_sample_band_minutes": 2,
+        "event_lookforward_open": 2,
+        "event_lookforward_exit": 10,
         "breakthrough_window": 20,
         "breakthrough_period": "1m",
         "linkage_symbols": [],
@@ -339,6 +341,8 @@ def test_load_episode_params_defaults_and_overrides() -> None:
             "reward_risk_threshold": 2.5,
             "price_precision": 4,
             "flat_sample_band_minutes": 0,
+            "event_lookforward_open": 5,
+            "event_lookforward_exit": 0,
         },
         where="测试配置段",
     )
@@ -348,6 +352,8 @@ def test_load_episode_params_defaults_and_overrides() -> None:
         reward_risk_threshold=2.5,
         price_precision=4,
         flat_sample_band_minutes=0,
+        event_lookforward_open=5,
+        event_lookforward_exit=0,
     )
 
 
@@ -360,6 +366,8 @@ def test_load_episode_params_defaults_and_overrides() -> None:
         ({"reward_risk_threshold": -1}, "必须为正数"),
         ({"price_precision": 13}, "必须 ≤ 12"),
         ({"flat_sample_band_minutes": -1}, "必须为非负整数"),
+        ({"event_lookforward_open": -1}, "必须为非负整数"),
+        ({"event_lookforward_exit": -1}, "必须为非负整数"),
     ],
 )
 def test_load_episode_params_rejects_invalid(section: dict, message: str) -> None:

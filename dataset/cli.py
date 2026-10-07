@@ -17,6 +17,7 @@ board-state    离线读取已落盘 1m/1d K 线 → 盘面状态 CSV + sidecar�
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -191,6 +192,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="日线折点目录（v5 日线行 trend 四值数据源；默认 <data_dir>/../turning_points）",
     )
+    episode.add_argument(
+        "--event-lookforward-open",
+        dest="event_lookforward_open",
+        type=int,
+        metavar="N",
+        default=None,
+        help="覆盖配置文件 episode.event_lookforward_open（train/dev 开仓类事件前看 N 条决策记录；单位 = 决策记录条数；仅 train/dev 生效）",
+    )
+    episode.add_argument(
+        "--event-lookforward-exit",
+        dest="event_lookforward_exit",
+        type=int,
+        metavar="N",
+        default=None,
+        help="覆盖配置文件 episode.event_lookforward_exit（train/dev 离场类事件前看 N 条决策记录；单位 = 决策记录条数；仅 train/dev 生效）",
+    )
     episode.add_argument("--config", dest="config", metavar="FILE", help="配置文件（YAML）")
 
     board = subparsers.add_parser(
@@ -332,6 +349,16 @@ def _extract_turning_points(
 def _run_episode_generate(args: argparse.Namespace) -> int:
     """``episode-generate``：离线生成 episode 训练数据（不联网、不触天勤凭证）。"""
     config = load_episode_config(args.config)
+    # 采样参数 CLI 覆盖（label-band-sampling）：CLI 给值优先于配置文件/内置默认；
+    # 非法值（负数/非整数）在进入生成前拒绝（UsageError → 退出码 2）
+    params = config.params
+    for name in ("event_lookforward_open", "event_lookforward_exit"):
+        value = getattr(args, name)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise UsageError(f"--{name.replace('_', '-')} 必须为非负整数，实际: {value!r}")
+        params = dataclasses.replace(params, **{name: value})
     segments = load_segments(Path(args.segments))
     symbols = load_symbols_config(config.symbols_path)
     output_dir = Path(args.output_dir) if args.output_dir else config.output_dir
@@ -346,7 +373,7 @@ def _run_episode_generate(args: argparse.Namespace) -> int:
         segments,
         symbols=symbols,
         data_dir=config.data_dir,
-        params=config.params,
+        params=params,
         output_dir=output_dir,
         daily_turning_points_dir=daily_turning_points_dir,
     )

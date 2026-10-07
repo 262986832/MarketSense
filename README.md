@@ -435,6 +435,8 @@ python -m dataset episode-generate --segments data/segments/my_segments.jsonl \
 |---|---|
 | `--segments FILE` | 必填。片段清单 JSONL（每行一个片段 = 一个 episode） |
 | `--daily-turning-points-dir DIR` | 日线折点输入目录（v5 日线行 trend 四值数据源；默认 `<data_dir>/../turning_points`，与 `turning-points` 子命令落盘布局一致；目录内缺 `{symbol}_1d.csv` 报错退出 1） |
+| `--event-lookforward-open N` | 覆盖配置 `episode.event_lookforward_open`（train/dev 开仓类事件前看 N 条决策记录；单位 = 决策记录条数；非负整数，非法值退出 2；label-band-sampling） |
+| `--event-lookforward-exit N` | 覆盖配置 `episode.event_lookforward_exit`（train/dev 离场类事件前看 N 条决策记录；单位与边界同上） |
 | `--output-dir DIR` | 产物根目录（默认取配置 `episode.output_dir`，否则 `data/nanojev_dataset`） |
 | `--config FILE` | 配置文件（YAML；未给时依次取 `MARKETSENSE_DATASET_CONFIG`、`dataset/config/tianqin.local.yaml`，再退回内置默认值） |
 
@@ -455,7 +457,9 @@ episode:
   reward_risk_threshold: 3            # 开仓/反手盈亏比阈值（严格大于；冻结默认 3）
   drawdown_threshold: 0.05            # 账户回撤死亡阈值（冻结默认 5%）
   price_precision: 6                  # 模型可见比值小数位（冻结默认 6）
-  flat_sample_band_minutes: 2         # (b) 采样“不做”带宽度（分钟）
+  flat_sample_band_minutes: 2         # (b) 采样“不做”带宽度（分钟；仅 test/calibration/ood 生效）
+  event_lookforward_open: 2           # (b) 采样（train/dev）：开仓类事件前看 N 条决策记录
+  event_lookforward_exit: 10          # (b) 采样（train/dev）：离场类事件前看 N 条决策记录
   breakthrough_window: 20             # 联动行突破动量窗口（最近 N 根已收盘 K 线/桶，v10）
   breakthrough_period: "1m"           # 联动行突破动量粒度（1m/5m/15m/1h；1d 拒绝；v10）
   linkage_symbols: []                 # v11 联动品种清单（如 ["INE.sc2611"]；空 = 无联动段）
@@ -534,6 +538,19 @@ episode:
   持仓 `close=平仓 / hold=继续持有 / reverse=反手`；成交价位由执行程序与滑点决定，不进模型输入。
   questions 文本由 `QUESTION_SCHEMA = marketsense.episode_question.v1` 标记（首次建立），
   纳入审计 `input.question_schema_sha256` 与 `run_id` 哈希；文案再演进必须换标记（产生新 run）。
+- **采样（双机制，label-band-sampling 任务 2026-10-06 拍板）**：只改变 selected/采样分类，
+  发生在 gold 回放与账户值计算之后（确定性、无未来泄漏语义不变；`selection` 字段入审计）。
+  * **train/dev**：进训练集 = 事件决策记录（gold = 开多/开空 → open 类事件；gold = 平仓/反手
+    → exit 类事件；事件包含自身）+ 每个事件紧邻其前 N 条决策记录（open 类窗口
+    `event_lookforward_open` 默认 2、exit 类窗口 `event_lookforward_exit` 默认 10；**单位 =
+    决策记录条数**：程序止损离场/死亡分钟不产生决策记录、不占窗口槽位；窗口不跨片段）；
+    一条记录同时是多个事件的前导只保留一次（标签统一 `event_lead`）；未被任何事件窗口覆盖
+    的持仓分钟剔除（审计 `excluded_holding`）、未覆盖的空仓分钟剔除（审计 `excluded_flat`）。
+  * **test/calibration/ood**：维持原口径——机会分钟周边 ± `flat_sample_band_minutes` 平带
+    （机会分钟 + 带宽内空仓分钟 + 全部持仓分钟入选；带宽外空仓分钟剔除）；改动前已生成的
+    test/ood 产物与本口径**逐字节一致**。
+  * 审计恒等式升级：`decision_points = selected + excluded_flat + excluded_holding`
+    （per_segment 求和与 totals 各校验一道，不一致不写出产物）。
 - `tick_size` 按品种配置：成交价 = 决策 K 线最高 + 1 tick / 最低 − 1 tick；止损距离 = 当根振幅 + 1 tick。
 - **确定性**：无墙钟/随机；同输入两次生成输出 sha256 一致（`audit.json` 记录各文件指纹与双跑比对依据）。
 - **`run_id` 组成**：`run-<12 位十六进制>` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记

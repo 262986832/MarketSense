@@ -27,9 +27,20 @@
 2. 从 ``t+1`` 起扫描：先到止损价 → 成立（冻结项 6）；扫到片段末既未超当前 K 线
    也未触止损 → 同样成立（冻结项 6）。
 
-(b) 采样（冻结）：进训练集 = 机会分钟（gold = 开多/开空）+ 机会分钟周边 ± 带宽内的
-空仓分钟（gold = 继续空仓）+ 持仓期间分钟（gold = 持有/平仓/反手）；其余空仓分钟
-剔除并计审计。
+(b) 采样（双机制，label-band-sampling 任务用户拍板，2026-10-06）：
+
+* **test/calibration/ood**（维持原口径）：进训练集 = 机会分钟（gold = 开多/开空）
+  + 机会分钟周边 ± 带宽内的空仓分钟（gold = 继续空仓）+ 持仓期间分钟
+  （gold = 持有/平仓/反手）；其余空仓分钟剔除并计审计；
+* **train/dev**：进训练集 = 事件决策记录（gold = 开多/开空 → open 类事件；
+  gold = 平仓/反手 → exit 类事件；事件包含自身）+ 每个事件紧邻其前 N 条决策记录
+  （open 类窗口 ``event_lookforward_open`` 默认 2、exit 类窗口
+  ``event_lookforward_exit`` 默认 10；一条记录同时是多个事件的前导只保留一次，
+  标签统一 ``event_lead``；窗口不跨片段）；未被任何事件窗口覆盖的持仓分钟剔除
+  （``excluded_holding``），未被覆盖的空仓分钟剔除（``excluded_flat``）；
+  程序止损离场/死亡分钟不产生决策记录，不计入 N。
+采样只改变 selected/selection 标记，发生在 gold 回放与账户值计算之后（确定性、
+无未来泄漏语义不变）。
 """
 
 from __future__ import annotations
@@ -66,9 +77,20 @@ ACTION_REVERSE = "reverse"
 SELECTION_OPPORTUNITY = "opportunity"
 SELECTION_FLAT_BAND = "flat_band"
 SELECTION_EXCLUDED_FLAT = "excluded_flat"
+SELECTION_EXCLUDED_HOLDING = "excluded_holding"
+SELECTION_EVENT_LEAD = "event_lead"
 SELECTION_HOLDING = "holding"
-#: 空仓点（尚未定采样归属）的中间状态：待 :func:`apply_flat_band` 决定进/出训练集
+#: 空仓点（尚未定采样归属）的中间状态：待 :func:`apply_flat_band` 或
+#: :func:`apply_event_lookforward` 决定进/出训练集
 SELECTION_FLAT = "flat"
+
+#: 事件前看采样生效的 split（label-band-sampling 拍板：train/dev 新机制；
+#: test/calibration/ood 维持 ±2 平带，calibration/ood 为低风险默认，未单独拍板）
+EVENT_LOOKFORWARD_SPLITS = frozenset({"train", "dev"})
+#: 开仓类事件动作（窗口 = ``event_lookforward_open``）
+_OPEN_EVENT_ACTIONS = frozenset({ACTION_OPEN_LONG, ACTION_OPEN_SHORT})
+#: 离场类事件动作（窗口 = ``event_lookforward_exit``）
+_EXIT_EVENT_ACTIONS = frozenset({ACTION_CLOSE, ACTION_REVERSE})
 
 
 @dataclass(frozen=True)
@@ -128,7 +150,18 @@ class SegmentOutcome:
 
     @property
     def excluded_flat(self) -> int:
-        return sum(1 for point in self.decision_points if not point.selected)
+        return sum(
+            1 for point in self.decision_points if point.selection == SELECTION_EXCLUDED_FLAT
+        )
+
+    @property
+    def excluded_holding(self) -> int:
+        """事件前看采样（train/dev）下未被任何事件窗口覆盖的持仓分钟数。"""
+        return sum(
+            1
+            for point in self.decision_points
+            if point.selection == SELECTION_EXCLUDED_HOLDING
+        )
 
     @property
     def action_counts(self) -> Mapping[str, int]:
@@ -290,6 +323,60 @@ def apply_flat_band(points: list[DecisionPoint], band: int) -> list[DecisionPoin
     return result
 
 
+def apply_event_lookforward(
+    points: list[DecisionPoint], *, open_lookforward: int, exit_lookforward: int
+) -> list[DecisionPoint]:
+    """(b) 采样（train/dev）：事件决策记录 + 紧邻其前 N 条决策记录入选。
+
+    * 事件判定（按 gold 动作）：``open_long``/``open_short`` → open 类事件（窗口
+      ``open_lookforward``）；``close``/``reverse`` → exit 类事件（窗口
+      ``exit_lookforward``）；``hold``/``stay_flat`` 非事件（程序止损离场根本不在
+      决策序列中，死亡分钟同理——两者均不计入 N）；
+    * 对每个事件（按列表序），把同片段内**紧邻其前 N 条决策记录**（位置
+      ``max(0, i-N) .. i-1``）标记为前导；窗口不跨片段（函数按片段点列表操作）;
+      去重按 bar（一条记录同时是多个事件的前导只保留一次；同时是 open 与 exit
+      窗口前导也只保留一次，标签统一 ``event_lead``）；
+    * 终态重标：事件记录保留其分支选择（open 事件 = opportunity、exit 事件 =
+      holding，``selected=True``——事件包含自身，前导身份不覆盖事件身份）；前导 →
+      ``event_lead``、``selected=True``；其余 flat → ``excluded_flat``、
+      其余 holding → ``excluded_holding``（均 ``selected=False``）；
+    * ``bar_index``/action/position 等其余字段不动；纯列表操作，无墙钟/随机。
+
+    :raises DatasetError: 两个 N 非负整数校验失败（0 合法 = 只保留事件本身）
+    """
+    for name, value in (
+        ("open_lookforward", open_lookforward),
+        ("exit_lookforward", exit_lookforward),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DatasetError(f"事件前看条数必须为非负整数: {name}={value!r}")
+
+    lead_positions: set[int] = set()
+    for position, point in enumerate(points):
+        if point.action in _OPEN_EVENT_ACTIONS:
+            window = open_lookforward
+        elif point.action in _EXIT_EVENT_ACTIONS:
+            window = exit_lookforward
+        else:
+            continue
+        for lead in range(max(0, position - window), position):
+            lead_positions.add(lead)
+
+    result: list[DecisionPoint] = []
+    for position, point in enumerate(points):
+        if point.action in _OPEN_EVENT_ACTIONS or point.action in _EXIT_EVENT_ACTIONS:
+            # 事件包含自身：保留分支选择（opportunity/holding），必入选
+            result.append(point)
+        elif position in lead_positions:
+            result.append(replace(point, selection=SELECTION_EVENT_LEAD, selected=True))
+        elif point.selection == SELECTION_FLAT:
+            result.append(replace(point, selection=SELECTION_EXCLUDED_FLAT, selected=False))
+        else:
+            # 持仓分钟（hold，未入选）：显式剔除类别（与空仓剔除分开计数）
+            result.append(replace(point, selection=SELECTION_EXCLUDED_HOLDING, selected=False))
+    return result
+
+
 def evaluate_segment(
     segment: Segment,
     bars: tuple[Bar, ...],
@@ -398,7 +485,16 @@ def evaluate_segment(
             segment_end_forced_close = len(bars) - 1
             account.close_position(bars[-1], reason=REASON_SEGMENT_END)
 
-    points = apply_flat_band(points, params.flat_sample_band_minutes)
+    if segment.split_role in EVENT_LOOKFORWARD_SPLITS:
+        # train/dev：事件 + 紧邻其前 N 条决策记录（按标签类型，label-band-sampling）
+        points = apply_event_lookforward(
+            points,
+            open_lookforward=params.event_lookforward_open,
+            exit_lookforward=params.event_lookforward_exit,
+        )
+    else:
+        # test/calibration/ood：维持机会分钟周边 ± 带宽平带（原口径不变）
+        points = apply_flat_band(points, params.flat_sample_band_minutes)
     return SegmentOutcome(
         segment_id=segment.segment_id,
         symbol=segment.symbol,
@@ -426,7 +522,10 @@ __all__ = [
     "ACTION_OPEN_SHORT",
     "ACTION_REVERSE",
     "ACTION_STAY_FLAT",
+    "EVENT_LOOKFORWARD_SPLITS",
     "SELECTION_EXCLUDED_FLAT",
+    "SELECTION_EXCLUDED_HOLDING",
+    "SELECTION_EVENT_LEAD",
     "SELECTION_FLAT",
     "SELECTION_FLAT_BAND",
     "SELECTION_HOLDING",
@@ -434,6 +533,7 @@ __all__ = [
     "DecisionPoint",
     "DeathEvent",
     "SegmentOutcome",
+    "apply_event_lookforward",
     "apply_flat_band",
     "evaluate_segment",
     "holding_action",

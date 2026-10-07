@@ -306,6 +306,19 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   对 `bars[: bar_index + 1]` 切片，防泄漏上界与生成侧同口径）并与 state 文本逐值比对
   （不一致不写出任何产物）；缺省 `None` 保持 v9 兼容语义（联动行按 `联动: na` 比对，
   既有调用点零破坏）。
+- **采样双机制（label-band-sampling，2026-10-06 拍板）**：`EpisodeParams` 新增
+  `event_lookforward_open`（默认 2）/ `event_lookforward_exit`（默认 10）两个配置项
+  （CLI `--event-lookforward-open/--event-lookforward-exit` 可覆盖，非法值退出 2）；
+  **train/dev** 进训练集 = 事件决策记录（open_long/open_short → open 类事件；
+  close/reverse → exit 类事件；事件包含自身）+ 每个事件紧邻其前 N 条**决策记录**
+  （单位 = 记录条数：程序止损离场/死亡分钟无记录、不占窗口槽位；窗口不跨片段；
+  多重前导去重为单一 `event_lead`）；未被覆盖的持仓分钟剔除（审计新键
+  `excluded_holding`）、空仓分钟剔除（`excluded_flat`）；**test/calibration/ood** 维持
+  机会分钟周边 ± `flat_sample_band_minutes` 平带（原口径逐字节不变）；采样发生在 gold
+  回放与账户值计算之后（净值链/标签语义不变）；审计恒等式升级为
+  `decision_points = selected + excluded_flat + excluded_holding`（per_segment 求和与
+  totals 两层级校验）；`FROZEN_DECISIONS` 的 `flat_sample_band` 键替换为
+  `event_lookforward_sampling`（`AUDIT_SCHEMA` 保持 v1；state 文本不变）。
 - **questions/candidates 文案（2026-10-02 用户拍板精简）**：唯一 choice 题 `next_action`，候选文案只留动作语义——空仓 `open_long=买入开仓 / open_short=卖出开仓 / stay_flat=继续空仓`，持仓 `close=平仓 / hold=继续持有 / reverse=反手`；成交价位由执行程序与滑点决定，不进模型输入。questions 文本由 `QUESTION_SCHEMA = marketsense.episode_question.v1` 标记（首次建立），纳入审计 `input.question_schema_sha256` 与 `run_id` 哈希；文案再演进必须换标记（产生新 run）。
 - 确定性：无墙钟/随机；同输入双跑输出 sha256 一致。
 - `run_id` = sha256(片段清单 + 品种配置 + 参数 + 状态 schema 标记 + questions schema 标记) 的前 12 位；**状态/候选文案变更产生新 run**（旧 run 保留不覆盖）；

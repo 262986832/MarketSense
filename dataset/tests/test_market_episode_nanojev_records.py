@@ -164,14 +164,36 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
     assert state == (
         f"{STATE_SCHEMA} \n "
         "账户: 持仓=空仓 净值=100.000000 今日=0.000000 回撤=0.000000 \n "
-        "日线: 跌势(-2, 最低=39.800000, 时长=2根) 涨势(-2, 最高=40.100000, 时长=4根) "
-        "涨势(-1, 最高=40.200000, 时长=7根) 跌势(-1, 最低=39.700000, 时长=5根) "
-        "当前为涨势 时长=3根 整体为震荡 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000 \n "
+        "日线: 跌势(-2, 最低=39.800000, 时长=2d根) 涨势(-2, 最高=40.100000, 时长=4d根) "
+        "涨势(-1, 最高=40.200000, 时长=7d根) 跌势(-1, 最低=39.700000, 时长=5d根) "
+        "当前为涨势 时长=3d根 整体为震荡 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000 \n "
         "日内: 今高=1.002000 今低=0.998000 \n "
-        "联动: 标的（突破=na） \n "
-        "现价: 开=1.000000 高=1.002000 低=0.998000 收=1.000000 bar=0 成交量比=1.000000 持仓量比=1.000000 \n "
+        "联动: 1dK相关度=na 1mK相关度=na \n "
+        "现价: bar=0 价=1.000000 成交量比=1.000000 持仓量比=1.000000 1mK突破=na \n "
         "盘口: na"
     )
+
+
+def test_render_state_uses_dynamic_breakthrough_label() -> None:
+    bar_list = bars(_PATTERN[:2])
+    state = render_state(
+        bar=bar_list[-1],
+        reference_bar=bar_list[0],
+        position=None,
+        drawdown=0.0,
+        net_value=100.0,
+        today_pnl=0.0,
+        price_precision=6,
+        board_state=BoardStateValues(today_high=100.2, today_low=99.8, **_BOARD),
+        trend_context=RENDER_TREND_CONTEXT,
+        breakthrough_bars=bar_list,
+        breakthrough_window=20,
+        breakthrough_duration_seconds=300,
+        breakthrough_label="5mK突破",
+    )
+    price_line = state.split(" \n ")[5]
+    assert "5mK突破=na" in price_line
+    assert "1mK突破=" not in price_line
 
 
 def test_render_state_template_is_byte_stable_for_holding_position() -> None:
@@ -197,12 +219,12 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
     assert state == (
         f"{STATE_SCHEMA} \n "
         "账户: 持仓=持空 开仓价=0.998500 止损价=1.000500 净值=100.000000 今日=0.000000 回撤=0.001500 \n "
-        "日线: 跌势(-2, 最低=3.980000, 时长=2根) 涨势(-2, 最高=4.010000, 时长=4根) "
-        "涨势(-1, 最高=4.020000, 时长=7根) 跌势(-1, 最低=3.970000, 时长=5根) "
-        "当前为涨势 时长=3根 整体为震荡 昨日高=2.010000 昨日低=1.980000 昨日收=1.990000 \n "
+        "日线: 跌势(-2, 最低=3.980000, 时长=2d根) 涨势(-2, 最高=4.010000, 时长=4d根) "
+        "涨势(-1, 最高=4.020000, 时长=7d根) 跌势(-1, 最低=3.970000, 时长=5d根) "
+        "当前为涨势 时长=3d根 整体为震荡 昨日高=2.010000 昨日低=1.980000 昨日收=1.990000 \n "
         "日内: 今高=1.010000 今低=0.999500 \n "
-        "联动: 标的（突破=1.000000） \n "
-        "现价: 开=1.000000 高=1.010000 低=1.000500 收=1.008000 bar=1 成交量比=1.000000 持仓量比=1.001996 \n "
+        "联动: 1dK相关度=na 1mK相关度=na \n "
+        "现价: bar=1 价=1.008000 成交量比=1.000000 持仓量比=1.001996 1mK突破=1.000000 \n "
         "盘口: na"
     )
 
@@ -240,7 +262,7 @@ def test_render_state_marks_undefined_denominators_as_na() -> None:
 
     assert "成交量比=na" in state  # v7：量比在现价行，volume=0 → na
     assert "持仓量比=na" in zero_oi_state  # v7：持仓量只保留收盘，close_oi=0 → na
-    assert "联动: 标的（突破=na）" in state  # v13：缺省空序列（可用根数 < 2）→ 主值 na
+    assert "联动: 1dK相关度=na 1mK相关度=na" in state  # v13：缺省空序列（可用根数 < 2）→ 主值 na
     assert "昨日高=2.010000" in state  # 日线行不受分母影响（价格分母正常）
     assert "inf" not in state and "nan" not in state
 
@@ -264,9 +286,9 @@ def test_render_state_fixed_linkage_labels_and_reference_value() -> None:
     )
 
     linkage_line = state.splitlines()[4]
-    assert linkage_line.strip().startswith("联动: 标的（突破=1.000000），参考（突破=-1.000000） 相关度=")
+    assert linkage_line.strip() == "联动: 1dK相关度=na 1mK相关度=na"
     assert "v2701" not in linkage_line and "sc2611" not in linkage_line
-    assert linkage_line.strip().endswith("相关度=na")
+    assert "参考（突破=" not in linkage_line
 
 
 def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar() -> None:
@@ -307,9 +329,9 @@ def test_v5_daily_line_trend_values_match_independent_hand_calc() -> None:
 
     assert record["state"].startswith(STATE_SCHEMA)
     assert (
-        "日线: 跌势(-2, 最低=39.800000, 时长=2根) 涨势(-2, 最高=40.100000, 时长=4根) "
-        "涨势(-1, 最高=40.200000, 时长=7根) 跌势(-1, 最低=39.700000, 时长=5根) "
-        "当前为涨势 时长=3根 整体为震荡 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000"
+        "日线: 跌势(-2, 最低=39.800000, 时长=2d根) 涨势(-2, 最高=40.100000, 时长=4d根) "
+        "涨势(-1, 最高=40.200000, 时长=7d根) 跌势(-1, 最低=39.700000, 时长=5d根) "
+        "当前为涨势 时长=3d根 整体为震荡 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000"
     ) in record["state"]
 
 
@@ -472,6 +494,23 @@ def _generate(tmp_path: Path, *, rows=_ROWS, band: int = 2):
         output_dir=tmp_path / "out",
     )
     return workspace, result
+
+
+def test_generate_dataset_requires_linkage_daily_file(tmp_path: Path) -> None:
+    workspace = build_workspace(tmp_path, _ROWS)
+    link_symbol = "INE.sc2611"
+    save_ohlcv(frame(_ROWS), symbol=link_symbol, period="1m", output_dir=workspace.data_dir)
+    segments = load_segments(workspace.manifest)
+    symbols = load_symbols_config(workspace.symbols_path)
+
+    with pytest.raises(DatasetError, match=r"INE\.sc2611.*1d K 线 CSV.*--period 1d"):
+        generate_dataset(
+            segments,
+            symbols=symbols,
+            data_dir=workspace.data_dir,
+            params=EpisodeParams(linkage_symbols=(link_symbol,)),
+            output_dir=tmp_path / "out",
+        )
 
 
 def test_generate_dataset_writes_all_splits_and_passes_mirror_validation(tmp_path: Path) -> None:
@@ -812,9 +851,9 @@ def test_generate_dataset_skips_segments_without_prev_daily_and_reports(
     for row in dev_rows:
         # v12: 折点按确认顺序；昨日值置于行尾，趋势判断仍按极值比较。
         assert (
-            "日线: 跌势(-2, 最低=39.800000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
-            "跌势(-1, 最低=39.900000, 时长=0根) 涨势(-1, 最高=40.400000, 时长=0根) "
-            "当前为跌势 时长=1根 整体为涨势中 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000"
+            "日线: 跌势(-2, 最低=39.800000, 时长=0d根) 涨势(-2, 最高=40.200000, 时长=0d根) "
+            "跌势(-1, 最低=39.900000, 时长=0d根) 涨势(-1, 最高=40.400000, 时长=0d根) "
+            "当前为跌势 时长=1d根 整体为涨势中 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000"
         ) in row["state"]
     train_rows = [
         json.loads(line)
@@ -943,9 +982,9 @@ def test_trend_points_confirmed_on_or_after_trade_date_are_not_usable(tmp_path: 
     for record in records:
         # v12: 按确认时序列出折点；当前方向独立于基于高低值比较的整体分类。
         assert (
-            "日线: 跌势(-2, 最低=39.800000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
-            "跌势(-1, 最低=39.900000, 时长=0根) 涨势(-1, 最高=40.400000, 时长=0根) "
-            "当前为跌势 时长=1根 整体为涨势中 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000"
+            "日线: 跌势(-2, 最低=39.800000, 时长=0d根) 涨势(-2, 最高=40.200000, 时长=0d根) "
+            "跌势(-1, 最低=39.900000, 时长=0d根) 涨势(-1, 最高=40.400000, 时长=0d根) "
+            "当前为跌势 时长=1d根 整体为涨势中 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000"
         ) in record["state"]
         # 确认日 == 决策交易日的折点极值价（4500/4600 ÷ 100）不得出现
         assert "45.000000" not in record["state"]
@@ -1030,9 +1069,9 @@ def test_generate_dataset_skips_segments_without_usable_trend_points(tmp_path: P
     for row in dev_rows:
         # v12: 确认时序 = up@01-01 22:30, down@01-01 23:00, up@01-01 23:30, down@01-01 22:00。
         assert (
-            "日线: 跌势(-2, 最低=39.800000, 时长=1根) 涨势(-2, 最高=40.200000, 时长=0根) "
-            "跌势(-1, 最低=39.900000, 时长=0根) 涨势(-1, 最高=40.400000, 时长=0根) "
-            "当前为跌势 时长=1根 整体为涨势中 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000"
+            "日线: 跌势(-2, 最低=39.800000, 时长=1d根) 涨势(-2, 最高=40.200000, 时长=0d根) "
+            "跌势(-1, 最低=39.900000, 时长=0d根) 涨势(-1, 最高=40.400000, 时长=0d根) "
+            "当前为跌势 时长=1d根 整体为涨势中 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000"
         ) in row["state"]
 
 
@@ -1203,9 +1242,9 @@ def test_night_bars_use_next_trading_day_for_trend_points(tmp_path: Path) -> Non
         row = json.loads(line)
         # v12：确认时序为 22:00 down、22:30 up、23:00 down、23:30 up。
         assert (
-            "日线: 跌势(-2, 最低=39.800000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
-            "跌势(-1, 最低=39.900000, 时长=0根) 涨势(-1, 最高=40.400000, 时长=0根) "
-            "当前为跌势 时长=1根 整体为涨势中 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000"
+            "日线: 跌势(-2, 最低=39.800000, 时长=0d根) 涨势(-2, 最高=40.200000, 时长=0d根) "
+            "跌势(-1, 最低=39.900000, 时长=0d根) 涨势(-1, 最高=40.400000, 时长=0d根) "
+            "当前为跌势 时长=1d根 整体为涨势中 昨日高=40.100000 昨日低=39.900000 昨日收=40.050000"
         ) in row["state"]
 
 
@@ -1283,18 +1322,18 @@ def test_multi_day_segment_later_trade_date_sees_later_confirmed_points(tmp_path
     # 涨势 4040/4020、跌势 3990/3980；两向皆抬 → 涨势中；时长 = T 行号 1 − 0 = 1
     for bar_index in range(0, 4):
         assert (
-            "跌势(-2, 最低=39.800000, 时长=0根) 涨势(-2, 最高=40.200000, 时长=0根) "
-            "跌势(-1, 最低=39.900000, 时长=0根) 涨势(-1, 最高=40.400000, 时长=0根) "
-            "当前为跌势 时长=1根 整体为涨势中"
+            "跌势(-2, 最低=39.800000, 时长=0d根) 涨势(-2, 最高=40.200000, 时长=0d根) "
+            "跌势(-1, 最低=39.900000, 时长=0d根) 涨势(-1, 最高=40.400000, 时长=0d根) "
+            "当前为跌势 时长=1d根 整体为涨势中"
         ) in by_bar[bar_index]["state"]
     # 01-03 的入选 bar（bar_index 4，交易日 01-03）：up 01-02 21:00 已确认
     # （< 决策交易日 01-03）→ 涨势(-1) = 4600→46.0 段长 1（触发根 bar1 − 前序触发根 bar0），
     # 涨势(-2) = 4040→40.4 段长 0；后一交易日可用前一日之后确认的折点；
     # 时长 = T（01-03）行号 2 − 最近折点 bar_index 1 = 1
     assert (
-        "跌势(-2, 最低=39.800000, 时长=0根) 跌势(-1, 最低=39.900000, 时长=0根) "
-        "涨势(-2, 最高=40.400000, 时长=0根) 涨势(-1, 最高=46.000000, 时长=1根) "
-        "当前为跌势 时长=1根 整体为涨势中"
+        "跌势(-2, 最低=39.800000, 时长=0d根) 跌势(-1, 最低=39.900000, 时长=0d根) "
+        "涨势(-2, 最高=40.400000, 时长=0d根) 涨势(-1, 最高=46.000000, 时长=1d根) "
+        "当前为跌势 时长=1d根 整体为涨势中"
     ) in by_bar[4]["state"]
 
 

@@ -39,12 +39,12 @@ up/down 折点各 ≥2 + 新增缺决策交易日日线行跳过原因），其�
 2026-10-03 用户拍板，见 ``artifacts/trend-state-v9/02-design/tech-design.md``）**
 
 ```text
-marketsense.episode_state.v13
+marketsense.episode_state.v14
 账户: 持仓=空仓 净值=<..> 今日=<..> 回撤=<..>
-日线: <按确认时间升序交错的涨势/跌势折点项，各方向 -1 最近、-2 次近> 当前为<涨势|跌势> 时长=<n>根 整体为<涨势中|跌势中|震荡> 昨日高=<..> 昨日低=<..> 昨日收=<..>
+日线: <折点段长及趋势时长以 d根 展示> 昨日高=<..> 昨日低=<..> 昨日收=<..>
 日内: 今高=<..> 今低=<..>
-联动: 标的（突破=<momentum|na>）[，参考（突破=<..>）][ 相关度=<r|na>]
-现价: 开=<..> 高=<..> 低=<..> 收=<..> bar=<片段内 0 基序号> 成交量比=<..> 持仓量比=<..>
+联动: 1dK相关度=<r|na> 1mK相关度=<r|na>
+现价: bar=<片段内 0 基序号> 价=<旧收值> 成交量比=<..> 持仓量比=<..> <周期>K突破=<momentum|na>
 盘口: na
 ```
 
@@ -178,6 +178,7 @@ from dataset.market_episode.linkage import (
     align_bars_by_timestamp,
     breakthrough_momentum,
     linkage_breakthrough_momentum,
+    daily_linkage_correlation,
     pearson_correlation,
     signal_pairs_from_aligned,
 )
@@ -230,9 +231,8 @@ from dataset.market_episode.segments import (
 #: 加权 + 只用已收盘 K 线/桶；首根/可用根数 < 2 → ``na``；窗口/周期 =
 #: EpisodeParams.breakthrough_window/breakthrough_period，其余五行与 v9 逐字节同构，
 #: 见 artifacts/linkage-breakthrough/02-design/tech-design.md）
-#: v13 联动行固定显示标签：主品种为 ``标的``，首个联动品种为 ``参考``；
-#: 突破动量、交集对齐、相关度与三段 na 判定沿用 v11 口径，不改变计算语义。
-STATE_SCHEMA = "marketsense.episode_state.v13"
+#: v14 联动行固定为日线/分钟相关度；现价行显示由 breakthrough_period 派生的突破标签。
+STATE_SCHEMA = "marketsense.episode_state.v14"
 #: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
 QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
@@ -479,13 +479,13 @@ def _daily_line(
         field = "最高" if item.kind == "up" else "最低"
         number = -1 - index
         trend_items.append(
-            f"{label}({number}, {field}={format_ratio_value(ratio_or_none(item.trend_extreme_price, open_price), price_precision)}, 时长={item.segment_length}根)"
+            f"{label}({number}, {field}={format_ratio_value(ratio_or_none(item.trend_extreme_price, open_price), price_precision)}, 时长={item.segment_length}d根)"
         )
     current_direction = "跌势" if trend_context.latest_confirmation_kind == "up" else "涨势"
     return (
         "日线: "
         + " ".join(trend_items)
-        + f" 当前为{current_direction} 时长={trend_context.state_duration}根"
+        + f" 当前为{current_direction} 时长={trend_context.state_duration}d根"
         + f" 整体为{trend_label}"
         + f" 昨日高={format_ratio_value(ratio_or_none(board_state.prev_day_high, open_price), price_precision)}"
         + f" 昨日低={format_ratio_value(ratio_or_none(board_state.prev_day_low, open_price), price_precision)}"
@@ -522,8 +522,11 @@ def render_state(
     breakthrough_duration_seconds: int = 60,
     primary_symbol: str = "",
     linkage_symbol_bars: Mapping[str, Sequence[Bar]] | None = None,
+    daily_rows_by_symbol: Mapping[str, Sequence[tuple[Any, float, float, float]]] | None = None,
+    trade_date: dt.date | None = None,
+    breakthrough_label: str = "1mK突破",
 ) -> str:
-    """确定性状态文本（v13 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
+    """确定性 v14 状态文本（账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
 
     只做「决策 K 线单根 + 仓位 + 净值 + 今日 + 回撤 + 盘面状态 + 日线折点趋势上下文」
     的序列化：函数签名决定它无法访问决策 K 线之后的任何 bar（``board_state`` 的今日值与
@@ -546,15 +549,14 @@ def render_state(
     前缀后原样保留）与 ``linkage_symbol_bars``（symbol → 联动品种**片段窗口内**的
     完整 1m 序列；不要求调用方预切片到 T——交集对齐以主品种窗口（已截至 T）
     时间戳为准，联动品种仅取相同时间戳，天然上界 ≤ T，无未来泄漏）：
-    v11 历史显示格式曾使用品种名；当前 v13 配置允许 0 或 1 个联动品种，联动行固定为
+    v11 历史显示格式曾使用品种名；当前 v14 配置允许 0 或 1 个联动品种，联动行固定为
     ``标的（突破=<主值>）``，可选 ``，参考（突破=<联动值>） 相关度=<r>``。联动 K 线与主品种
     窗口按时间戳保序交集；联动值 = 交集序列 secondary 侧三态加权；
     ``dataset.market_episode.linkage``；相关度为同一交集序列上主/联动相邻对三态信号的
     皮尔逊 r。三段 na 语义独立判定：主值 na（首根/可用根数不足）、联动值 na（交集对 < 2）、
     相关度 na（有效信号对 < 2 或任一序列零方差）。
 
-    v13：联动行主品种与唯一可选联动品种分别固定显示为 ``标的``/``参考``；symbol 仍用于
-    数据选择与对齐，但不再作为联动行标签输出。突破动量与相关度的计算口径沿用 v11。
+    v14：联动行固定两项 1dK/1mK 相关度；现价行动态显示主突破周期。
     """
     account_values = (
         f"净值={format_ratio_value(net_value, price_precision)}"
@@ -582,11 +584,9 @@ def render_state(
     momentum = breakthrough_momentum(
         breakthrough_bars, breakthrough_window, breakthrough_duration_seconds
     )
-    linkage_parts = [
-        "标的"
-        f"（突破={format_ratio_value(momentum, price_precision)}）"
-    ]
-    correlation: float | None = None
+    linkage_parts = []
+    correlation_1m: float | None = None
+    correlation_1d: float | None = None
     if linkage_symbol_bars:
         for link_position, (link_symbol, link_bars) in enumerate(
             linkage_symbol_bars.items()
@@ -594,19 +594,24 @@ def render_state(
             aligned = align_bars_by_timestamp(
                 breakthrough_bars, link_bars, breakthrough_window
             )
-            link_value = linkage_breakthrough_momentum(aligned)
-            linkage_parts.append(
-                f"参考（突破={format_ratio_value(link_value, price_precision)}）"
-            )
             if link_position == 0:
                 signal_pairs = signal_pairs_from_aligned(aligned)
-                correlation = pearson_correlation(
+                correlation_1m = pearson_correlation(
                     [primary for primary, _ in signal_pairs],
                     [secondary for _, secondary in signal_pairs],
                 )
-    linkage_line = "联动: " + "，".join(linkage_parts)
-    if linkage_symbol_bars:
-        linkage_line += f" 相关度={format_ratio_value(correlation, price_precision)}"
+                if daily_rows_by_symbol is not None and trade_date is not None:
+                    primary_rows = daily_rows_by_symbol.get(primary_symbol)
+                    secondary_rows = daily_rows_by_symbol.get(link_symbol)
+                    if primary_rows is not None and secondary_rows is not None:
+                        correlation_1d = daily_linkage_correlation(
+                            primary_rows, secondary_rows, trade_date, breakthrough_window
+                        )
+    linkage_line = (
+        "联动: 1dK相关度="
+        f"{format_ratio_value(correlation_1d, price_precision)} 1mK相关度="
+        f"{format_ratio_value(correlation_1m, price_precision)}"
+    )
     return " \n ".join(
         (
             STATE_SCHEMA,
@@ -619,7 +624,10 @@ def render_state(
             ),
             _intraday_line(board_state, reference_bar, price_precision),
             linkage_line,
-            px_ratio_line(bar, reference_bar, price_precision),
+            px_ratio_line(
+                bar, reference_bar, price_precision,
+                breakthrough_label=breakthrough_label, breakthrough=momentum,
+            ),
             "盘口: na",
         )
     )
@@ -636,6 +644,9 @@ def build_record(
     breakthrough_window: int = 20,
     breakthrough_duration_seconds: int = 60,
     linkage_symbol_bars: Mapping[str, Sequence[Bar]] | None = None,
+    daily_rows_by_symbol: Mapping[str, Sequence[tuple[Any, float, float, float]]] | None = None,
+    trade_date: dt.date | None = None,
+    breakthrough_label: str = "1mK突破",
 ) -> dict[str, Any]:
     """把一个入选决策点映射为 NanoJev 训练记录。
 
@@ -679,6 +690,9 @@ def build_record(
         breakthrough_duration_seconds=breakthrough_duration_seconds,
         primary_symbol=segment.symbol,
         linkage_symbol_bars=linkage_symbol_bars,
+        daily_rows_by_symbol=daily_rows_by_symbol,
+        trade_date=trade_date,
+        breakthrough_label=breakthrough_label,
     )
     criteria = FLAT_CRITERIA if point.position is None else HELD_CRITERIA
     if point.action not in criteria:
@@ -1071,6 +1085,19 @@ def generate_dataset(
                 f"`python -m dataset fetch --symbol {link_symbol} --period 1m "
                 f"--start <start> --end <end>` 落盘（data_dir={data_dir}）"
             ) from error
+    linkage_daily_loaded: dict[str, Any] = {}
+    linkage_daily_rows: dict[str, tuple[tuple[Any, float, float, float], ...]] = {}
+    for link_symbol in params.linkage_symbols:
+        try:
+            loaded_daily = _load_daily_ohlc(data_dir, link_symbol)
+        except DataLoadError as error:
+            raise DatasetError(
+                f"联动品种 {link_symbol!r} 的 1d K 线 CSV 不存在或不可读：请先执行 "
+                f"`python -m dataset fetch --symbol {link_symbol} --period 1d "
+                f"--start <start> --end <end>` 落盘（data_dir={data_dir}）"
+            ) from error
+        linkage_daily_loaded[link_symbol] = loaded_daily
+        linkage_daily_rows[link_symbol] = _daily_rows(loaded_daily)
 
     outcomes: dict[str, SegmentOutcome] = {}
     bars_by_segment: dict[str, tuple[Bar, ...]] = {}
@@ -1086,9 +1113,9 @@ def generate_dataset(
     # 同 bars_by_symbol 模式；片段窗口切片同主品种规则，窗口内无数据 → 空序列 → na）
     linkage_bars_by_symbol: dict[str, dict[str, tuple[Bar, ...]]] = {}
     records_by_split: dict[str, list[dict[str, Any]]] = {split: [] for split in SPLIT_ROLES}
-    daily_loaded_by_symbol: dict[str, Any] = {}
+    daily_loaded_by_symbol: dict[str, Any] = dict(linkage_daily_loaded)
     # v9：日线行元组按 symbol 缓存（上一交易日查找与决策交易日行号查找共用同源行序）
-    daily_rows_by_symbol: dict[str, tuple[tuple[Any, float, float, float], ...]] = {}
+    daily_rows_by_symbol: dict[str, tuple[tuple[Any, float, float, float], ...]] = dict(linkage_daily_rows)
     prev_daily_by_segment: dict[str, tuple[float, float, float]] = {}
     board_state_skipped: dict[str, str] = {}
     trend_points_by_symbol: dict[str, tuple[TurningPoint, ...]] = {}
@@ -1254,6 +1281,9 @@ def generate_dataset(
                     breakthrough_window=params.breakthrough_window,
                     breakthrough_duration_seconds=breakthrough_duration_seconds,
                     linkage_symbol_bars=segment_linkage_bars or None,
+                    daily_rows_by_symbol=daily_rows_by_symbol,
+                    trade_date=_bar_trade_date(bars, bars[point.bar_index]),
+                    breakthrough_label=f"{params.breakthrough_period}K突破",
                 )
             )
 
@@ -1310,6 +1340,8 @@ def generate_dataset(
         # v11：联动行独立复算入参（联动 symbol → segment_id → 片段完整 1m 序列；
         # 无联动品种配置 → None = 无联动品种格式比对）
         linkage_bars_by_symbol=linkage_bars_by_symbol or None,
+        breakthrough_label=f"{params.breakthrough_period}K突破",
+        linkage_daily_rows_by_symbol=daily_rows_by_symbol,
     )
 
     segments_text = _dump_json([segment.canonical() for segment in segments])

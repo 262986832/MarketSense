@@ -110,7 +110,7 @@ GOLD_LABEL_KINDS = frozenset(
 #: （状态文本不变：state_template 标记与 AUDIT_SCHEMA 均不动）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v13:decision_bar_only+board_state+daily_trend_extremes+chronological_confirmation+current_direction+overall_trend+account_net_value+breakthrough_momentum+linkage_symbol+fixed_linkage_labels",
+    "state_template": "marketsense.episode_state.v14:decision_bar_only+board_state+daily_trend_extremes_d_roots+chronological_confirmation+current_direction+overall_trend+account_net_value+breakthrough_momentum_in_price+daily_and_minute_linkage_correlation+fixed_linkage_labels",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "net_value_base_100:equity=100*(1+cum_ratio_pnl),1_lot=1_notional,no_multiplier,no_fees",
@@ -284,22 +284,15 @@ def _ratio_or_na(numerator: float, denominator: float, precision: int) -> str:
     return _format_ratio(numerator / denominator, precision)
 
 
-def _independent_px_line(bar: Bar, reference: Bar, precision: int) -> str:
-    """独立重算的决策 K 线价格/量/持仓量比值行（v7「现价」行；不调用状态序列化实现，
-    避免自证）。v7 起 ``bar`` 序号与量/持仓量比值并入本行（持仓量只保留收盘时刻），
-    bar 序号与 state_id 解析出的决策 K 线交叉锁定（bar 即 ``bars[bar_index]``）。"""
-    values = (
-        _ratio_or_na(bar.open, reference.open, precision),
-        _ratio_or_na(bar.high, reference.open, precision),
-        _ratio_or_na(bar.low, reference.open, precision),
-        _ratio_or_na(bar.close, reference.open, precision),
-        f"{bar.index}",
-        _ratio_or_na(bar.volume, reference.volume, precision),
-        _ratio_or_na(bar.close_oi, reference.close_oi, precision),
-    )
+def _independent_px_line(
+    bar: Bar, reference: Bar, precision: int, breakthrough_label: str, momentum: float | None
+) -> str:
+    """独立复算 v14 现价行，不调用生成侧序列化实现。"""
     return (
-        f"现价: 开={values[0]} 高={values[1]} 低={values[2]} 收={values[3]}"
-        f" bar={values[4]} 成交量比={values[5]} 持仓量比={values[6]}"
+        f"现价: bar={bar.index} 价={_ratio_or_na(bar.close, reference.open, precision)}"
+        f" 成交量比={_ratio_or_na(bar.volume, reference.volume, precision)}"
+        f" 持仓量比={_ratio_or_na(bar.close_oi, reference.close_oi, precision)}"
+        f" {breakthrough_label}={format_ratio_value(momentum, precision)}"
     )
 
 
@@ -390,6 +383,39 @@ def _three_state_signal(
     if cur[1] < prev[1] and cur[2] < prev[2]:
         return -1
     return 0
+
+
+def _independent_linkage_1m_correlation(
+    primary_prefix: tuple[Bar, ...], secondary_bars: tuple[Bar, ...], window: int
+) -> float | None:
+    """独立复算窗口内 1m 联动相关度；先截主序列，再按时间戳求交集。
+
+    不调用生成侧对齐或信号函数。窗口边界与生成侧 ``align_bars_by_timestamp`` 一致：
+    主品种截至决策 K 线的序列先取末尾 ``window`` 根，再查找相同时间戳的参考品种 K 线。
+    """
+    if window < 1:
+        raise DatasetError(f"审计独立复算：window 必须 ≥ 1，实际: {window}")
+    secondary_by_ts = {pd.Timestamp(item.timestamp): item for item in secondary_bars}
+    primary_window = primary_prefix[-window:]
+    aligned = [
+        (item, secondary_by_ts[pd.Timestamp(item.timestamp)])
+        for item in primary_window
+        if pd.Timestamp(item.timestamp) in secondary_by_ts
+    ]
+    primary_signals: list[int] = []
+    secondary_signals: list[int] = []
+    for (p0, s0), (p1, s1) in zip(aligned, aligned[1:]):
+        primary_signals.append(
+            _three_state_signal(
+                (p0.high, p0.low, p0.close), (p1.high, p1.low, p1.close)
+            )
+        )
+        secondary_signals.append(
+            _three_state_signal(
+                (s0.high, s0.low, s0.close), (s1.high, s1.low, s1.close)
+            )
+        )
+    return _independent_pearson(primary_signals, secondary_signals)
 
 
 def _independent_pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
@@ -720,12 +746,12 @@ def _independent_daily_line_v12(
     for _, _, index, item in indexed_extremes:
         number = -1 - index
         name, field = ("涨势", "最高") if item.kind == "up" else ("跌势", "最低")
-        parts.append(f"{name}({number}, {field}={_ratio(item.trend_extreme_price)}, 时长={item.segment_length}根)")
+        parts.append(f"{name}({number}, {field}={_ratio(item.trend_extreme_price)}, 时长={item.segment_length}d根)")
     current = "跌势" if context.latest_confirmation_kind == "up" else "涨势"
     return (
         "日线: "
         + " ".join(parts)
-        + f" 当前为{current} 时长={context.state_duration}根"
+        + f" 当前为{current} 时长={context.state_duration}d根"
         + f" 整体为{label}"
         + f" 昨日高={_ratio(prev_high)} 昨日低={_ratio(prev_low)} 昨日收={_ratio(prev_close)}"
     )
@@ -891,6 +917,8 @@ def check_state_leakage(
     breakthrough_window: int = 20,
     breakthrough_duration_seconds: int = 60,
     linkage_bars_by_symbol: Mapping[str, Mapping[str, tuple[Bar, ...]]] | None = None,
+    breakthrough_label: str = "1mK突破",
+    linkage_daily_rows_by_symbol: Mapping[str, tuple[tuple[Any, float, float, float], ...]] | None = None,
 ) -> None:
     """状态泄漏抽查：决策点状态只能由 ≤ 决策 K 线的数据计算。
 
@@ -1042,42 +1070,39 @@ def check_state_leakage(
             breakthrough_window,
             breakthrough_duration_seconds,
         )
-        linkage_parts = [
-            f"标的（突破={format_ratio_value(momentum, price_precision)}）"
-        ]
+        expected_linkage = "联动: 1dK相关度=na 1mK相关度=na"
         if linkage_bars_by_symbol:
-            # v11：联动品种段 + 首个联动品种相关度（交集对齐 + secondary 三态加权 +
-            # 皮尔逊 r 全内联独立重算，见 _independent_linkage_symbol；对齐键 =
-            # 时间戳值比较；防泄漏上界与生成侧同口径 = bars[: bar_index + 1]）
-            linkage_r: float | None = None
-            for link_position, (link_symbol, link_segments) in enumerate(
-                linkage_bars_by_symbol.items()
-            ):
-                link_segment_bars = link_segments.get(segment_id)
-                _require(
-                    link_segment_bars is not None,
-                    f"审计缺少联动品种 {link_symbol!r} 片段 {segment_id!r} 的 1m K 线"
-                    f"（记录 {record['id']} 联动行无法独立复算）",
-                )
-                assert link_segment_bars is not None
-                link_momentum, link_r = _independent_linkage_symbol(
-                    primary_prefix, link_segment_bars, breakthrough_window
-                )
-                linkage_parts.append(
-                    f"，参考（突破={format_ratio_value(link_momentum, price_precision)}）"
-                )
-                if link_position == 0:
-                    linkage_r = link_r
-            expected_linkage = (
-                "联动: "
-                + "".join(linkage_parts)
-                + f" 相关度={format_ratio_value(linkage_r, price_precision)}"
+
+            link_symbol = next(iter(linkage_bars_by_symbol))
+            link_segment_bars = linkage_bars_by_symbol[link_symbol].get(segment_id)
+            _require(link_segment_bars is not None,
+                     f"审计缺少联动品种 {link_symbol!r} 片段 {segment_id!r} 的 1m K 线")
+            assert link_segment_bars is not None
+            one_minute_r = _independent_linkage_1m_correlation(
+                primary_prefix, link_segment_bars, breakthrough_window
             )
-        else:
-            # v11 无联动品种格式（linkage_bars_by_symbol 缺省 None 或空容器）
-            expected_linkage = "联动: " + "".join(linkage_parts)
+            daily_audit_rows = linkage_daily_rows_by_symbol or daily_rows_by_symbol
+            primary_daily = daily_audit_rows.get(symbol) if daily_audit_rows else None
+            secondary_daily = daily_audit_rows.get(link_symbol) if daily_audit_rows else None
+            _require(primary_daily is not None and secondary_daily is not None,
+                     f"审计缺少联动日线数据: {symbol!r}, {link_symbol!r}")
+            primary_map = {row[0]: row[1:] for row in primary_daily if row[0] < trade_date}
+            secondary_map = {row[0]: row[1:] for row in secondary_daily if row[0] < trade_date}
+            shared_dates = sorted(primary_map.keys() & secondary_map.keys())[-breakthrough_window:]
+            daily_x: list[int] = []
+            daily_y: list[int] = []
+            for previous, current in zip(shared_dates, shared_dates[1:]):
+                p0, p1 = primary_map[previous], primary_map[current]
+                s0, s1 = secondary_map[previous], secondary_map[current]
+                daily_x.append(1 if p1[0] > p0[0] and p1[2] > p0[2] else -1 if p1[1] < p0[1] and p1[2] < p0[2] else 0)
+                daily_y.append(1 if s1[0] > s0[0] and s1[2] > s0[2] else -1 if s1[1] < s0[1] and s1[2] < s0[2] else 0)
+            one_day_r = _independent_pearson(daily_x, daily_y)
+            expected_linkage = (
+                f"联动: 1dK相关度={format_ratio_value(one_day_r, price_precision)} "
+                f"1mK相关度={format_ratio_value(one_minute_r, price_precision)}"
+            )
         expected_lines = (
-            ("现价", _independent_px_line(bar, reference, price_precision)),
+            ("现价", _independent_px_line(bar, reference, price_precision, breakthrough_label, momentum)),
             ("联动", expected_linkage),
             ("日线", expected_daily_line),
             ("日内", _independent_intraday_line(prefix, bar_index, reference, price_precision)),

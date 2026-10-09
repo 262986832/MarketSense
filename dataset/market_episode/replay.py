@@ -141,19 +141,15 @@ def load_segment_bars(
     return bars_from_frame(selected.reset_index(drop=True)), loaded.source_data_version
 
 
-def px_ratio_line(bar: Bar, reference_bar: Bar, precision: int) -> str:
-    """决策 K 线价格/量/持仓量的比值行（v7「现价」行；分母 = 片段首根同名字段，冻结）。
-
-    v7 变更：``bar`` 序号自「日内」行并入本行；成交量/持仓量比值自「联动」行并入本行
-    （持仓量只保留收盘时刻，开盘时刻丢弃，2026-10-02 用户拍板）。
-    """
+def px_ratio_line(
+    bar: Bar, reference_bar: Bar, precision: int, *, breakthrough_label: str, breakthrough: float | None
+) -> str:
+    """v14 现价行；价格仅保留决策收盘价比值，另含 bar、量比及主突破值。"""
     return (
         "现价: "
-        f"开={format_ratio_value(ratio_or_none(bar.open, reference_bar.open), precision)}"
-        f" 高={format_ratio_value(ratio_or_none(bar.high, reference_bar.open), precision)}"
-        f" 低={format_ratio_value(ratio_or_none(bar.low, reference_bar.open), precision)}"
-        f" 收={format_ratio_value(ratio_or_none(bar.close, reference_bar.open), precision)}"
-        f" bar={bar.index}"
+        f"bar={bar.index}"
+        f" 价={format_ratio_value(ratio_or_none(bar.close, reference_bar.open), precision)}"
         f" 成交量比={format_ratio_value(ratio_or_none(bar.volume, reference_bar.volume), precision)}"
         f" 持仓量比={format_ratio_value(ratio_or_none(bar.close_oi, reference_bar.close_oi), precision)}"
+        f" {breakthrough_label}={format_ratio_value(breakthrough, precision)}"
     )

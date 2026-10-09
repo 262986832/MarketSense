@@ -139,12 +139,12 @@ class _WatchHarness:
         self,
         frames: list[pd.DataFrame | BaseException],
         *,
-        rest: tuple[pd.DataFrame, dict[str, Any | None]] | None = None,
+        rest: tuple[pd.DataFrame, dict[str, Any | None], dict[str, pd.DataFrame]] | tuple[pd.DataFrame, dict[str, Any | None]] | None = None,
         now: pd.Timestamp | None = None,
         interrupt_on_wait_call: int | None = None,
     ) -> None:
         self.frames = list(frames)
-        self.rest = rest or (pd.DataFrame(), {})
+        self.rest = rest or (pd.DataFrame(), {}, {})
         self.now = now or pd.Timestamp("2024-01-02 09:04:30+08:00")
         self.interrupt_on_wait_call = interrupt_on_wait_call
         self.rendered: list[tuple[Any, pd.Timestamp]] = []
@@ -159,8 +159,10 @@ class _WatchHarness:
             raise item
         return item
 
-    def fetch_rest(self) -> tuple[pd.DataFrame, dict[str, Any | None]]:
+    def fetch_rest(self) -> tuple[pd.DataFrame, dict[str, Any | None], dict[str, pd.DataFrame]]:
         self.rest_calls += 1
+        if len(self.rest) == 2:
+            return self.rest[0], self.rest[1], {}
         return self.rest
 
     def render(self, snapshot: Any, key: pd.Timestamp) -> None:

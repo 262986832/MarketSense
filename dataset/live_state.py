@@ -62,6 +62,7 @@ from dataset.errors import DatasetError
 from dataset.market_episode.linkage import (
     align_bars_by_timestamp,
     breakthrough_momentum,
+    daily_linkage_correlation,
     linkage_breakthrough_momentum,
     pearson_correlation,
     signal_pairs_from_aligned,
@@ -97,7 +98,7 @@ _NET_VALUE_INITIAL = 100.0
 class LiveStateSnapshot:
     """state-now 快照（frozen；同输入双跑全等）。"""
 
-    #: v13 状态文本（七段原文，``STATE_SCHEMA = marketsense.episode_state.v13``）
+    #: v14 状态文本（七段原文，``STATE_SCHEMA = marketsense.episode_state.v14``）
     state_text: str
     #: choice 题（结构同训练记录 ``questions``，单题 ``next_action``）
     question: dict[str, Any]
@@ -220,6 +221,7 @@ def build_live_state(
     daily_rows: pd.DataFrame,
     turning_points: tuple[TurningPoint, ...],
     linkage_bars: Mapping[str, pd.DataFrame | None] | None = None,
+    linkage_daily_rows: Mapping[str, pd.DataFrame] | None = None,
     params: EpisodeParams = EpisodeParams(),
     price_precision: int = PRECISION,
 ) -> LiveStateSnapshot:
@@ -232,15 +234,15 @@ def build_live_state(
     :param daily_rows: 标准 OHLCV 1d 帧（升序；在线只含已收盘日线 → T 行可能缺失）。
     :param turning_points: 日线折点序列（``load_turning_points(symbol, "1d")``）；
         首点必须为 ``kind="start"``、``bar_index=0``（锚定前提，守卫不满足硬错误）。
-    :param linkage_bars: 联动品种 → 1m 帧（缺数据/取数失败传 ``None``）；
-        未配置联动品种时传 ``None``。
+    :param linkage_bars: 联动品种 → 1m 帧（缺数据时传 ``None``）。
+    :param linkage_daily_rows: 已配置参考品种 → 完整 1d 帧；缺失为硬错误，计算前严格截断至 trade_date。
     :param params: episode 参数（只用 ``breakthrough_window/breakthrough_period/
         linkage_symbols``）。
     :param price_precision: 模型可见比值小数位（缺省 6，与训练同口径 E11；
         CLI 传 ``params.price_precision`` 以透传配置）。
     :returns: :class:`LiveStateSnapshot`。
     :raises DatasetError: 越界 / T 未入窗（15:00–20:59）/ 日线缺前置行 /
-        折点与 1d 不同源 / 折点不足（up/down 各 <2）/ 联动品种帧非法。
+        折点与 1d 不同源 / 折点不足（up/down 各 <2）/ 已配置参考日线缺失 / 联动品种帧非法。
     """
     if not 0 <= decision_index < len(bars_1m):
         raise DatasetError(
@@ -326,6 +328,13 @@ def build_live_state(
 
     # ⑦' 联动品种（D4）：缺数据 → 空元组（render 内 na 语义原样生效），meta 记录可用性
     links = dict(linkage_bars) if linkage_bars else {}
+    daily_links = dict(linkage_daily_rows) if linkage_daily_rows else {}
+    for link_symbol in params.linkage_symbols:
+        if link_symbol not in daily_links:
+            raise DatasetError(
+                f"联动品种 {link_symbol!r} 的 1d 日线缺失；请在线获取或执行 "
+                f"`python -m dataset fetch --symbol {link_symbol} --period 1d --bars <N>`"
+            )
     linkage_symbol_bars: dict[str, tuple[Bar, ...]] = {}
     linkage_meta: list[dict[str, Any]] = []
     for link_symbol in params.linkage_symbols:
@@ -375,8 +384,20 @@ def build_live_state(
         )
         if correlation is None:
             na_details.append(
-                f"{_linkage_display_name(first_link)} 相关度=na："
+                f"{_linkage_display_name(first_link)} 1mK相关度=na："
                 f"有效信号对 {len(signal_pairs)} <2 或零方差"
+            )
+        daily_correlation = daily_linkage_correlation(
+            tuple((pd.Timestamp(row.timestamp).date(), float(row.high), float(row.low), float(row.close))
+                  for row in daily_rows.itertuples(index=False)),
+            tuple((pd.Timestamp(row.timestamp).date(), float(row.high), float(row.low), float(row.close))
+                  for row in daily_links[first_link].sort_values("timestamp").itertuples(index=False)),
+            trade_date,
+            params.breakthrough_window,
+        )
+        if daily_correlation is None:
+            na_details.append(
+                f"{_linkage_display_name(first_link)} 1dK相关度=na：有效信号对不足 2 或零方差"
             )
 
     # ⑩ 状态文本：参数透传与 build_record 逐项同构（reference_bar/账户值按 D2/D4 替换）
@@ -395,6 +416,21 @@ def build_live_state(
         breakthrough_duration_seconds=duration_seconds,
         primary_symbol=symbol,
         linkage_symbol_bars=linkage_symbol_bars,
+        daily_rows_by_symbol={
+            symbol: tuple(
+                (pd.Timestamp(row.timestamp).date(), float(row.high), float(row.low), float(row.close))
+                for row in daily_rows.itertuples(index=False)
+            ),
+            **{
+                link_symbol: tuple(
+                    (pd.Timestamp(row.timestamp).date(), float(row.high), float(row.low), float(row.close))
+                    for row in frame.sort_values("timestamp").itertuples(index=False)
+                )
+                for link_symbol, frame in (linkage_daily_rows or {}).items()
+            },
+        },
+        trade_date=trade_date,
+        breakthrough_label=f"{params.breakthrough_period}K突破",
     )
 
     # ⑪ metadata（键序固定，设计 §3.5；全部由输入与中间量填充，无墙钟无随机）

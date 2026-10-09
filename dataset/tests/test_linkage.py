@@ -21,6 +21,7 @@ from dataset.market_episode.linkage import (
     align_bars_by_timestamp,
     breakthrough_momentum,
     breakthrough_signal,
+    daily_linkage_correlation,
     linkage_breakthrough_momentum,
     pearson_correlation,
     resample_bars,
@@ -322,6 +323,37 @@ def test_momentum_resampled_partial_bucket_unavailable() -> None:
 def test_momentum_resampled_window_truncates_to_one_bucket() -> None:
     # window=1 → 只取末 1 个已收满桶 → 无相邻对 → None
     assert breakthrough_momentum(_night_bars(), window=1, duration_seconds=300) is None
+
+
+def test_daily_linkage_correlation_intersection_cutoff_window_and_na() -> None:
+    from datetime import date, timedelta
+
+    dates = [date(2024, 1, 1) + timedelta(days=index) for index in range(6)]
+    values = (10.0, 11.0, 99.0, 10.0, 11.0, 999.0)
+    primary = tuple(
+        (day, values[index], values[index] - 1.0, values[index])
+        for index, day in enumerate(dates)
+    )
+    secondary = tuple(
+        (day, values[index], values[index] - 1.0, values[index])
+        for index, day in enumerate(dates)
+        if index != 2
+    )
+    assert daily_linkage_correlation(primary, secondary, dates[5], window=4) == 1.0
+    assert daily_linkage_correlation(primary, secondary, dates[5], window=2) is None
+    assert daily_linkage_correlation(primary, secondary, dates[3], window=20) is None
+
+    with pytest.raises(DatasetError, match="window 必须 ≥ 1"):
+        daily_linkage_correlation(primary, secondary, dates[5], window=0)
+
+
+def test_daily_linkage_correlation_zero_variance_is_undefined() -> None:
+    from datetime import date, timedelta
+
+    dates = [date(2024, 2, 1) + timedelta(days=index) for index in range(4)]
+    primary = tuple((day, 10.0 + index, 9.0, 10.0 + index) for index, day in enumerate(dates))
+    secondary = tuple((day, 20.0, 20.0, 20.0) for day in dates)
+    assert daily_linkage_correlation(primary, secondary, dates[-1], window=4) is None
 
 
 # --------------------------------------------------------------------------- #

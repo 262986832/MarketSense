@@ -45,6 +45,7 @@ __all__ = [
     "align_bars_by_timestamp",
     "breakthrough_momentum",
     "breakthrough_signal",
+    "daily_linkage_correlation",
     "linkage_breakthrough_momentum",
     "pearson_correlation",
     "resample_bars",
@@ -268,6 +269,40 @@ def signal_pairs_from_aligned(
             )
         )
     return tuple(pairs)
+
+
+def daily_linkage_correlation(
+    primary_rows: Sequence[tuple[object, float, float, float]],
+    secondary_rows: Sequence[tuple[object, float, float, float]],
+    trade_date: object,
+    window: int,
+) -> float | None:
+    """交易日前最近交集日线窗口的三态突破信号 Pearson r。
+
+    Rows are (trade_date, high, low, close), in source order. The decision date
+    itself and later rows are excluded before the stable date intersection.
+    """
+    if window < 1:
+        raise DatasetError(f"window 必须 ≥ 1，实际: {window}")
+    primary = {row[0]: row[1:] for row in primary_rows if row[0] < trade_date}
+    secondary = {row[0]: row[1:] for row in secondary_rows if row[0] < trade_date}
+    dates = sorted(primary.keys() & secondary.keys())[-window:]
+    if len(dates) < 3:
+        return None
+    primary_signals: list[int] = []
+    secondary_signals: list[int] = []
+    for previous, current in zip(dates, dates[1:]):
+        p0, p1 = primary[previous], primary[current]
+        s0, s1 = secondary[previous], secondary[current]
+        primary_signals.append(
+            1 if p1[0] > p0[0] and p1[2] > p0[2]
+            else -1 if p1[1] < p0[1] and p1[2] < p0[2] else 0
+        )
+        secondary_signals.append(
+            1 if s1[0] > s0[0] and s1[2] > s0[2]
+            else -1 if s1[1] < s0[1] and s1[2] < s0[2] else 0
+        )
+    return pearson_correlation(primary_signals, secondary_signals)
 
 
 def pearson_correlation(xs: Sequence[float], ys: Sequence[float]) -> float | None:

@@ -99,7 +99,7 @@ def run_watch(
     price_precision: int,
     full: bool,
     fetch_1m: Callable[[], pd.DataFrame],
-    fetch_rest: Callable[[], tuple[pd.DataFrame, dict[str, Any | None]]],
+    fetch_rest: Callable[[], tuple[pd.DataFrame, dict[str, Any | None], dict[str, pd.DataFrame]]],
     render: Callable[[LiveStateSnapshot, pd.Timestamp], None],
     warn: Callable[[str], None],
     now_fn: Callable[[], pd.Timestamp],
@@ -131,7 +131,7 @@ def run_watch(
         key = frame_1m["timestamp"].iloc[-1]
         if last_key is not None and key == last_key:
             return  # 同根 → 无任何 stdout（静默）
-        frame_1d, linkage = fetch_rest()
+        frame_1d, linkage, linkage_daily = fetch_rest()
         snapshot = build_live_state(
             symbol=symbol,
             bars_1m=frame_1m,
@@ -139,6 +139,7 @@ def run_watch(
             daily_rows=frame_1d,
             turning_points=turning_points,
             linkage_bars=linkage or None,
+            linkage_daily_rows=linkage_daily or None,
             params=params,
             price_precision=price_precision,
         )

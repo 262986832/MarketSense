@@ -101,6 +101,7 @@ def build_default(
     daily_rows: pd.DataFrame | None = None,
     params: EpisodeParams | None = None,
     linkage_bars: dict[str, pd.DataFrame | None] | None = None,
+    linkage_daily_rows: dict[str, pd.DataFrame] | None = None,
 ) -> LiveStateSnapshot:
     """默认形态的快照：T = 日盘末根、daily = [01-01, 01-02]、TP = 默认点集。"""
     return build_live_state(
@@ -114,6 +115,7 @@ def build_default(
         ),
         turning_points=_default_points(),
         linkage_bars=linkage_bars,
+        linkage_daily_rows=linkage_daily_rows,
         params=EpisodeParams() if params is None else params,
     )
 
@@ -171,7 +173,7 @@ class TestSnapshotShape:
         assert "涨势(-1, 最高=40.400000" in parts[2]
         assert "整体为涨势中" in parts[2]
         assert "当前为跌势" in parts[2]
-        assert "时长=1根" in parts[2]
+        assert "时长=1d根" in parts[2]
         assert parts[6] == "盘口: na"
 
     def test_question_and_candidates(self) -> None:
@@ -224,14 +226,13 @@ class TestSnapshotShape:
     def test_price_line_bar_index_in_today(self) -> None:
         snapshot = build_default()
         price_line = snapshot.state_text.split(" \n ")[5]
-        assert price_line.startswith("现价: 开=1.010000")
+        assert price_line.startswith("现价: bar=9 价=1.020000")
         assert "bar=9" in price_line
 
     def test_no_linkage_means_no_correlation_segment(self) -> None:
         snapshot = build_default()
         linkage_line = snapshot.state_text.split(" \n ")[4]
-        assert linkage_line.startswith("联动: 标的（突破=")
-        assert "相关度" not in linkage_line
+        assert linkage_line == "联动: 1dK相关度=na 1mK相关度=na"
 
 
 class TestDeterminismAndLeak:
@@ -266,7 +267,7 @@ class TestDailyIndexAnchoring:
         """daily 首日 == 折点窗口首日（01-01）→ 锚 pos=0 → 与设计字面口径逐值相同。"""
         snapshot = build_default()
         assert snapshot.metadata["daily_rows"]["daily_row_derived"] is False
-        assert "时长=1根" in snapshot.state_text.split(" \n ")[2]
+        assert "时长=1d根" in snapshot.state_text.split(" \n ")[2]
 
     def test_deeper_window_keeps_duration(self) -> None:
         """1d 窗口起点深于折点窗口（前置 2023-12-29 行）→ 锚定修正，时长不变。
@@ -514,6 +515,7 @@ class TestLinkageAndParams:
         snapshot = build_default(
             params=params,
             linkage_bars={"TEST.lnk": today_window_frame()},
+            linkage_daily_rows={"TEST.lnk": daily_frame([("2024-01-01", DAILY_PREV), ("2024-01-02", DAILY_T)])},
         )
         meta = snapshot.metadata
         assert meta["symbol"] == SYMBOL
@@ -521,10 +523,11 @@ class TestLinkageAndParams:
         entry = meta["linkage_symbols"][0]
         assert entry["available"] is True
         assert entry["first_timestamp"] == "2024-01-01T21:00:00+08:00"
-        assert meta["na_details"] == []
+        assert meta["na_details"] == [
+            "lnk 1dK相关度=na：有效信号对不足 2 或零方差"
+        ]
         linkage_line = snapshot.state_text.split(" \n ")[4]
-        assert linkage_line.startswith("联动: 标的（突破=")
-        assert "参考（突破=" in linkage_line
+        assert linkage_line == "联动: 1dK相关度=na 1mK相关度=1.000000"
         assert "TEST.lnk" not in linkage_line
         assert "相关度=" in linkage_line
 
@@ -534,23 +537,25 @@ class TestLinkageAndParams:
         shifted = frame(
             list(NIGHT_ROWS), start="2024-01-01 21:30:00"
         )
-        snapshot = build_default(params=params, linkage_bars={"TEST.lnk": shifted})
+        snapshot = build_default(params=params, linkage_bars={"TEST.lnk": shifted}, linkage_daily_rows={"TEST.lnk": daily_frame([("2024-01-01", DAILY_PREV)])})
         assert snapshot.metadata["na_details"] == [
             "lnk 突破=na：交集对 0 <2",
-            "lnk 相关度=na：有效信号对 0 <2 或零方差",
+            "lnk 1mK相关度=na：有效信号对 0 <2 或零方差",
+            "lnk 1dK相关度=na：有效信号对不足 2 或零方差",
         ]
 
     def test_linkage_missing_data_degrades_to_na(self) -> None:
         """联动品种缺数据（None）→ 空序列 na 降级 + available=false（不中断快照）。"""
         params = EpisodeParams(linkage_symbols=("TEST.lnk",))
-        snapshot = build_default(params=params, linkage_bars={"TEST.lnk": None})
+        snapshot = build_default(params=params, linkage_bars={"TEST.lnk": None}, linkage_daily_rows={"TEST.lnk": daily_frame([("2024-01-01", DAILY_PREV)])})
         entry = snapshot.metadata["linkage_symbols"][0]
         assert entry["available"] is False
         assert entry["first_timestamp"] is None
         assert entry["last_timestamp"] is None
         assert snapshot.metadata["na_details"] == [
             "lnk 突破=na：交集对 0 <2",
-            "lnk 相关度=na：有效信号对 0 <2 或零方差",
+            "lnk 1mK相关度=na：有效信号对 0 <2 或零方差",
+            "lnk 1dK相关度=na：有效信号对不足 2 或零方差",
         ]
 
     def test_breakthrough_window_short_na_detail(self) -> None:
@@ -843,6 +848,10 @@ class TestCliOffline:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         data_dir, tp_dir, _ = _write_cli_workspace(tmp_path)
+        save_ohlcv(
+            daily_frame([("2024-01-01", DAILY_PREV), ("2024-01-02", DAILY_T)]),
+            symbol="TEST.lnk", period="1d", output_dir=data_dir,
+        )
         episode_yaml = tmp_path / "episode_link.yaml"
         episode_yaml.write_text(
             yaml.safe_dump(
@@ -978,14 +987,18 @@ class TestCliOnlineStub:
             assert "=== state ===" not in captured.out
         assert fake.close_count == 1
 
-    def test_online_linkage_failure_degrades(
+    def test_online_linkage_failure_is_hard_error(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _isolate_config(tmp_path, monkeypatch)
-        _, tp_dir, _ = _write_cli_workspace(tmp_path)
+        data_dir, tp_dir, _ = _write_cli_workspace(tmp_path)
+        save_ohlcv(
+            daily_frame([("2024-01-01", DAILY_PREV), ("2024-01-02", DAILY_T)]),
+            symbol="TEST.lnk", period="1d", output_dir=data_dir,
+        )
         episode_yaml = tmp_path / "episode_link.yaml"
         episode_yaml.write_text(
             yaml.safe_dump(
@@ -1013,11 +1026,11 @@ class TestCliOnlineStub:
             api_factory=lambda _config: fake,
         )
         captured = capsys.readouterr()
-        assert code == 0
-        assert "警告：联动品种 TEST.lnk 在线取数失败，按 na 降级" in captured.err
-        _, metadata = _parse_cli_stdout(captured.out)
-        assert metadata["linkage_symbols"][0]["available"] is False
-        assert metadata["na_details"]
+        assert code == 1
+        assert "TEST.lnk" in captured.err
+        assert "在线 1d 取数/校验失败" in captured.err
+        assert "不能计算状态" in captured.err
+        assert fake.close_count == 1
 
     def test_online_primary_failure_hard_error(
         self,
@@ -1113,11 +1126,12 @@ REAL_1M = REPO_ROOT / "data" / "ohlcv" / "DCE.v2701_1m.csv"
 REAL_1D = REPO_ROOT / "data" / "ohlcv" / "DCE.v2701_1d.csv"
 REAL_TP = REPO_ROOT / "data" / "turning_points" / "DCE.v2701_1d.csv"
 REAL_SC_1M = REPO_ROOT / "data" / "ohlcv" / "INE.sc2611_1m.csv"
+REAL_SC_1D = REPO_ROOT / "data" / "ohlcv" / "INE.sc2611_1d.csv"
 
 
 @pytest.mark.skipif(
-    not (REAL_1M.is_file() and REAL_1D.is_file() and REAL_TP.is_file()),
-    reason="本机无 DCE.v2701 真实落盘数据（1m/1d/折点 CSV）",
+    not (REAL_1M.is_file() and REAL_1D.is_file() and REAL_TP.is_file() and REAL_SC_1M.is_file() and REAL_SC_1D.is_file()),
+reason="本机缺少所需真实数据（主/参考品种 1m、1d 或折点 CSV）",
 )
 class TestCliOfflineRealData:
     """AC3：离线真实落盘数据端到端（T = 1m CSV 末行）。"""

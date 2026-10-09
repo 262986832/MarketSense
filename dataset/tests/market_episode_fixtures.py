@@ -291,15 +291,22 @@ def daily_rows_map(
     读取走 ``load_ohlcv``（与生产同路径；symbol 由文件名 ``{symbol}_1d.csv`` 反解）。
     """
     symbol = workspace.daily_path.name[: -len("_1d.csv")]
-    loaded = load_ohlcv(symbol, "1d", data_dir=workspace.data_dir)
-    return {
-        symbol: tuple(
+    symbols = [symbol]
+    symbols.extend(
+        path.name[: -len("_1d.csv")]
+        for path in sorted(workspace.data_dir.glob("*_1d.csv"))
+        if path.name != workspace.daily_path.name
+    )
+    result = {}
+    for item in symbols:
+        loaded = load_ohlcv(item, "1d", data_dir=workspace.data_dir)
+        result[item] = tuple(
             (pd.Timestamp(ts).date(), float(high), float(low), float(close))
             for ts, high, low, close in zip(
                 loaded.df["timestamp"], loaded.df["high"], loaded.df["low"], loaded.df["close"]
             )
         )
-    }
+    return result
 
 
 @dataclass(frozen=True)

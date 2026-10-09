@@ -670,14 +670,15 @@ def _fetch_rest_frames(
     daily_bars: int,
     params: EpisodeParams,
     warn: Callable[[str], None],
-) -> tuple[Any, dict[str, Any | None]]:
-    """1d 帧 + 联动品种帧（联动失败降级 na；顺序与一次性路径一致）。"""
+) -> tuple[Any, dict[str, Any | None], dict[str, Any]]:
+    """主品种 1d、参考 1m 与参考 1d；参考日线取数失败硬错。"""
     frame_1d = provider.fetch_recent(symbol, "1d", daily_bars)
     message = _bars_shortfall_message(symbol, daily_bars, len(frame_1d))
     if message is not None:
         warn(message)
     validate_ohlcv(frame_1d).raise_if_invalid()
     linkage: dict[str, Any | None] = {}
+    linkage_daily: dict[str, Any] = {}
     for link_symbol in params.linkage_symbols:
         try:
             frame = provider.fetch_recent(link_symbol, "1m", bars)
@@ -689,7 +690,15 @@ def _fetch_rest_frames(
             warn(f"警告：联动品种 {link_symbol} 在线取数失败，按 na 降级（{exc}）")
             frame = None
         linkage[link_symbol] = frame
-    return frame_1d, linkage
+        try:
+            daily = provider.fetch_recent(link_symbol, "1d", daily_bars)
+            validate_ohlcv(daily).raise_if_invalid()
+        except DatasetError as exc:
+            raise DatasetError(
+                f"联动品种 {link_symbol!r} 在线 1d 取数/校验失败，不能计算状态：{exc}"
+            ) from exc
+        linkage_daily[link_symbol] = daily
+    return frame_1d, linkage, linkage_daily
 
 
 def _fetch_frames_with_provider(
@@ -700,11 +709,10 @@ def _fetch_frames_with_provider(
     daily_bars: int,
     params: EpisodeParams,
     warn: Callable[[str], None],
-) -> tuple[Any, Any, dict[str, Any | None]]:
-    """已连接 provider 的取数内层（1m → 1d → 联动；设计 T3 拆分，
-    一次性与 watch 两模式复用同一实现/同一会话）。"""
+) -> tuple[Any, Any, dict[str, Any | None], dict[str, Any]]:
+    """已连接 provider 的取数内层（1m → 1d → 联动及联动 1d）。"""
     frame_1m = _fetch_1m_frame(provider, symbol=symbol, bars=bars, warn=warn)
-    frame_1d, linkage = _fetch_rest_frames(
+    frame_1d, linkage, linkage_daily = _fetch_rest_frames(
         provider,
         symbol=symbol,
         bars=bars,
@@ -712,7 +720,7 @@ def _fetch_frames_with_provider(
         params=params,
         warn=warn,
     )
-    return frame_1m, frame_1d, linkage
+    return frame_1m, frame_1d, linkage, linkage_daily
 
 
 def _fetch_state_now_frames(
@@ -720,12 +728,8 @@ def _fetch_state_now_frames(
     config: DatasetConfig,
     params: EpisodeParams,
     api_factory: Callable[[DatasetConfig], Any] | None,
-) -> tuple[Any, Any, int, str, dict[str, Any | None]]:
-    """取 1m/1d/联动品种帧：在线（provider）或离线（已落盘 CSV）。
-
-    :returns: (frame_1m, frame_1d, decision_index, data_source, ``联动品种 → 帧或 None``)
-    :raises DatasetError: 主品种取数/校验失败（不静默；联动品种失败降级 na）
-    """
+) -> tuple[Any, Any, int, str, dict[str, Any | None], dict[str, Any]]:
+    """读取主/参考品种数据；配置的参考日线缺失/无效时显式失败。"""
     data_dir = (
         Path(args.data_dir) if args.data_dir else ohlcv_dir(config.output_dir)
     )
@@ -733,7 +737,7 @@ def _fetch_state_now_frames(
         provider = TianQinProvider(config, api_factory)
         try:
             provider.connect()
-            frame_1m, frame_1d, linkage = _fetch_frames_with_provider(
+            frame_1m, frame_1d, linkage, linkage_daily = _fetch_frames_with_provider(
                 provider,
                 symbol=args.symbol,
                 bars=args.bars,
@@ -743,13 +747,14 @@ def _fetch_state_now_frames(
             )
         finally:
             provider.close()
-        return frame_1m, frame_1d, len(frame_1m) - 1, "online", linkage
+        return frame_1m, frame_1d, len(frame_1m) - 1, "online", linkage, linkage_daily
 
     loaded_1m = load_ohlcv(args.symbol, "1m", data_dir=data_dir)
     validate_ohlcv(loaded_1m.df).raise_if_invalid()
     loaded_1d = load_ohlcv(args.symbol, "1d", data_dir=data_dir)
     validate_ohlcv(loaded_1d.df).raise_if_invalid()
     linkage = {}
+    linkage_daily = {}
     for link_symbol in params.linkage_symbols:
         try:
             frame = load_ohlcv(link_symbol, "1m", data_dir=data_dir).df
@@ -761,7 +766,16 @@ def _fetch_state_now_frames(
             )
             frame = None
         linkage[link_symbol] = frame
-    return loaded_1m.df, loaded_1d.df, len(loaded_1m.df) - 1, "offline", linkage
+        try:
+            loaded_daily = load_ohlcv(link_symbol, "1d", data_dir=data_dir)
+            validate_ohlcv(loaded_daily.df).raise_if_invalid()
+        except DatasetError as exc:
+            raise DatasetError(
+                f"联动品种 {link_symbol!r} 的 1d 日线文件缺失或无效；请执行 "
+                f"`python -m dataset fetch --symbol {link_symbol} --period 1d --bars <N>`"
+            ) from exc
+        linkage_daily[link_symbol] = loaded_daily.df
+    return loaded_1m.df, loaded_1d.df, len(loaded_1m.df) - 1, "offline", linkage, linkage_daily
 
 
 def _print_snapshot(
@@ -856,7 +870,7 @@ def _run_state_now_once(
     api_factory: Callable[[DatasetConfig], Any] | None,
 ) -> int:
     """单次快照（``--once`` 在线/离线；state-now-view 已验收行为不回退）。"""
-    frame_1m, frame_1d, decision_index, data_source, linkage = _fetch_state_now_frames(
+    frame_1m, frame_1d, decision_index, data_source, linkage, linkage_daily = _fetch_state_now_frames(
         args, config, params, api_factory
     )
     loaded_tp = _load_state_now_turning_points(args, config)
@@ -867,6 +881,7 @@ def _run_state_now_once(
         daily_rows=frame_1d,
         turning_points=loaded_tp.points,
         linkage_bars=linkage or None,
+        linkage_daily_rows=linkage_daily or None,
         params=params,
         price_precision=params.price_precision,
     )
@@ -921,7 +936,7 @@ def _run_state_now_watch(
                 warn=dedupe_warn,
             )
 
-        def fetch_rest() -> tuple[pd.DataFrame, dict[str, Any | None]]:
+        def fetch_rest() -> tuple[pd.DataFrame, dict[str, Any | None], dict[str, pd.DataFrame]]:
             return _fetch_rest_frames(
                 provider,
                 symbol=args.symbol,

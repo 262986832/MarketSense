@@ -43,6 +43,8 @@ from dataset.market_episode.segments import (
 from dataset.periods import resolve_duration_seconds
 from dataset.storage import save_ohlcv
 from dataset.tests.market_episode_fixtures import (
+    DAILY_ROWS,
+    DAILY_T_ROW,
     RENDER_TREND_CONTEXT,
     SYMBOL,
     bars,
@@ -74,6 +76,13 @@ def _workspace_and_records(tmp_path: Path, *, linkage_symbols: tuple[str, ...] =
     if linkage_symbols:
         save_ohlcv(
             frame(_ROWS), symbol=linkage_symbols[0], period="1m", output_dir=workspace.data_dir
+        )
+        save_ohlcv(
+            pd.concat([
+                frame([DAILY_ROWS[0]], start="2024-01-01 00:00:00"),
+                frame([DAILY_T_ROW], start="2024-01-02 00:00:00"),
+            ]).reset_index(drop=True),
+            symbol=linkage_symbols[0], period="1d", output_dir=workspace.data_dir,
         )
     symbols = load_symbols_config(workspace.symbols_path)
     segments = load_segments(workspace.manifest)
@@ -215,21 +224,20 @@ def test_linkage_audit_accepts_fixed_labels_and_detects_line_tampering(tmp_path:
         breakthrough_window=params.breakthrough_window,
         breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         linkage_bars_by_symbol=linkage_bars,
+        linkage_daily_rows_by_symbol=daily_rows_map(workspace),
     )
     check_state_leakage(records, **audit_args)
     row = records[0]["state"].splitlines()[4].strip()
-    assert row.startswith("联动: 标的（突破=")
-    assert "参考（突破=" in row
-    assert "v2701" not in row and "sc2611" not in row
-
-    for old, new in (("标的", "错误"), ("参考", "错误")):
-        tampered = copy.deepcopy(records)
-        tampered[0]["state"] = tampered[0]["state"].replace(old, new, 1)
-        with pytest.raises(DatasetError, match="联动行"):
-            check_state_leakage(tampered, **audit_args)
+    assert row.startswith("联动: 1dK相关度=")
+    assert "1mK相关度=" in row
+    assert "参考（突破=" not in row
+    tampered = copy.deepcopy(records)
+    tampered[0]["state"] = tampered[0]["state"].replace("1dK相关度=na", "1dK相关度=0.999999", 1)
+    with pytest.raises(DatasetError, match="联动行"):
+        check_state_leakage(tampered, **audit_args)
 
     tampered = copy.deepcopy(records)
-    tampered[0]["state"] = tampered[0]["state"].replace("参考（突破=", "参考（突破=9", 1)
+    tampered[0]["state"] = tampered[0]["state"].replace("1mK相关度=na", "1mK相关度=0.999999", 1)
     with pytest.raises(DatasetError, match="联动行"):
         check_state_leakage(tampered, **audit_args)
 
@@ -237,6 +245,36 @@ def test_linkage_audit_accepts_fixed_labels_and_detects_line_tampering(tmp_path:
     tampered[0]["state"] = tampered[0]["state"].replace("相关度=na", "相关度=0.000000", 1)
     with pytest.raises(DatasetError, match="联动行"):
         check_state_leakage(tampered, **audit_args)
+
+
+def test_independent_1m_linkage_correlation_truncates_before_intersection() -> None:
+    """超过窗口的片段中，窗口前信号不能改变 1m Pearson 相关度。"""
+    from dataset.market_episode.audit import _independent_linkage_1m_correlation
+
+    primary_signals = (1, -1, -1, 1, 1)
+    secondary_signals = (-1, 1, -1, 1, 1)
+
+    def rows_for_signals(signals: tuple[int, ...]) -> list[tuple[float, float, float, float]]:
+        rows = [(100.0, 100.0, 100.0, 100.0)]
+        for signal in signals:
+            previous_open, previous_high, previous_low, previous_close = rows[-1]
+            if signal > 0:
+                rows.append((previous_close, previous_high + 1, previous_low, previous_close + 1))
+            else:
+                rows.append((previous_close, previous_high, previous_low - 1, previous_close - 1))
+        return rows
+
+    primary_bars = bars(rows_for_signals(primary_signals))
+    secondary_bars = bars(rows_for_signals(secondary_signals))
+    window = 4  # Four bars yield three in-window signals; two earlier signals are excluded.
+
+    assert len(primary_bars) > window
+    window_r = _independent_linkage_1m_correlation(primary_bars, secondary_bars, window)
+    full_prefix_r = _independent_linkage_1m_correlation(
+        primary_bars, secondary_bars, len(primary_bars)
+    )
+    assert window_r == 1.0
+    assert full_prefix_r != window_r
 
 
 def test_split_isolation_detects_injected_cross_split_record(tmp_path: Path) -> None:
@@ -605,7 +643,7 @@ def test_state_of_flat_minute_uses_bars_up_to_its_own_index() -> None:
     )
 
     assert (
-        "现价: 开=1.009000 高=1.012000 低=0.990000 收=0.992000 bar=2 成交量比=1.000000 持仓量比=1.003992"
+        "现价: bar=2 价=0.992000 成交量比=1.000000 持仓量比=1.003992 1mK突破=na"
     ) in state
 
 
@@ -889,12 +927,12 @@ def test_state_leakage_linkage_line_independent_recompute(tmp_path: Path) -> Non
 
     first = next(record for record in records if parse_state_id(record["state_id"])[1] == 0)
     second = next(record for record in records if parse_state_id(record["state_id"])[1] == 1)
-    assert "联动: 标的（突破=na）" in first["state"]  # 片段首根 → 可用根数不足 → na
-    assert "联动: 标的（突破=1.000000）" in second["state"]  # 手算 +1（见 docstring 算式）
+    assert "联动: 1dK相关度=na 1mK相关度=na" in first["state"]
+    assert "联动: 1dK相关度=na 1mK相关度=na" in second["state"]
 
 
 def test_state_leakage_detects_tampered_linkage_line(tmp_path: Path) -> None:
-    """v11 主段 tamper 防护：突破动量实算值 / na 占位任一被篡改 → DatasetError。
+    """v14 联动行篡改防护：相关度值/na 占位任一被篡改均拒绝。
 
     另锁定 ``bars_by_symbol`` 缺省 None 的 v11 行为：主品种突破值复算源回退
     ``bars_by_segment`` 的片段序列（生成侧同源同值）→ v11 格式记录仍通过；
@@ -916,15 +954,15 @@ def test_state_leakage_detects_tampered_linkage_line(tmp_path: Path) -> None:
     # 篡改实算突破动量（bar1，期望 1.000000）→ 独立复算不一致 → DatasetError
     tampered = [copy.deepcopy(record) for record in records]
     second = next(record for record in tampered if parse_state_id(record["state_id"])[1] == 1)
-    assert "突破=1.000000" in second["state"]
-    second["state"] = re.sub(r"突破=[\d.]+", "突破=9.999999", second["state"], count=1)
-    with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
+    assert "1mK突破=1.000000" in second["state"]
+    second["state"] = re.sub(r"1mK突破=[\d.]+", "1mK突破=9.999999", second["state"], count=1)
+    with pytest.raises(DatasetError, match="现价行与决策 K 线不一致"):
         check_state_leakage(tampered, **kwargs)
 
     # 篡改片段首根 na 占位（bar0，期望 ``sym（突破=na）``）→ 期望 na 不再匹配 → DatasetError
     tampered = [copy.deepcopy(record) for record in records]
     first = next(record for record in tampered if parse_state_id(record["state_id"])[1] == 0)
-    first["state"] = first["state"].replace("联动: 标的（突破=na）", "联动: 标的（突破=9.999999）", 1)
+    first["state"] = first["state"].replace("联动: 1dK相关度=na 1mK相关度=na", "联动: 1dK相关度=0.999999 1mK相关度=na", 1)
     with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
         check_state_leakage(tampered, **kwargs)
 

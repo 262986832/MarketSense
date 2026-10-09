@@ -8,7 +8,7 @@
 
 **与训练路径的关系**（复用而非重写）：
 
-* 状态文本 = :func:`dataset.market_episode.nanojev_records.render_state`（v11 模板）
+* 状态文本 = :func:`dataset.market_episode.nanojev_records.render_state`(v12 模板）
   原样复用；参数透传方式与 ``build_record`` 逐项同构，仅两处替换——
   ``reference_bar`` = **今日首根**（快照分母，训练片段 = 片段首根），账户初值
   ``position=None / net_value=100 / today_pnl=0 / drawdown=0``（空仓起始态）。
@@ -97,7 +97,7 @@ _NET_VALUE_INITIAL = 100.0
 class LiveStateSnapshot:
     """state-now 快照（frozen；同输入双跑全等）。"""
 
-    #: v11 状态文本（七段原文，``STATE_SCHEMA = marketsense.episode_state.v11``）
+    #: v12 状态文本（七段原文，``STATE_SCHEMA = marketsense.episode_state.v12``）
     state_text: str
     #: choice 题（结构同训练记录 ``questions``，单题 ``next_action``）
     question: dict[str, Any]

@@ -15,7 +15,7 @@
   v9 起传入 ``daily_rows_by_symbol``（T4 接线）时对日线行做**全内容**独立复算——
   涨势/跌势各最近 2 个折点（编号 -1/-2：段极值比值 + 段长）+ 对称三分支趋势状态
   （判据内联重写）+ 状态时长（决策交易日 T 的 1d 行号 − 最近可用折点确认根行号），
-  经 :func:`_independent_trend_context` / :func:`_independent_daily_line_v9` 独立拼装
+  经 :func:`_independent_trend_context` / :func:`_independent_daily_line_v12` 独立拼装
   后逐值比对（不调用 ``recent_trend_extremes``/``trend_state_direction``/
   ``_usable_trend_context``，防自证；缺省 ``None`` 保持 v5/v8 单极值旧行为）；
 * :func:`check_account_chain` 跨片段账户净值链硬校验（首评估片段起点净值 = 100、
@@ -112,7 +112,7 @@ GOLD_LABEL_KINDS = frozenset(
 #: （状态文本不变：state_template 标记与 AUDIT_SCHEMA 均不动）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v11:decision_bar_only+board_state+daily_trend_extremes+account_net_value+breakthrough_momentum+linkage_symbol",
+    "state_template": "marketsense.episode_state.v12:decision_bar_only+board_state+daily_trend_extremes+chronological_confirmation+current_direction+overall_trend+account_net_value+breakthrough_momentum+linkage_symbol",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "net_value_base_100:equity=100*(1+cum_ratio_pnl),1_lot=1_notional,no_multiplier,no_fees",
@@ -531,11 +531,14 @@ def _independent_trend_extremes(
     （up/down 点的段起点 = 序列中上一个 up/down 点的触发根，无前序 → 0；过滤后
     为前缀，与全序列推导一致）。
     """
-    usable = tuple(
-        point
-        for point in points
-        if point.kind in ("up", "down") and point.timestamp.date() < trade_date
-    )
+    usable = tuple(sorted(
+        (
+            point
+            for point in points
+            if point.kind in ("up", "down") and point.timestamp.date() < trade_date
+        ),
+        key=lambda point: (point.bar_index, point.timestamp),
+    ))
     if not any(point.kind == "up" for point in usable) or not any(
         point.kind == "down" for point in usable
     ):
@@ -555,6 +558,8 @@ def _independent_trend_extremes(
             trend_extreme_price=point.trend_extreme_price,
             trend_extreme_bar_index=point.trend_extreme_bar_index,
             segment_length=point.bar_index - segment_start,
+            confirmation_bar_index=point.bar_index,
+            confirmation_timestamp=point.timestamp,
         )
         if point.kind == "up":
             last_up = extreme
@@ -582,6 +587,7 @@ class IndependentTrendContext:
     lows: tuple[TrendExtreme, TrendExtreme]
     state_duration: int
     direction: str
+    latest_confirmation_kind: str
 
 
 def _independent_trade_date_daily_index(
@@ -625,11 +631,14 @@ def _independent_trend_context(
     :raises DatasetError: 可用 up/down 折点缺当次趋势极值字段（文件损坏，硬错误）；
         状态时长 ``< 1``（折点 ``bar_index`` 与 1d 行号不同源）
     """
-    usable = tuple(
-        point
-        for point in points
-        if point.kind in ("up", "down") and point.timestamp.date() < trade_date
-    )
+    usable = tuple(sorted(
+        (
+            point
+            for point in points
+            if point.kind in ("up", "down") and point.timestamp.date() < trade_date
+        ),
+        key=lambda point: (point.bar_index, point.timestamp),
+    ))
     highs: list[TrendExtreme] = []
     lows: list[TrendExtreme] = []
     previous_trigger: int | None = None
@@ -645,6 +654,8 @@ def _independent_trend_context(
             trend_extreme_price=point.trend_extreme_price,
             trend_extreme_bar_index=point.trend_extreme_bar_index,
             segment_length=point.bar_index - segment_start,
+            confirmation_bar_index=point.bar_index,
+            confirmation_timestamp=point.timestamp,
         )
         (highs if point.kind == "up" else lows).append(extreme)
         previous_trigger = point.bar_index
@@ -680,22 +691,17 @@ def _independent_trend_context(
         lows=recent_lows,
         state_duration=state_duration,
         direction=direction,
+        latest_confirmation_kind=usable[-1].kind,
     )
 
 
-def _independent_daily_line_v9(
+def _independent_daily_line_v12(
     prev_daily: tuple[float, float, float],
     reference: Bar,
     precision: int,
     context: IndependentTrendContext,
 ) -> str:
-    """独立拼装 v9 格式期望日线行（与生成侧 ``_daily_line`` 同格式、不同实现，防自证）。
-
-    昨日高/低/收 + 涨势/跌势各最近 2 个折点（编号时间倒序 -1/-2：段极值比值 +
-    段长「时长=n根」）+ 对称三分支趋势状态与状态时长（比值分母 = 片段首根开盘价、
-    6 位小数与 v5/v8 同口径；分母 ≤ 0 时逐值写 ``na``；段长/时长为整数不入比值口径）。
-    三分支标签映射与键序在此独立固定：涨势 -1/-2 → 跌势 -1/-2 → 趋势 → 时长。
-    """
+    """独立拼装 v12 日线行，保持审计侧与生成侧拼接实现分离。"""
     prev_high, prev_low, prev_close = prev_daily
     label = {"up": "涨势中", "down": "跌势中", "range": "震荡"}.get(context.direction)
     if label is None:
@@ -704,16 +710,26 @@ def _independent_daily_line_v9(
     def _ratio(price: float) -> str:
         return format_ratio_value(ratio_or_none(price, reference.open), precision)
 
+    indexed_extremes = sorted(
+        (
+            (item.confirmation_bar_index, item.confirmation_timestamp, index, item)
+            for kind_extremes in (context.highs, context.lows)
+            for index, item in enumerate(kind_extremes)
+        ),
+        key=lambda value: (value[0], -1 if value[1] is None else value[1].value),
+    )
+    parts = []
+    for _, _, index, item in indexed_extremes:
+        number = -1 - index
+        name, field = ("涨势", "最高") if item.kind == "up" else ("跌势", "最低")
+        parts.append(f"{name}({number}, {field}={_ratio(item.trend_extreme_price)}, 时长={item.segment_length}根)")
+    current = "跌势" if context.latest_confirmation_kind == "up" else "涨势"
     return (
         "日线: "
-        f"昨日高={_ratio(prev_high)}"
-        f" 昨日低={_ratio(prev_low)}"
-        f" 昨日收={_ratio(prev_close)}"
-        f" 涨势(-1, 最高={_ratio(context.highs[0].trend_extreme_price)}, 时长={context.highs[0].segment_length}根)"
-        f" 涨势(-2, 最高={_ratio(context.highs[1].trend_extreme_price)}, 时长={context.highs[1].segment_length}根)"
-        f" 跌势(-1, 最低={_ratio(context.lows[0].trend_extreme_price)}, 时长={context.lows[0].segment_length}根)"
-        f" 跌势(-2, 最低={_ratio(context.lows[1].trend_extreme_price)}, 时长={context.lows[1].segment_length}根)"
-        f" 趋势={label} 时长={context.state_duration}根"
+        + " ".join(parts)
+        + f" 当前为{current} 时长={context.state_duration}根"
+        + f" 整体为{label}"
+        + f" 昨日高={_ratio(prev_high)} 昨日低={_ratio(prev_low)} 昨日收={_ratio(prev_close)}"
     )
 
 
@@ -890,7 +906,7 @@ def check_state_leakage(
         独立复算：涨势/跌势各最近 2 个折点（编号 -1/-2：段极值比值 + 段长）+
         对称三分支趋势状态（判据内联重写）+ 状态时长（T 的 1d 行号 − 最近可用
         折点确认根行号，缺 T 行/同源不变式破坏 → ``DatasetError``），
-        经 :func:`_independent_trend_context`/:func:`_independent_daily_line_v9`
+        经 :func:`_independent_trend_context`/:func:`_independent_daily_line_v12`
         独立拼装后与 state 文本逐值比对（不调用生成侧选择/序列化实现，防自证）；
       - 缺省 ``None`` 保持 v5/v8 旧行为（单极值复算 + v8 格式日线行，既有调用点
         零破坏）；
@@ -993,7 +1009,7 @@ def check_state_leakage(
                 "（确认日早于该交易日的 up/down 需各 ≥2；缺折点片段生成时应已被跳过）",
             )
             assert trend_context is not None
-            expected_daily_line = _independent_daily_line_v9(
+            expected_daily_line = _independent_daily_line_v12(
                 prev_daily,
                 reference,
                 price_precision,
@@ -1130,11 +1146,14 @@ def check_state_leakage(
                     f"记录 {record['id']} 状态出现上一交易日绝对价格 {token!r}"
                     "（绝对数不得进入模型输入）"
                 )
-        usable = tuple(
-            point
-            for point in points
-            if point.kind in ("up", "down") and point.timestamp.date() < trade_date
-        )
+        usable = tuple(sorted(
+            (
+                point
+                for point in points
+                if point.kind in ("up", "down") and point.timestamp.date() < trade_date
+            ),
+            key=lambda point: point.bar_index,
+        ))
         # 可用折点绝对极值价扫描（含 v9 入选的涨势/跌势 -1/-2 共 4 个极值，
         # 范围为全部可用 up/down 折点，是入选集的超集）
         extreme_prices = [

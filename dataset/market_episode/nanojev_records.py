@@ -7,11 +7,9 @@
 * ``family_id`` = ``metadata.source_group_id`` = ``segment_id``（一个片段 = 一个 episode，
   直接复用 NanoJev 的 state/source_group 跨 split 泄漏检查）；
 * ``split`` = 片段的 ``split_role``；
-* ``state`` = 确定性文本序列化的**相对比值**状态（v9 六部分：账户（六键：持仓 /
-  [开仓价/止损价] / 净值 / 今日 / 回撤）/ 日线（上一交易日高/低/收 + 涨势/跌势各最近 2 个
-  折点段极值与段长 + 对称三分支趋势状态与时长）/
-  日内（今日高/低）/
-  联动（na 占位）/ 现价（决策 K 线 OHLC + bar 序号 + 量/持仓量比值）/ 盘口（na 占位））；
+* ``state`` = 确定性文本序列化的**相对比值**状态（v12 六部分：账户（六键：持仓 /
+  [开仓价/止损价] / 净值 / 今日 / 回撤）/ 日线（按确认时间交错的涨势/跌势各最近 2 个折点段极值与段长、最近确认后的当前方向与时长、极值比较整体分类、行尾昨日高/低/收）/
+  日内（今日高/低）/ 联动（品种化突破与相关度）/ 现价（决策 K 线 OHLC + bar 序号 + 量/持仓量比值）/ 盘口（na 占位））；
 * ``questions`` 恰好一个 choice 题 ``next_action``：空仓
   ``{open_long, open_short, stay_flat}`` / 持仓 ``{close, hold, reverse}``；
   候选文案只留动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
@@ -41,9 +39,9 @@ up/down 折点各 ≥2 + 新增缺决策交易日日线行跳过原因），其�
 2026-10-03 用户拍板，见 ``artifacts/trend-state-v9/02-design/tech-design.md``）**
 
 ```text
-marketsense.episode_state.v11
+marketsense.episode_state.v12
 账户: 持仓=空仓 净值=<..> 今日=<..> 回撤=<..>
-日线: 昨日高=<..> 昨日低=<..> 昨日收=<..> 涨势(-1, 最高=<..>, 时长=<n>根) 涨势(-2, 最高=<..>, 时长=<n>根) 跌势(-1, 最低=<..>, 时长=<n>根) 跌势(-2, 最低=<..>, 时长=<n>根) 趋势=<涨势中|跌势中|震荡> 时长=<n>根
+日线: <按确认时间升序交错的涨势/跌势折点项，各方向 -1 最近、-2 次近> 当前为<涨势|跌势> 时长=<n>根 整体为<涨势中|跌势中|震荡> 昨日高=<..> 昨日低=<..> 昨日收=<..>
 日内: 今高=<..> 今低=<..>
 联动: <主显示名>（突破=<momentum|na>）[，<联动显示名>（突破=<..>）][ 相关度=<r|na>]
 现价: 开=<..> 高=<..> 低=<..> 收=<..> bar=<片段内 0 基序号> 成交量比=<..> 持仓量比=<..>
@@ -66,6 +64,8 @@ v11：联动行升为品种化联动（2026-10-04 拍板设计，见
 有效信号对 < 2 或任一序列零方差 → ``na``）。显示名 = 去交易所前缀**原样保留**
 （``DCE.v2701`` → ``v2701``、``INE.sc2611`` → ``sc2611``，大小写与配置一致，
 不引入大小写改写；任务决定，change-report 披露）。三段 na 语义独立判定。
+
+v12：日线折点项按确认根索引升序展示（同索引以确认时间戳作次序键），保持各方向 -1/-2 编号；最近确认折点决定当前方向，段极值比较结果单独作为整体分类，昨日高低收移至日线行尾。
 
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
@@ -240,7 +240,7 @@ from dataset.market_episode.segments import (
 #: `` 相关度=<r>``（同一交集序列上主/联动相邻对三态信号的皮尔逊 r，无定义 → na）；
 #: 显示名 = 去交易所前缀原样保留（大小写与配置一致）；三段 na 独立判定，
 #: 2026-10-04 拍板，见 artifacts/linkage-symbol/02-design/tech-design.md）
-STATE_SCHEMA = "marketsense.episode_state.v11"
+STATE_SCHEMA = "marketsense.episode_state.v12"
 #: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
 QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
@@ -337,6 +337,7 @@ class UsableTrendContext:
     highs: tuple[TrendExtreme, TrendExtreme]
     lows: tuple[TrendExtreme, TrendExtreme]
     state_duration: int
+    latest_confirmation_kind: str
 
 
 def _bar_trade_date(bars: tuple[Bar, ...], bar: Bar) -> dt.date:
@@ -412,11 +413,14 @@ def _usable_trend_context(
     :raises DatasetError: 可用 up/down 点缺极值字段（文件损坏，硬错误不静默）；
         状态时长 ``< 1``（折点与 1d 行号不同源）
     """
-    usable = tuple(
-        point
-        for point in points
-        if point.kind in ("up", "down") and point.timestamp.date() < trade_date
-    )
+    usable = tuple(sorted(
+        (
+            point
+            for point in points
+            if point.kind in ("up", "down") and point.timestamp.date() < trade_date
+        ),
+        key=lambda point: (point.bar_index, point.timestamp),
+    ))
     up_count = sum(1 for point in usable if point.kind == "up")
     down_count = len(usable) - up_count
     if up_count < 2 or down_count < 2:
@@ -430,7 +434,12 @@ def _usable_trend_context(
             f"最近可用折点 bar_index={usable[-1].bar_index}）；"
             "折点 CSV 的 bar_index 与 1d 文件行号必须同源（同一 1d 内容生成）"
         )
-    return UsableTrendContext(highs=highs, lows=lows, state_duration=state_duration)
+    return UsableTrendContext(
+        highs=highs,
+        lows=lows,
+        state_duration=state_duration,
+        latest_confirmation_kind=usable[-1].kind,
+    )
 
 
 #: 纯增量公开别名（state-now 快照 builder 复用；与 ``_usable_trend_context`` 同一对象，
@@ -456,27 +465,39 @@ def _daily_line(
     *,
     trend_context: UsableTrendContext,
 ) -> str:
-    """日线行（v9）：上一交易日高/低/收（昨日高/低/收）+ 涨势/跌势各最近 2 个折点的
-    段极值比值与段长（编号时间倒序 -1/-2）+ 对称三分支趋势状态与状态时长
-    （分母 = 片段首根开盘价；分母 ≤ 0 时逐值写 ``na``；段长/时长为整数，不入比值口径）。
-    三分支判据见 :func:`dataset.turning_points.trend_state_direction`（键序固定：
-    涨势 -1/-2 → 跌势 -1/-2 → 趋势 → 时长；编号 -1 = 最近、-2 = 次近，对应
-    ``recent_trend_extremes`` 时间倒序元组的 ``[0]``/``[1]``）。"""
+    """日线行（v12）：折点按确认根索引升序交错输出；最近确认折点后的当前方向与时长、
+    保持独立的极值比较整体分类，昨日高/低/收置于行尾。价格比值分母为片段首根开盘价；
+    段长/状态时长为整数。"""
     open_price = reference_bar.open
     direction = trend_state_direction(trend_context.highs, trend_context.lows)
     trend_label = {"up": "涨势中", "down": "跌势中", "range": "震荡"}.get(direction)
     if trend_label is None:
         raise DatasetError(f"未知趋势状态分类: {direction!r}")
+    indexed_extremes = sorted(
+        (
+            (item.confirmation_bar_index, item.confirmation_timestamp, index, item)
+            for kind_extremes in (trend_context.highs, trend_context.lows)
+            for index, item in enumerate(kind_extremes)
+        ),
+        key=lambda value: (value[0], -1 if value[1] is None else value[1].value),
+    )
+    trend_items = []
+    for _, _, index, item in indexed_extremes:
+        label = "涨势" if item.kind == "up" else "跌势"
+        field = "最高" if item.kind == "up" else "最低"
+        number = -1 - index
+        trend_items.append(
+            f"{label}({number}, {field}={format_ratio_value(ratio_or_none(item.trend_extreme_price, open_price), price_precision)}, 时长={item.segment_length}根)"
+        )
+    current_direction = "跌势" if trend_context.latest_confirmation_kind == "up" else "涨势"
     return (
         "日线: "
-        f"昨日高={format_ratio_value(ratio_or_none(board_state.prev_day_high, open_price), price_precision)}"
-        f" 昨日低={format_ratio_value(ratio_or_none(board_state.prev_day_low, open_price), price_precision)}"
-        f" 昨日收={format_ratio_value(ratio_or_none(board_state.prev_day_close, open_price), price_precision)}"
-        f" 涨势(-1, 最高={format_ratio_value(ratio_or_none(trend_context.highs[0].trend_extreme_price, open_price), price_precision)}, 时长={trend_context.highs[0].segment_length}根)"
-        f" 涨势(-2, 最高={format_ratio_value(ratio_or_none(trend_context.highs[1].trend_extreme_price, open_price), price_precision)}, 时长={trend_context.highs[1].segment_length}根)"
-        f" 跌势(-1, 最低={format_ratio_value(ratio_or_none(trend_context.lows[0].trend_extreme_price, open_price), price_precision)}, 时长={trend_context.lows[0].segment_length}根)"
-        f" 跌势(-2, 最低={format_ratio_value(ratio_or_none(trend_context.lows[1].trend_extreme_price, open_price), price_precision)}, 时长={trend_context.lows[1].segment_length}根)"
-        f" 趋势={trend_label} 时长={trend_context.state_duration}根"
+        + " ".join(trend_items)
+        + f" 当前为{current_direction} 时长={trend_context.state_duration}根"
+        + f" 整体为{trend_label}"
+        + f" 昨日高={format_ratio_value(ratio_or_none(board_state.prev_day_high, open_price), price_precision)}"
+        + f" 昨日低={format_ratio_value(ratio_or_none(board_state.prev_day_low, open_price), price_precision)}"
+        + f" 昨日收={format_ratio_value(ratio_or_none(board_state.prev_day_close, open_price), price_precision)}"
     )
 
 
@@ -518,7 +539,7 @@ def render_state(
     primary_symbol: str = "",
     linkage_symbol_bars: Mapping[str, Sequence[Bar]] | None = None,
 ) -> str:
-    """确定性状态文本（v11 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
+    """确定性状态文本（v12 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
 
     只做「决策 K 线单根 + 仓位 + 净值 + 今日 + 回撤 + 盘面状态 + 日线折点趋势上下文」
     的序列化：函数签名决定它无法访问决策 K 线之后的任何 bar（``board_state`` 的今日值与
@@ -1278,8 +1299,8 @@ def generate_dataset(
     # 独立复算（内联重放，不调用 ReplayAccount/序列化实现）并与 state 文本逐值比对
     # （防自证/tamper 防护）；入参 = 逐片段事件轨迹 + 处理 bar 数 + 链起点快照，
     # 不一致即 raise DatasetError（不写出任何产物）
-    # v9（T4）硬门：日线行全内容（涨势/跌势各 2 项编号极值 + 三分支趋势状态 + 状态时长）
-    # 由审计侧 _independent_trend_context/_independent_daily_line_v9 从折点 CSV +
+    # v12（T4）硬门：日线行全内容（按确认时序的涨势/跌势各 2 项编号极值 + 当前方向 + 整体分类 + 状态时长 + 行尾昨日 OHLC）
+    # 由审计侧 _independent_trend_context/_independent_daily_line_v12 从折点 CSV +
     # 日线行元组独立内联重算（不调用生成侧选择/序列化实现），不一致即不写出任何产物
     account_inputs_by_segment = {
         segment_id: AccountReplayInputs(

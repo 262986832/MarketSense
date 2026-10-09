@@ -697,29 +697,29 @@ def test_recent_trend_extremes_returns_recent_n_in_reverse_order() -> None:
     points = find_turning_points(df, initial_direction="up")
 
     highs1, lows1 = recent_trend_extremes(points, n=1)
-    assert highs1 == (TrendExtreme("up", 100.0, 14, 3),)
-    assert lows1 == (TrendExtreme("down", 60.0, 17, 3),)
+    assert highs1 == (TrendExtreme("up", 100.0, 14, 3, 16),)
+    assert lows1 == (TrendExtreme("down", 60.0, 17, 3, 19),)
 
     highs2, lows2 = recent_trend_extremes(points, n=2)
     assert highs2 == (
-        TrendExtreme("up", 100.0, 14, 3),
-        TrendExtreme("up", 120.0, 8, 3),
+        TrendExtreme("up", 100.0, 14, 3, 16),
+        TrendExtreme("up", 120.0, 8, 3, 10),
     )
     assert lows2 == (
-        TrendExtreme("down", 60.0, 17, 3),
-        TrendExtreme("down", 70.0, 11, 3),
+        TrendExtreme("down", 60.0, 17, 3, 19),
+        TrendExtreme("down", 70.0, 11, 3, 13),
     )
 
     highs3, lows3 = recent_trend_extremes(points, n=3)
     assert highs3 == (
-        TrendExtreme("up", 100.0, 14, 3),
-        TrendExtreme("up", 120.0, 8, 3),
-        TrendExtreme("up", 110.0, 1, 3),
+        TrendExtreme("up", 100.0, 14, 3, 16),
+        TrendExtreme("up", 120.0, 8, 3, 10),
+        TrendExtreme("up", 110.0, 1, 3, 3),
     )
     assert lows3 == (
-        TrendExtreme("down", 60.0, 17, 3),
-        TrendExtreme("down", 70.0, 11, 3),
-        TrendExtreme("down", 80.0, 4, 4),  # down@7：段 [3, 6]，段长 4
+        TrendExtreme("down", 60.0, 17, 3, 19),
+        TrendExtreme("down", 70.0, 11, 3, 13),
+        TrendExtreme("down", 80.0, 4, 4, 7),  # down@7：段 [3, 6]，段长 4
     )
 
 
@@ -885,6 +885,7 @@ def test_trend_state_direction_branches() -> None:
             trend_extreme_price=price,
             trend_extreme_bar_index=0,
             segment_length=1,
+            confirmation_bar_index=0,
         )
 
     # 高点升高 + 低点升高 → up（涨势中）

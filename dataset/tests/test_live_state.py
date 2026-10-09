@@ -169,7 +169,8 @@ class TestSnapshotShape:
         # 状态时长 = 拍板 A 锚定行号（1）− 最近可用折点确认根（0）= 1
         # 趋势极值为比值（分母 = 今日首根开盘 100）→ 4040.0 渲染为 40.400000
         assert "涨势(-1, 最高=40.400000" in parts[2]
-        assert "趋势=涨势中" in parts[2]
+        assert "整体为涨势中" in parts[2]
+        assert "当前为跌势" in parts[2]
         assert "时长=1根" in parts[2]
         assert parts[6] == "盘口: na"
 

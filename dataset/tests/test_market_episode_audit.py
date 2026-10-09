@@ -636,6 +636,49 @@ def test_state_leakage_detects_wrong_trend_line(tmp_path: Path) -> None:
             breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
         )
 
+    tampered_order = [copy.deepcopy(record) for record in records]
+    parts = tampered_order[0]["state"].split(" \n ")
+    daily_items = parts[2].split(" ")
+    daily_items[1], daily_items[2] = daily_items[2], daily_items[1]
+    parts[2] = " ".join(daily_items)
+    tampered_order[0]["state"] = " \n ".join(parts)
+    with pytest.raises(DatasetError, match="日线行与决策 K 线不一致"):
+        check_state_leakage(
+            tampered_order,
+            bars_by_segment=bars_by_segment,
+            price_precision=params.price_precision,
+            prev_daily_by_segment=prev_daily_map(workspace),
+            trend_points_by_symbol=daily_trend_points_map(workspace),
+            daily_rows_by_symbol=daily_rows_map(workspace),
+            symbols_by_segment=_symbols_by_segment(workspace),
+            bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+            breakthrough_window=params.breakthrough_window,
+            breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
+        )
+
+    tampered_direction = [copy.deepcopy(record) for record in records]
+    original_direction = (
+        "当前为跌势" if "当前为跌势" in tampered_direction[0]["state"] else "当前为涨势"
+    )
+    tampered_direction[0]["state"] = tampered_direction[0]["state"].replace(
+        original_direction,
+        "当前为涨势" if original_direction == "当前为跌势" else "当前为跌势",
+        1,
+    )
+    with pytest.raises(DatasetError, match="日线行与决策 K 线不一致"):
+        check_state_leakage(
+            tampered_direction,
+            bars_by_segment=bars_by_segment,
+            price_precision=params.price_precision,
+            prev_daily_by_segment=prev_daily_map(workspace),
+            trend_points_by_symbol=daily_trend_points_map(workspace),
+            daily_rows_by_symbol=daily_rows_map(workspace),
+            symbols_by_segment=_symbols_by_segment(workspace),
+            bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+            breakthrough_window=params.breakthrough_window,
+            breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
+        )
+
 
 def test_state_leakage_detects_trend_extreme_absolute_price(tmp_path: Path) -> None:
     """可用折点的绝对极值价不得出现在状态文本（与 prev_daily 绝对价同型硬门）。"""

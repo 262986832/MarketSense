@@ -104,7 +104,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Sequence
 
@@ -188,12 +188,16 @@ class TrendExtreme:
     :param trend_extreme_price: 段内实际最高/最低价
     :param trend_extreme_bar_index: 极值所在 bar（窗口 0 基，平局取最早）
     :param segment_length: 段长（K 线数量，≥ 1；由点序列确定性推导）
+    :param confirmation_bar_index: 确认根索引（``TurningPoint.bar_index``）
+    :param confirmation_timestamp: 确认根时间戳；同索引下作为确定性顺序键
     """
 
     kind: str
     trend_extreme_price: float
     trend_extreme_bar_index: int
     segment_length: int
+    confirmation_bar_index: int
+    confirmation_timestamp: pd.Timestamp | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -481,6 +485,8 @@ def recent_trend_extremes(
             trend_extreme_price=point.trend_extreme_price,
             trend_extreme_bar_index=point.trend_extreme_bar_index,
             segment_length=point.bar_index - segment_start,
+            confirmation_bar_index=point.bar_index,
+            confirmation_timestamp=point.timestamp,
         )
         (highs if point.kind == "up" else lows).append(extreme)
         previous_trigger = point.bar_index

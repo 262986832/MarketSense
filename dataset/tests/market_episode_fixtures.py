@@ -101,38 +101,55 @@ DAILY_TP_ROWS: tuple[dict[str, Any], ...] = (
 #: 的段长推导一致；v9 时间倒序下第二组（*2）为 -1 编号项、第一组为 -2 编号项；
 #: 第一组 up/down = DAILY_TP_UP/DAILY_TP_DOWN）
 DAILY_TP_UP = TrendExtreme(
-    kind="up", trend_extreme_price=4020.0, trend_extreme_bar_index=0, segment_length=0
+    kind="up", trend_extreme_price=4020.0, trend_extreme_bar_index=0, segment_length=0,
+    confirmation_bar_index=0,
+    confirmation_timestamp=pd.Timestamp("2024-01-01 21:35:00+08:00"),
 )
 DAILY_TP_DOWN = TrendExtreme(
-    kind="down", trend_extreme_price=3980.0, trend_extreme_bar_index=0, segment_length=0
+    kind="down", trend_extreme_price=3980.0, trend_extreme_bar_index=0, segment_length=0,
+    confirmation_bar_index=0,
+    confirmation_timestamp=pd.Timestamp("2024-01-01 21:05:00+08:00"),
 )
 DAILY_TP_UP2 = TrendExtreme(
-    kind="up", trend_extreme_price=4040.0, trend_extreme_bar_index=0, segment_length=0
+    kind="up", trend_extreme_price=4040.0, trend_extreme_bar_index=0, segment_length=0,
+    confirmation_bar_index=0,
+    confirmation_timestamp=pd.Timestamp("2024-01-01 22:35:00+08:00"),
 )
 DAILY_TP_DOWN2 = TrendExtreme(
-    kind="down", trend_extreme_price=3990.0, trend_extreme_bar_index=0, segment_length=0
+    kind="down", trend_extreme_price=3990.0, trend_extreme_bar_index=0, segment_length=0,
+    confirmation_bar_index=0,
+    confirmation_timestamp=pd.Timestamp("2024-01-01 22:05:00+08:00"),
 )
 #: v9 渲染夹具：render_state/build_record 直测用趋势上下文（不依赖 TP CSV 回读；
 #: highs/lows 为 recent_trend_extremes(n=2) 时间倒序语义：[0] = -1 最近、[1] = -2 次近；
-#: 高抬高价 + 低抬低价 → trend_state_direction = "up"（涨势中）；各段长取不同值以锁定格式）
+#: 确认时序 down/up/up/down（不强制交替）；高低结构构成震荡以区分整体分类与当前方向。
 RENDER_TREND_CONTEXT = UsableTrendContext(
     highs=(
         TrendExtreme(
-            kind="up", trend_extreme_price=4020.0, trend_extreme_bar_index=12, segment_length=7
+            kind="up", trend_extreme_price=4020.0, trend_extreme_bar_index=12, segment_length=7,
+            confirmation_bar_index=12,
+            confirmation_timestamp=pd.Timestamp("2024-01-02 12:00:00+08:00"),
         ),
         TrendExtreme(
-            kind="up", trend_extreme_price=4010.0, trend_extreme_bar_index=9, segment_length=4
+            kind="up", trend_extreme_price=4010.0, trend_extreme_bar_index=9, segment_length=4,
+            confirmation_bar_index=6,
+            confirmation_timestamp=pd.Timestamp("2024-01-02 06:00:00+08:00"),
         ),
     ),
     lows=(
         TrendExtreme(
-            kind="down", trend_extreme_price=3980.0, trend_extreme_bar_index=5, segment_length=5
+            kind="down", trend_extreme_price=3970.0, trend_extreme_bar_index=5, segment_length=5,
+            confirmation_bar_index=14,
+            confirmation_timestamp=pd.Timestamp("2024-01-02 14:00:00+08:00"),
         ),
         TrendExtreme(
-            kind="down", trend_extreme_price=3970.0, trend_extreme_bar_index=2, segment_length=2
+            kind="down", trend_extreme_price=3980.0, trend_extreme_bar_index=2, segment_length=2,
+            confirmation_bar_index=2,
+            confirmation_timestamp=pd.Timestamp("2024-01-02 02:00:00+08:00"),
         ),
     ),
     state_duration=3,
+    latest_confirmation_kind="down",
 )
 
 

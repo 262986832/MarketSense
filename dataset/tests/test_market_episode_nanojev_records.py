@@ -168,7 +168,7 @@ def test_render_state_template_is_byte_stable_for_flat_position() -> None:
         "涨势(-1, 最高=40.200000, 时长=7根) 跌势(-1, 最低=39.700000, 时长=5根) "
         "当前为涨势 时长=3根 整体为震荡 昨日高=20.100000 昨日低=19.800000 昨日收=19.900000 \n "
         "日内: 今高=1.002000 今低=0.998000 \n "
-        "联动: v2701（突破=na） \n "
+        "联动: 标的（突破=na） \n "
         "现价: 开=1.000000 高=1.002000 低=0.998000 收=1.000000 bar=0 成交量比=1.000000 持仓量比=1.000000 \n "
         "盘口: na"
     )
@@ -201,7 +201,7 @@ def test_render_state_template_is_byte_stable_for_holding_position() -> None:
         "涨势(-1, 最高=4.020000, 时长=7根) 跌势(-1, 最低=3.970000, 时长=5根) "
         "当前为涨势 时长=3根 整体为震荡 昨日高=2.010000 昨日低=1.980000 昨日收=1.990000 \n "
         "日内: 今高=1.010000 今低=0.999500 \n "
-        "联动: v2701（突破=1.000000） \n "
+        "联动: 标的（突破=1.000000） \n "
         "现价: 开=1.000000 高=1.010000 低=1.000500 收=1.008000 bar=1 成交量比=1.000000 持仓量比=1.001996 \n "
         "盘口: na"
     )
@@ -240,9 +240,33 @@ def test_render_state_marks_undefined_denominators_as_na() -> None:
 
     assert "成交量比=na" in state  # v7：量比在现价行，volume=0 → na
     assert "持仓量比=na" in zero_oi_state  # v7：持仓量只保留收盘，close_oi=0 → na
-    assert "联动: v2701（突破=na）" in state  # v11：缺省空序列（可用根数 < 2）→ 主值 na
+    assert "联动: 标的（突破=na）" in state  # v13：缺省空序列（可用根数 < 2）→ 主值 na
     assert "昨日高=2.010000" in state  # 日线行不受分母影响（价格分母正常）
     assert "inf" not in state and "nan" not in state
+
+
+def test_render_state_fixed_linkage_labels_and_reference_value() -> None:
+    bar_list = bars([(1000, 1000.5, 999.5, 1000), (1000, 1010, 1000.5, 1008)])
+    reference_bars = bars([(1000, 999.5, 998.5, 999), (999, 999.5, 997.5, 998)])
+    state = render_state(
+        bar=bar_list[1],
+        reference_bar=bar_list[0],
+        position=None,
+        drawdown=0.0,
+        net_value=100.0,
+        today_pnl=0.0,
+        price_precision=6,
+        board_state=BoardStateValues(today_high=1010.0, today_low=999.5, **_BOARD),
+        trend_context=RENDER_TREND_CONTEXT,
+        breakthrough_bars=bar_list,
+        primary_symbol="DCE.v2701",
+        linkage_symbol_bars={"INE.sc2611": reference_bars},
+    )
+
+    linkage_line = state.splitlines()[4]
+    assert linkage_line.strip().startswith("联动: 标的（突破=1.000000），参考（突破=-1.000000） 相关度=")
+    assert "v2701" not in linkage_line and "sc2611" not in linkage_line
+    assert linkage_line.strip().endswith("相关度=na")
 
 
 def test_render_state_has_no_absolute_prices_and_only_ratios_on_the_decision_bar() -> None:

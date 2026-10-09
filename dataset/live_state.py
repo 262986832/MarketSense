@@ -8,7 +8,7 @@
 
 **与训练路径的关系**（复用而非重写）：
 
-* 状态文本 = :func:`dataset.market_episode.nanojev_records.render_state`(v12 模板）
+* 状态文本 = :func:`dataset.market_episode.nanojev_records.render_state`(v13 模板）
   原样复用；参数透传方式与 ``build_record`` 逐项同构，仅两处替换——
   ``reference_bar`` = **今日首根**（快照分母，训练片段 = 片段首根），账户初值
   ``position=None / net_value=100 / today_pnl=0 / drawdown=0``（空仓起始态）。
@@ -97,7 +97,7 @@ _NET_VALUE_INITIAL = 100.0
 class LiveStateSnapshot:
     """state-now 快照（frozen；同输入双跑全等）。"""
 
-    #: v12 状态文本（七段原文，``STATE_SCHEMA = marketsense.episode_state.v12``）
+    #: v13 状态文本（七段原文，``STATE_SCHEMA = marketsense.episode_state.v13``）
     state_text: str
     #: choice 题（结构同训练记录 ``questions``，单题 ``next_action``）
     question: dict[str, Any]
@@ -108,7 +108,7 @@ class LiveStateSnapshot:
 
 
 def _linkage_display_name(symbol: str) -> str:
-    """联动品种显示名 = 去交易所前缀原样保留（与 ``_linkage_display_name`` 同规则）。"""
+    """state-now ``na_details`` 诊断中的真实合约后缀；不用于状态文本标签。"""
     return symbol.split(".", 1)[1] if "." in symbol else symbol
 
 
@@ -225,7 +225,7 @@ def build_live_state(
 ) -> LiveStateSnapshot:
     """构造「此刻」的 state/question/candidates/metadata 快照（纯函数）。
 
-    :param symbol: 主品种（``交易所.合约``，显示名去前缀）。
+    :param symbol: 主品种（``交易所.合约``）；状态文本固定显示「标的」，真实 symbol 保留在 metadata。
     :param bars_1m: 标准 OHLCV 1m 帧（升序、tz-aware；可含 T 之后的行，**不被读取**）。
     :param decision_index: T（刚收盘那根 1m）在 ``bars_1m`` 中的 0 基位置；
         显式切片防泄漏——此后内容不读取。在线调用方传 ``len(frame)-1``。

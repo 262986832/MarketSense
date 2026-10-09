@@ -551,6 +551,10 @@ def load_episode_params(section: Mapping[str, Any], *, where: str) -> EpisodePar
                 raise ConfigError(f"{where} 的 linkage_symbols 含重复元素: {symbol!r}")
             seen_symbols.add(symbol)
             parsed_symbols.append(symbol)
+        if len(parsed_symbols) > 1:
+            raise ConfigError(
+                f"{where} 的 linkage_symbols 允许 0 或 1 个参考品种，实际 {len(parsed_symbols)} 个"
+            )
         linkage_symbols = tuple(parsed_symbols)
     return EpisodeParams(
         drawdown_threshold=float(drawdown),

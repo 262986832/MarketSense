@@ -69,11 +69,15 @@ _HOLDING_PATTERN = [
 _HOLDING_ROWS = _HOLDING_PATTERN * 3
 
 
-def _workspace_and_records(tmp_path: Path):
+def _workspace_and_records(tmp_path: Path, *, linkage_symbols: tuple[str, ...] = ()):
     workspace = build_workspace(tmp_path, _ROWS)
+    if linkage_symbols:
+        save_ohlcv(
+            frame(_ROWS), symbol=linkage_symbols[0], period="1m", output_dir=workspace.data_dir
+        )
     symbols = load_symbols_config(workspace.symbols_path)
     segments = load_segments(workspace.manifest)
-    params = EpisodeParams()
+    params = EpisodeParams(linkage_symbols=linkage_symbols)
     result = generate_dataset(
         segments,
         symbols=symbols,
@@ -96,6 +100,11 @@ def _workspace_and_records(tmp_path: Path):
 def _symbols_by_segment(workspace) -> dict[str, str]:
     """segment_id → symbol（``check_state_leakage`` 新必参；从片段清单确定性派生）。"""
     return {segment.segment_id: segment.symbol for segment in load_segments(workspace.manifest)}
+
+
+def _bars_by_symbol_for_linkage(workspace, bars_by_segment, symbols) -> dict[str, dict[str, tuple]]:
+    """联动品种审计入参：联动 symbol → segment_id → 片段序列。"""
+    return {symbol: dict(bars_by_segment) for symbol in symbols}
 
 
 def _bars_by_symbol(
@@ -170,6 +179,11 @@ def test_generated_records_pass_all_audit_checks(tmp_path: Path) -> None:
         bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
         breakthrough_window=params.breakthrough_window,
         breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
+        linkage_bars_by_symbol=(
+            _bars_by_symbol_for_linkage(workspace, bars_by_segment, params.linkage_symbols)
+            if params.linkage_symbols
+            else None
+        ),
     )
     check_audit_consistency(result.audit, _records_by_split(result))
     assert all(row["split"] in SPLIT_ROLES for row in records)
@@ -183,6 +197,46 @@ def _records_by_split(result) -> dict[str, list[dict]]:
         ]
         for split in SPLIT_ROLES
     }
+
+
+def test_linkage_audit_accepts_fixed_labels_and_detects_line_tampering(tmp_path: Path) -> None:
+    workspace, _, _, params, _, records, bars_by_segment = _workspace_and_records(
+        tmp_path, linkage_symbols=("INE.sc2611",)
+    )
+    linkage_bars = _bars_by_symbol_for_linkage(workspace, bars_by_segment, params.linkage_symbols)
+    audit_args = dict(
+        bars_by_segment=bars_by_segment,
+        price_precision=params.price_precision,
+        prev_daily_by_segment=prev_daily_map(workspace),
+        trend_points_by_symbol=daily_trend_points_map(workspace),
+        daily_rows_by_symbol=daily_rows_map(workspace),
+        symbols_by_segment=_symbols_by_segment(workspace),
+        bars_by_symbol=_bars_by_symbol(workspace, bars_by_segment),
+        breakthrough_window=params.breakthrough_window,
+        breakthrough_duration_seconds=resolve_duration_seconds(params.breakthrough_period),
+        linkage_bars_by_symbol=linkage_bars,
+    )
+    check_state_leakage(records, **audit_args)
+    row = records[0]["state"].splitlines()[4].strip()
+    assert row.startswith("联动: 标的（突破=")
+    assert "参考（突破=" in row
+    assert "v2701" not in row and "sc2611" not in row
+
+    for old, new in (("标的", "错误"), ("参考", "错误")):
+        tampered = copy.deepcopy(records)
+        tampered[0]["state"] = tampered[0]["state"].replace(old, new, 1)
+        with pytest.raises(DatasetError, match="联动行"):
+            check_state_leakage(tampered, **audit_args)
+
+    tampered = copy.deepcopy(records)
+    tampered[0]["state"] = tampered[0]["state"].replace("参考（突破=", "参考（突破=9", 1)
+    with pytest.raises(DatasetError, match="联动行"):
+        check_state_leakage(tampered, **audit_args)
+
+    tampered = copy.deepcopy(records)
+    tampered[0]["state"] = tampered[0]["state"].replace("相关度=na", "相关度=0.000000", 1)
+    with pytest.raises(DatasetError, match="联动行"):
+        check_state_leakage(tampered, **audit_args)
 
 
 def test_split_isolation_detects_injected_cross_split_record(tmp_path: Path) -> None:
@@ -835,8 +889,8 @@ def test_state_leakage_linkage_line_independent_recompute(tmp_path: Path) -> Non
 
     first = next(record for record in records if parse_state_id(record["state_id"])[1] == 0)
     second = next(record for record in records if parse_state_id(record["state_id"])[1] == 1)
-    assert "联动: sym（突破=na）" in first["state"]  # 片段首根 → 可用根数不足 → na
-    assert "联动: sym（突破=1.000000）" in second["state"]  # 手算 +1（见 docstring 算式）
+    assert "联动: 标的（突破=na）" in first["state"]  # 片段首根 → 可用根数不足 → na
+    assert "联动: 标的（突破=1.000000）" in second["state"]  # 手算 +1（见 docstring 算式）
 
 
 def test_state_leakage_detects_tampered_linkage_line(tmp_path: Path) -> None:
@@ -870,7 +924,7 @@ def test_state_leakage_detects_tampered_linkage_line(tmp_path: Path) -> None:
     # 篡改片段首根 na 占位（bar0，期望 ``sym（突破=na）``）→ 期望 na 不再匹配 → DatasetError
     tampered = [copy.deepcopy(record) for record in records]
     first = next(record for record in tampered if parse_state_id(record["state_id"])[1] == 0)
-    first["state"] = first["state"].replace("联动: sym（突破=na）", "联动: sym（突破=9.999999）", 1)
+    first["state"] = first["state"].replace("联动: 标的（突破=na）", "联动: 标的（突破=9.999999）", 1)
     with pytest.raises(DatasetError, match="联动行与决策 K 线不一致"):
         check_state_leakage(tampered, **kwargs)
 

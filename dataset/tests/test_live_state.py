@@ -230,7 +230,7 @@ class TestSnapshotShape:
     def test_no_linkage_means_no_correlation_segment(self) -> None:
         snapshot = build_default()
         linkage_line = snapshot.state_text.split(" \n ")[4]
-        assert linkage_line.startswith("联动: sym（突破=")
+        assert linkage_line.startswith("联动: 标的（突破=")
         assert "相关度" not in linkage_line
 
 
@@ -516,13 +516,16 @@ class TestLinkageAndParams:
             linkage_bars={"TEST.lnk": today_window_frame()},
         )
         meta = snapshot.metadata
+        assert meta["symbol"] == SYMBOL
         assert [entry["symbol"] for entry in meta["linkage_symbols"]] == ["TEST.lnk"]
         entry = meta["linkage_symbols"][0]
         assert entry["available"] is True
         assert entry["first_timestamp"] == "2024-01-01T21:00:00+08:00"
         assert meta["na_details"] == []
         linkage_line = snapshot.state_text.split(" \n ")[4]
-        assert "lnk（突破=" in linkage_line
+        assert linkage_line.startswith("联动: 标的（突破=")
+        assert "参考（突破=" in linkage_line
+        assert "TEST.lnk" not in linkage_line
         assert "相关度=" in linkage_line
 
     def test_linkage_mismatched_timestamps_na(self) -> None:

@@ -522,10 +522,10 @@ class TestLinkageSymbolsParams:
 
     def test_valid_override_preserves_order(self) -> None:
         params = load_episode_params(
-            {"linkage_symbols": ["INE.sc2611", "DCE.v2701"]}, where="测试配置段"
+            {"linkage_symbols": ["INE.sc2611"]}, where="测试配置段"
         )
-        assert params.linkage_symbols == ("INE.sc2611", "DCE.v2701")
-        assert params.as_dict()["linkage_symbols"] == ["INE.sc2611", "DCE.v2701"]
+        assert params.linkage_symbols == ("INE.sc2611",)
+        assert params.as_dict()["linkage_symbols"] == ["INE.sc2611"]
 
     @pytest.mark.parametrize(
         "raw, message",
@@ -538,12 +538,19 @@ class TestLinkageSymbolsParams:
             (["INE."], "交易所.合约"),  # 合约端空
             ([".sc2611"], "交易所.合约"),  # 交易所端空
             (["INE.sc2611", 123], "必须为字符串"),  # 元素非字符串
-            (["INE.sc2611", "INE.sc2611"], "重复元素"),  # 重复（报错，不去重）
+            (["INE.sc2611", "DCE.v2701"], "允许 0 或 1"),  # 多项拒绝
         ],
     )
     def test_invalid_rejected(self, raw: object, message: str) -> None:
         with pytest.raises(ConfigError, match=message):
             load_episode_params({"linkage_symbols": raw}, where="测试配置段")
+
+    def test_duplicate_symbol_rejected(self) -> None:
+        with pytest.raises(ConfigError, match="linkage_symbols.*重复元素"):
+            load_episode_params(
+                {"linkage_symbols": ["INE.sc2611", "INE.sc2611"]},
+                where="测试配置段",
+            )
 
     def test_yaml_passthrough(self, tmp_path: Path) -> None:
         workspace = build_workspace(
@@ -551,6 +558,13 @@ class TestLinkageSymbolsParams:
         )
         config = load_episode_config(workspace.config_path)
         assert config.params.linkage_symbols == ("INE.sc2611",)
+
+    def test_yaml_rejects_multiple_linkage_symbols(self, tmp_path: Path) -> None:
+        workspace = build_workspace(
+            tmp_path, _ROWS, episode={"linkage_symbols": ["INE.sc2611", "DCE.v2701"]}
+        )
+        with pytest.raises(ConfigError, match="linkage_symbols.*允许 0 或 1"):
+            load_episode_config(workspace.config_path)
 
     def test_yaml_defaults_when_absent(self, tmp_path: Path) -> None:
         workspace = build_workspace(tmp_path, _ROWS)

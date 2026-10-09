@@ -100,19 +100,17 @@ GOLD_LABEL_KINDS = frozenset(
 #: breakthrough_period），state_template 追加 +breakthrough_momentum 标记并新增
 #: breakthrough 键，既有 daily_trend_extremes/daily_trend_state 键不变，
 #: AUDIT_SCHEMA 仍保持 v1（联动行为行内替换，非新增节））
-#: v11 起联动行升为品种化联动（无联动品种 = ``联动: <主显示名>（突破=<主值>）``；
-#: 有联动品种 = 每联动品种 ``，<联动显示名>（突破=<联动值>）`` 段（全角逗号连接）+
-#: 首个联动品种 `` 相关度=<r>``；交集对齐（主品种窗口 × 联动品种按时间戳保序交集）+
-#: secondary 侧三态加权 + 主/联动相邻对三态信号皮尔逊 r（有效对 < 2 或零方差 → na）;
-#: 显示名 = 去交易所前缀原样保留），state_template 追加 +linkage_symbol 标记并新增
-#: linkage_symbol 键（breakthrough 键保留不动），AUDIT_SCHEMA 仍保持 v1）
+#: v11 起联动行升为品种化联动；v13 起固定显示「标的」与至多一个「参考」标签，
+#: 数值独立复算口径不变。交集对齐（主品种窗口 × 联动品种按时间戳保序交集）+
+#: secondary 侧三态加权 + 主/联动相邻对三态信号皮尔逊 r（有效对 < 2 或零方差 → na）；
+#: state_template 标记随 state schema 升级，AUDIT_SCHEMA 仍保持 v1）
 #: label-band-sampling 起（2026-10-06）采样机制升级为双机制：train/dev = 事件 +
 #: 紧邻其前 N 条决策记录（按标签类型 open/exit 分别配置），其余 split 维持机会分钟
 #: 周边 ± 平带；冻结决策键 ``flat_sample_band`` 替换为 ``event_lookforward_sampling``
 #: （状态文本不变：state_template 标记与 AUDIT_SCHEMA 均不动）
 FROZEN_DECISIONS: Mapping[str, str] = {
     "reference_price": "segment_first_bar_open",
-    "state_template": "marketsense.episode_state.v12:decision_bar_only+board_state+daily_trend_extremes+chronological_confirmation+current_direction+overall_trend+account_net_value+breakthrough_momentum+linkage_symbol",
+    "state_template": "marketsense.episode_state.v13:decision_bar_only+board_state+daily_trend_extremes+chronological_confirmation+current_direction+overall_trend+account_net_value+breakthrough_momentum+linkage_symbol+fixed_linkage_labels",
     "stop_exit_fill": "decision_bar_opposite_extreme_minus_plus_tick",
     "mfe": "max_favorable_before_stop_touch__adverse_side_first_same_bar",
     "accounting": "net_value_base_100:equity=100*(1+cum_ratio_pnl),1_lot=1_notional,no_multiplier,no_fees",
@@ -1045,8 +1043,7 @@ def check_state_leakage(
             breakthrough_duration_seconds,
         )
         linkage_parts = [
-            f"{_linkage_display_name(symbol)}"
-            f"（突破={format_ratio_value(momentum, price_precision)}）"
+            f"标的（突破={format_ratio_value(momentum, price_precision)}）"
         ]
         if linkage_bars_by_symbol:
             # v11：联动品种段 + 首个联动品种相关度（交集对齐 + secondary 三态加权 +
@@ -1067,19 +1064,18 @@ def check_state_leakage(
                     primary_prefix, link_segment_bars, breakthrough_window
                 )
                 linkage_parts.append(
-                    f"{_linkage_display_name(link_symbol)}"
-                    f"（突破={format_ratio_value(link_momentum, price_precision)}）"
+                    f"，参考（突破={format_ratio_value(link_momentum, price_precision)}）"
                 )
                 if link_position == 0:
                     linkage_r = link_r
             expected_linkage = (
                 "联动: "
-                + "，".join(linkage_parts)
+                + "".join(linkage_parts)
                 + f" 相关度={format_ratio_value(linkage_r, price_precision)}"
             )
         else:
             # v11 无联动品种格式（linkage_bars_by_symbol 缺省 None 或空容器）
-            expected_linkage = "联动: " + "，".join(linkage_parts)
+            expected_linkage = "联动: " + "".join(linkage_parts)
         expected_lines = (
             ("现价", _independent_px_line(bar, reference, price_precision)),
             ("联动", expected_linkage),

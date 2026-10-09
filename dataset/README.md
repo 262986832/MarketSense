@@ -144,7 +144,7 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
 
 - 清单校验：字段完整非空、`period` 必须 `1m`、symbol+period 已有落盘 K 线、时间段落在数据范围内、
   同 symbol+period 不同 split 时间不重叠、清单覆盖 `train`/`dev`/`test`、每个 symbol 均有正数 `tick_size`。
-- **状态文本模板（v11）**：`marketsense.episode_state.v11`，7 行：`账户:`、`日线:`、
+- **当前状态文本模板（v13）**：`marketsense.episode_state.v13`，7 行：`账户:`、`日线:`、
   `日内:`、`联动:`、`现价:`、`盘口:`（na 占位）；
   v7 拍板：训练 state 文本键名中文化；日内行 `bar=` 序号与联动行量/持仓量比值并入现价行
   （持仓量只保留收盘时刻，开盘时刻丢弃）；联动行变为 `na` 常量占位。
@@ -154,7 +154,7 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   v10 拍板（2026-10-04，linkage-breakthrough 任务）：联动行升为突破动量
   `联动: 突破=<momentum|na>`（见下方联动行）；其余五行与 v9 逐字节同构。
   v11 拍板（2026-10-05，linkage-symbol 任务）：联动行升为品种化联动——主品种突破值 +
-  联动品种突破值 + 皮尔逊相关度（见下方联动行）；其余五行与 v10 逐字节同构。
+  联动品种突破值 + 皮尔逊相关度；v13 标签固定为「标的」「参考」，算法不变。
   行间用 `" \n "` 连接（换行符前后各一个空格，v3 起生效，转义后的 JSON 文本更易读）。
   - `账户: 持仓=<空仓|持多|持空>[ 开仓价=<..> 止损价=<..>] 净值=<..> 今日=<..> 回撤=<..>`：
     v8 键序固定为 持仓/[开仓价/止损价]/净值/今日/回撤（磁盘键名沿用 v7 的 `开仓价/止损价`，
@@ -165,10 +165,8 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
     （片段内权益变化，每片段重置，片段首个决策点 = 0.000000，可为负）；`回撤` 公式不变
     = (峰值 − 权益)/峰值，但峰值跨片段延续（见下方净值链）→ 数值不再每片段从 0 起算、
     与 v7 不同；三值均由调用方（账户回放）只用 ≤ 决策 K 线的数据算好传入，无未来泄漏；
-  - `联动: <主显示名>（突破=<momentum|na>）[, <联动显示名>（突破=<momentum|na>）]*[ 相关度=<r|na>]`
-    （v7~v9 为 `na` 常量占位；v10 起为突破动量；v11 起品种化：主品种段 + 每联动品种段
-    （全角逗号分隔）+ 尾部 `相关度=<r>`（仅首个联动品种）；显示名 = 去交易所前缀
-    原样保留（`DCE.v2701` → `v2701`、`INE.sc2611` → `sc2611`）；momentum ∈ [-1, +1]，
+  - `联动: 标的（突破=<momentum|na>）[，参考（突破=<momentum|na>）][ 相关度=<r|na>]`
+    （v7~v9 为 `na` 常量占位；v10 起为突破动量；v11 起品种化；v13 固定标签且允许 0..1 个参考品种；state-now metadata 仍保留真实 symbol；momentum ∈ [-1, +1]，
     **非比值**；相关度 = 皮尔逊 r ∈ [-1, +1]）。主品种段对**截至决策 K 线 T（刚收盘，含）**
     的片段 1m 序列（`bars[: bar_index + 1]`，防泄漏上界由调用方切片保证）计算：
     ①**三态突破信号**（相邻两根 K 线/桶，严格比较，相等 → 0）：
@@ -274,18 +272,17 @@ data/nanojev_dataset/<run_id>/audit.json              # 计数/指纹/冻结项/
   均独立实现，**不调用** `recent_trend_extremes`/`trend_state_direction`/生成侧序列化实现，
   防自证）并与 state 文本逐值比对（不一致不写出任何产物）；缺省 `None` 保持 v5/v8
   单极值旧行为（既有调用点零破坏）；绝对价泄漏扫描覆盖涨势/跌势共 4 个入选极值。
-- **联动行配置项（v10/v11）**：`episode.breakthrough_window`（突破动量窗口，默认 20，必须 ≥ 1）
+- **联动行配置项（v10/v11/v13）：`episode.breakthrough_window`（突破动量窗口，默认 20，必须 ≥ 1）
   与 `episode.breakthrough_period`（突破动量粒度，默认 `"1m"`，允许 `1m/5m/15m/1h`；
   `1d`/未知周期 → `ConfigError`，经 `resolve_duration_seconds` 双保险校验）；
-  `episode.linkage_symbols`（v11 联动品种清单，默认空 = 无联动品种；元素格式
-  `交易所.合约`，重复报错；**联动品种只算突破值不参与交易标签，不要求 tick_size**；
+  `episode.linkage_symbols`（默认空，允许 0 或 1 个参考品种；元素格式 `交易所.合约`，多个时报 ConfigError 且不截断；**联动品种只算突破值不参与交易标签，不要求 tick_size**；
   配置声明了联动品种就必须有其 1m 数据，缺失启动即报错——不静默降级）；YAML 示例：
 
   ```yaml
   episode:
     breakthrough_window: 20     # 最近 N 根已收盘 K 线/桶的相邻对加权
     breakthrough_period: "1m"   # 1m 直接用决策序列；5m/15m/1h 从 1m 重采样；1d 拒绝
-    linkage_symbols:            # v11 联动品种（突破值 + 皮尔逊相关度；空 = 无联动段）
+    linkage_symbols:            # 0 或 1 个参考品种；state 文本固定为「参考」，metadata 保留真实 symbol
       - "INE.sc2611"
   ```
 

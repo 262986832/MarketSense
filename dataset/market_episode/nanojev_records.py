@@ -7,9 +7,9 @@
 * ``family_id`` = ``metadata.source_group_id`` = ``segment_id``（一个片段 = 一个 episode，
   直接复用 NanoJev 的 state/source_group 跨 split 泄漏检查）；
 * ``split`` = 片段的 ``split_role``；
-* ``state`` = 确定性文本序列化的**相对比值**状态（v12 六部分：账户（六键：持仓 /
+* ``state`` = 确定性文本序列化的**相对比值**状态（v13 六部分：账户（六键：持仓 /
   [开仓价/止损价] / 净值 / 今日 / 回撤）/ 日线（按确认时间交错的涨势/跌势各最近 2 个折点段极值与段长、最近确认后的当前方向与时长、极值比较整体分类、行尾昨日高/低/收）/
-  日内（今日高/低）/ 联动（品种化突破与相关度）/ 现价（决策 K 线 OHLC + bar 序号 + 量/持仓量比值）/ 盘口（na 占位））；
+  日内（今日高/低）/ 联动（固定标签「标的」/「参考」的品种化突破与相关度）/ 现价（决策 K 线 OHLC + bar 序号 + 量/持仓量比值）/ 盘口（na 占位））；
 * ``questions`` 恰好一个 choice 题 ``next_action``：空仓
   ``{open_long, open_short, stay_flat}`` / 持仓 ``{close, hold, reverse}``；
   候选文案只留动作语义（买入开仓/卖出开仓/继续空仓/平仓/继续持有/反手），
@@ -39,11 +39,11 @@ up/down 折点各 ≥2 + 新增缺决策交易日日线行跳过原因），其�
 2026-10-03 用户拍板，见 ``artifacts/trend-state-v9/02-design/tech-design.md``）**
 
 ```text
-marketsense.episode_state.v12
+marketsense.episode_state.v13
 账户: 持仓=空仓 净值=<..> 今日=<..> 回撤=<..>
 日线: <按确认时间升序交错的涨势/跌势折点项，各方向 -1 最近、-2 次近> 当前为<涨势|跌势> 时长=<n>根 整体为<涨势中|跌势中|震荡> 昨日高=<..> 昨日低=<..> 昨日收=<..>
 日内: 今高=<..> 今低=<..>
-联动: <主显示名>（突破=<momentum|na>）[，<联动显示名>（突破=<..>）][ 相关度=<r|na>]
+联动: 标的（突破=<momentum|na>）[，参考（突破=<..>）][ 相关度=<r|na>]
 现价: 开=<..> 高=<..> 低=<..> 收=<..> bar=<片段内 0 基序号> 成交量比=<..> 持仓量比=<..>
 盘口: na
 ```
@@ -57,15 +57,11 @@ v10：联动行升为突破动量（``联动: 突破=<momentum|na>``；momentum 
 ``artifacts/linkage-breakthrough/02-design/tech-design.md``）。
 
 v11：联动行升为品种化联动（2026-10-04 拍板设计，见
-``artifacts/linkage-symbol/02-design/tech-design.md``）：无联动品种 =
-``联动: <主显示名>（突破=<主值>）``（主值 = v10 连续窗口突破动量口径不变）；
-有联动品种 = 每联动品种一段 ``，<联动显示名>（突破=<联动值>）``（全角逗号连接）+
-首个联动品种 `` 相关度=<r>``（同一交集序列上主/联动相邻对三态信号的皮尔逊 r；
-有效信号对 < 2 或任一序列零方差 → ``na``）。显示名 = 去交易所前缀**原样保留**
-（``DCE.v2701`` → ``v2701``、``INE.sc2611`` → ``sc2611``，大小写与配置一致，
-不引入大小写改写；任务决定，change-report 披露）。三段 na 语义独立判定。
+``artifacts/linkage-symbol/02-design/tech-design.md``），突破动量和相关度口径独立；当时显示名为去交易所前缀后原样保留的 symbol（如 ``DCE.v2701`` → ``v2701``）。
 
 v12：日线折点项按确认根索引升序展示（同索引以确认时间戳作次序键），保持各方向 -1/-2 编号；最近确认折点决定当前方向，段极值比较结果单独作为整体分类，昨日高低收移至日线行尾。
+
+v13：联动行固定显示标签为「标的」和至多一个「参考」；计算和值格式保持不变。真实 symbol 仅在 state-now metadata 保留。
 
 * 比值分母 = **片段首根**（价格用首根开盘价，量/持仓量用首根同名列），小数位固定
   （默认 6）；分母 ≤ 0 时写 ``na``（不产生 ``inf``/绝对数）；
@@ -234,13 +230,9 @@ from dataset.market_episode.segments import (
 #: 加权 + 只用已收盘 K 线/桶；首根/可用根数 < 2 → ``na``；窗口/周期 =
 #: EpisodeParams.breakthrough_window/breakthrough_period，其余五行与 v9 逐字节同构，
 #: 见 artifacts/linkage-breakthrough/02-design/tech-design.md）
-#: v11 联动行升为品种化联动：无联动品种 = ``联动: <主显示名>（突破=<主值>）``
-#: （主值 = v10 连续窗口口径不变）；有联动品种 = 每联动品种
-#: ``，<联动显示名>（突破=<联动值>）`` 段（全角逗号连接）+ 首个联动品种
-#: `` 相关度=<r>``（同一交集序列上主/联动相邻对三态信号的皮尔逊 r，无定义 → na）；
-#: 显示名 = 去交易所前缀原样保留（大小写与配置一致）；三段 na 独立判定，
-#: 2026-10-04 拍板，见 artifacts/linkage-symbol/02-design/tech-design.md）
-STATE_SCHEMA = "marketsense.episode_state.v12"
+#: v13 联动行固定显示标签：主品种为 ``标的``，首个联动品种为 ``参考``；
+#: 突破动量、交集对齐、相关度与三段 na 判定沿用 v11 口径，不改变计算语义。
+STATE_SCHEMA = "marketsense.episode_state.v13"
 #: questions 文本的 schema 版本标记（首次建立；候选文案演进必须换标记）
 QUESTION_SCHEMA = "marketsense.episode_question.v1"
 #: 记录中的 choice 题目 ID
@@ -514,14 +506,6 @@ def _intraday_line(
     )
 
 
-def _linkage_display_name(symbol: str) -> str:
-    """联动行品种显示名：去交易所前缀后**原样保留**（``DCE.v2701`` → ``v2701``、
-    ``INE.sc2611`` → ``sc2611``，大小写与配置一致，不引入大小写改写；
-    无 ``.`` 前缀的 symbol 原样返回）。任务决定（2026-10-04）：忠实配置原文，
-    若需 ``SC2611`` 大写显示后续一行改（change-report 披露）。"""
-    return symbol.split(".", 1)[1] if "." in symbol else symbol
-
-
 def render_state(
     *,
     bar: Bar,
@@ -539,7 +523,7 @@ def render_state(
     primary_symbol: str = "",
     linkage_symbol_bars: Mapping[str, Sequence[Bar]] | None = None,
 ) -> str:
-    """确定性状态文本（v12 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
+    """确定性状态文本（v13 六部分：账户/日线/日内/联动/现价/盘口；模板见模块 docstring）。
 
     只做「决策 K 线单根 + 仓位 + 净值 + 今日 + 回撤 + 盘面状态 + 日线折点趋势上下文」
     的序列化：函数签名决定它无法访问决策 K 线之后的任何 bar（``board_state`` 的今日值与
@@ -558,18 +542,19 @@ def render_state(
     首根/可用根数 < 2 → ``na``（缺省空序列同）。缺省窗口/周期 = EpisodeParams 默认口径，
     生产调用方（build_record）必须显式透传 params 派生值。
 
-    v11：联动行升为品种化联动——``primary_symbol``（主品种 symbol，显示名去交易所
-    前缀原样保留）与 ``linkage_symbol_bars``（symbol → 联动品种**片段窗口内**的
+    v11：联动行升为品种化联动——``primary_symbol``（主品种 symbol；当时显示名为去交易所
+    前缀后原样保留）与 ``linkage_symbol_bars``（symbol → 联动品种**片段窗口内**的
     完整 1m 序列；不要求调用方预切片到 T——交集对齐以主品种窗口（已截至 T）
     时间戳为准，联动品种仅取相同时间戳，天然上界 ≤ T，无未来泄漏）：
-    无联动品种 = ``联动: <主显示名>（突破=<主值>）``；有联动品种 = 每联动品种
-    ``，<联动显示名>（突破=<联动值>）`` 段（交集对齐 = 主品种窗口（同 v10 窗口）与
-    联动品种按时间戳保序交集；联动值 = 交集序列 secondary 侧三态加权；
-    ``dataset.market_episode.linkage``）+ 首个联动品种 `` 相关度=<r>``
-    （同一交集序列上主/联动相邻对三态信号的皮尔逊 r）。三段 na 语义独立判定：
-    主值 na（首根/可用根数不足）、联动值 na（交集对 < 2）、相关度 na
-    （有效信号对 < 2 或任一序列零方差）。多联动品种：相关度只对首个联动品种
-    （单品种任务；多品种格式设计留白）。
+    v11 历史显示格式曾使用品种名；当前 v13 配置允许 0 或 1 个联动品种，联动行固定为
+    ``标的（突破=<主值>）``，可选 ``，参考（突破=<联动值>） 相关度=<r>``。联动 K 线与主品种
+    窗口按时间戳保序交集；联动值 = 交集序列 secondary 侧三态加权；
+    ``dataset.market_episode.linkage``；相关度为同一交集序列上主/联动相邻对三态信号的
+    皮尔逊 r。三段 na 语义独立判定：主值 na（首根/可用根数不足）、联动值 na（交集对 < 2）、
+    相关度 na（有效信号对 < 2 或任一序列零方差）。
+
+    v13：联动行主品种与唯一可选联动品种分别固定显示为 ``标的``/``参考``；symbol 仍用于
+    数据选择与对齐，但不再作为联动行标签输出。突破动量与相关度的计算口径沿用 v11。
     """
     account_values = (
         f"净值={format_ratio_value(net_value, price_precision)}"
@@ -591,16 +576,14 @@ def render_state(
     # bars[: bar_index + 1]，防泄漏上界由调用方切片保证；momentum 函数内只用已收盘
     # 数据（1m 逐根天然收盘；非 1m 由 resample_bars 的 is_closed 排除未收满桶），
     # 正负号照常（负值自然带 - 号）。
-    # v11 品种化联动：主段 ``<主显示名>（突破=<主值>）``（v10 连续窗口口径不变）；
-    # 有联动品种时每品种一段 ``，<联动显示名>（突破=<联动值>）``（全角逗号连接；
-    # 联动值 = 交集序列 secondary 侧三态加权，交集按主品种时间戳天然上界）+
-    # 首个联动品种 `` 相关度=<r>``（同一交集序列上主/联动相邻对信号的皮尔逊 r）。
+    # v13 当前联动行固定显示「标的」/「参考」；主值仍为 v10 连续窗口突破动量，联动值
+    # 仍为主品种窗口按时间戳交集序列的 secondary 侧三态加权；首个联动品种显示相关度。
     # 三段 na 独立判定（format_ratio_value(None) → na）。
     momentum = breakthrough_momentum(
         breakthrough_bars, breakthrough_window, breakthrough_duration_seconds
     )
     linkage_parts = [
-        f"{_linkage_display_name(primary_symbol)}"
+        "标的"
         f"（突破={format_ratio_value(momentum, price_precision)}）"
     ]
     correlation: float | None = None
@@ -613,8 +596,7 @@ def render_state(
             )
             link_value = linkage_breakthrough_momentum(aligned)
             linkage_parts.append(
-                f"{_linkage_display_name(link_symbol)}"
-                f"（突破={format_ratio_value(link_value, price_precision)}）"
+                f"参考（突破={format_ratio_value(link_value, price_precision)}）"
             )
             if link_position == 0:
                 signal_pairs = signal_pairs_from_aligned(aligned)

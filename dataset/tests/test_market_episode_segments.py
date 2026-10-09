@@ -375,6 +375,18 @@ def test_load_episode_params_rejects_invalid(section: dict, message: str) -> Non
         load_episode_params(section, where="测试配置段")
 
 
+@pytest.mark.parametrize("symbols", [[], ["INE.sc2611"]])
+def test_load_episode_params_accepts_zero_or_one_linkage_symbol(symbols: list[str]) -> None:
+    params = load_episode_params({"linkage_symbols": symbols}, where="测试配置段")
+    assert params.linkage_symbols == tuple(symbols)
+
+
+@pytest.mark.parametrize("symbols", [["INE.sc2611", "DCE.v2701"], ["INE.sc2611", "DCE.v2701", "SHFE.rb2701"]])
+def test_load_episode_params_rejects_multiple_linkage_symbols(symbols: list[str]) -> None:
+    with pytest.raises(ConfigError, match=rf"linkage_symbols.*允许 0 或 1.*实际 {len(symbols)} 个"):
+        load_episode_params({"linkage_symbols": symbols}, where="测试配置段")
+
+
 def test_load_episode_config_resolves_paths(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv(ENV_DATA_DIR, raising=False)
     workspace = build_workspace(tmp_path, _ROWS, episode={"reward_risk_threshold": 4.0})

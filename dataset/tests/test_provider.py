@@ -138,6 +138,43 @@ def test_fetch_history_rejects_bad_date_bounds(tmp_path: Path) -> None:
         provider.fetch_history("DCE.v2701", "1m", "2024/01/01", "2024-01-02")
 
 
+def test_fetch_recent_wraps_sdk_serial_errors_as_dataset_error(tmp_path: Path) -> None:
+    class BrokenSerialApi(FakeTqApi):
+        def get_kline_serial(
+            self, *, symbol: str, duration_seconds: int, data_length: int
+        ) -> pd.DataFrame:
+            raise RuntimeError("serial subscription failed")
+
+    provider = _provider(tmp_path, BrokenSerialApi())
+    provider.connect()
+
+    with pytest.raises(DatasetError, match="获取天勤K线序列失败") as excinfo:
+        provider.fetch_recent("DCE.v2701", "1m", 3)
+
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "serial subscription failed" in str(excinfo.value)
+
+
+def test_fetch_recent_does_not_swallow_base_exceptions(tmp_path: Path) -> None:
+    class InterruptSerialApi(FakeTqApi):
+        def get_kline_serial(
+            self, *, symbol: str, duration_seconds: int, data_length: int
+        ) -> pd.DataFrame:
+            raise KeyboardInterrupt
+
+    class ExitSerialApi(FakeTqApi):
+        def get_kline_serial(
+            self, *, symbol: str, duration_seconds: int, data_length: int
+        ) -> pd.DataFrame:
+            raise SystemExit(23)
+
+    for api, error in ((InterruptSerialApi(), KeyboardInterrupt), (ExitSerialApi(), SystemExit)):
+        provider = _provider(tmp_path, api)
+        provider.connect()
+        with pytest.raises(error):
+            provider.fetch_recent("DCE.v2701", "1m", 3)
+
+
 def test_fetch_recent_requests_one_extra_bar_and_returns_n(tmp_path: Path) -> None:
     api = FakeTqApi(serial=build_serial_klines(_SERIAL_ROWS, width=8))
     provider = _provider(tmp_path, api)
@@ -331,3 +368,60 @@ def test_history_path_does_not_require_serial_columns(tmp_path: Path) -> None:
 
     assert api.calls[-1]["duration_seconds"] == 86400
     assert len(df) == len(RAW_ROWS_ASC)
+
+
+class _WaitRecordingApi(FakeTqApi):
+    """记录 ``wait_update(deadline=…)`` 委托调用的桩（watch 边界等待）。"""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.deadlines: list[float | None] = []
+
+    def wait_update(self, deadline: float | None = None) -> bool:
+        self.deadlines.append(deadline)
+        return True
+
+
+def test_wait_until_not_connected_raises(tmp_path: Path) -> None:
+    provider = TianQinProvider(_config(tmp_path), api_factory=lambda _cfg: FakeTqApi())
+
+    with pytest.raises(ProviderNotConnectedError, match="connect"):
+        provider.wait_until(1_000.0)
+
+
+def test_wait_until_delegates_to_api_with_absolute_deadline(tmp_path: Path) -> None:
+    api = _WaitRecordingApi()
+    provider = _provider(tmp_path, api)
+    provider.connect()
+
+    provider.wait_until(1_724_000_000.5)
+
+    assert api.deadlines == [1_724_000_000.5]
+
+
+def test_wait_until_wraps_connection_interruption_as_dataset_error(
+    tmp_path: Path,
+) -> None:
+    class BrokenWaitApi(FakeTqApi):
+        def wait_update(self, deadline: float | None = None) -> bool:
+            raise RuntimeError("connection lost")
+
+    provider = _provider(tmp_path, BrokenWaitApi())
+    provider.connect()
+
+    with pytest.raises(DatasetError, match="连接中断"):
+        provider.wait_until(1_000.0)
+
+
+def test_wait_until_keyboard_interrupt_not_swallowed(tmp_path: Path) -> None:
+    """``KeyboardInterrupt`` 为 BaseException，不被 ``except Exception`` 吞掉。"""
+
+    class InterruptWaitApi(FakeTqApi):
+        def wait_update(self, deadline: float | None = None) -> bool:
+            raise KeyboardInterrupt
+
+    provider = _provider(tmp_path, InterruptWaitApi())
+    provider.connect()
+
+    with pytest.raises(KeyboardInterrupt):
+        provider.wait_until(1_000.0)

@@ -687,6 +687,75 @@ python -m trainer --data data/nanojev_dataset/run-828447b7fd1e --validate-only
 - 确定性：固定种子（默认 `--seed 17`），训练日志无墙钟时间；同种子双跑日志逐行一致、
   最终权重 sha256 一致（单测断言）。
 
+#### 10. `state-now`：当前时刻状态快照 + watch 循环（state-now-view / state-now-watch）
+
+构造「此刻」的 NanoJev 模型输入快照（2026-10-08 新增；同日增强为 watch 循环 +
+五部分默认输出）：v11 六部分状态文本 + question + 空仓候选文案 + 元数据，stdout
+输出、**不落盘**；纯函数 builder（`dataset/live_state.py::build_live_state`，无
+I/O、无墙钟）可被未来预测程序直接 import 复用（喂流式 1m/1d + `decision_index`
+切片上界，无未来数据泄漏）；watch 驱动同为纯函数（`dataset/watch_state.py`，时钟/
+等待/取数全部注入，无 I/O）。
+
+```bash
+# 在线 watch（默认）：长连接常驻，启动即输出一次，此后每周期收盘边界有新根才输出
+python -m dataset state-now --symbol DCE.v2701
+# 单次快照：保留既有完整布局、无时间戳头；--full 在此模式为 no-op
+python -m dataset state-now --symbol DCE.v2701 --once [--full]
+# --offline 必配 --once（离线数据运行期不变）
+python -m dataset state-now --symbol DCE.v2701 --offline --once
+# 触发周期（默认 1m；1d 拒绝）
+python -m dataset state-now --symbol DCE.v2701 --period 5m
+# 完整布局（schema/账户/question/candidates/metadata）
+python -m dataset state-now --symbol DCE.v2701 --full
+```
+
+前置：在线 = 天勤凭证（§7.2 小节 1）；离线 = 1m/1d K 线已落盘；两模式均需日线折点
+CSV（`data/turning_points/{symbol}_1d.csv`，缺则指引先跑 `dataset turning-points --period 1d`）。
+
+参数速览：`--symbol`（必填）· `--offline`（必配 `--once`）· `--once`（单次模式）·
+`--full`（完整布局）· `--period P`（watch 触发周期，默认 1m，仅 1m/5m/15m/1h，
+1d 拒绝；与 `--once` 同给为用法错误）· `--bars N`（在线 1m 根数，默认 512）·
+`--daily-bars N`（在线 1d 根数，默认 300）· `--episode-config FILE`（缺省自动探测
+`dataset/config/episode.local.yaml`，不存在时用内置默认）· `--data-dir DIR`（离线目录）·
+`--turning-points-dir DIR`（默认 `<data_dir>/../turning_points`）· `--config FILE`。
+
+**显示口径**（默认进入 watch；`--once` 固定保留既有单次完整布局）：
+
+- **watch 输出布局**：缺省仅行情五部分（日线/日内/联动/现价/盘口，逐字节取自 builder
+  state 文本对应行；按行前缀过滤，模板加行时行为可预期）；watch `--full` 输出完整布局
+  （schema/账户/question/candidates/metadata），模型输入契约不变。
+- **单次布局**：`--once` 始终输出既有完整布局（`=== state ===` 至 `注：…`），不加时间戳头；
+  `--once --full` 与 `--once` 输出逐字节相同，`--full` 在单次模式是显式 no-op。
+- **触发**：绝对时间网格边界（1m 整分 / 5m 每 5 分钟整；无日期与交易日历假设，
+  夜盘跨零点自然对齐）+ **主品种最新已收盘 1m bar 时间戳判重**——同根静默、
+  新根输出一次、数据延迟下一轮补出（一次只输出最新一根）；联动品种帧变化不触发输出。
+- **会话复用**：`connect()` 一次常驻，逐周期 `fetch_recent`（不破坏其一是一次性语义），
+  退出 `finally close()`；折点 CSV/episode 参数启动加载一次（重生成需重启进程）。
+- **输出前缀**：watch 每次输出前置时间戳头 `[YYYY-MM-DD HH:MM symbol period]`
+  （时间 = 决策 K 线收盘时刻，北京时间）；`--once` 不加头。
+- **退出码**：`Ctrl+C` → 130；连续 3 次快照失败 → 1（告警文案含连续次数）；
+  非交易时段静默等待（每周期仅本地判重读，无网络动作；shortfall/联动降级告警
+  同文本只告警一次，不刷屏）。普通 SDK 序列取数异常会包装为 `DatasetError` 并由循环重试；
+  `KeyboardInterrupt`/`SystemExit` 等 `BaseException` 不会被该包装吞掉。
+
+口径说明：
+
+- **分母 = 今日首根 1m 开盘价**（今日开盘=1，与 board-state 口径一致）；
+  训练片段分母 = 片段首根开盘 —— 两者**有意不同**，输出尾行与 metadata
+  `denominator_note` 显式标注「快照口径 ≠ 训练片段口径」。
+- **账户行 = 空仓初始态**（持仓=空仓、净值=100、今日=0、回撤=0）。
+- **T 日线行号**：在线 1d 只含已收盘日线 → T 行缺失时按「前一交易日行号+1」推导
+  （metadata `daily_rows.daily_row_derived=true`）；折点行号以折点首点（start，
+  bar_index=0）为锚同源对齐，1d 窗口起点深于折点生成窗口时趋势时长不受影响。
+- **夜盘快照**（21:00–23:00，归属次一交易日）：日盘根尚未产生，归属由显式传入的
+  交易日全集（日线日期 ∪ 帧内日盘日历日 ∪ 尾段夜盘隐含次日）决定；真实次一交易日
+  无法由数据确定时（如周五夜盘且日线不揭示周一），metadata `trade_date` 可能为
+  非交易日历日，状态文本与数值输出不受影响。
+- **联动品种缺数据 → na 降级**（stderr 警告 + metadata 标记，不中断快照；
+  与训练侧「CSV 缺失硬错误」不同——快照是查看工具）。
+- 帧首根仍属今日窗口且时刻晚于 21:00 → `today_window.truncated=true` + stderr 告警
+  （今日开盘分母可能非真实开盘价；增大 `--bars` 可消除）。
+
 ### 7.3 `scripts/plot_price_line.py`：转折点价格折线图（快速可视化）
 
 `scripts/plot_price_line.py` 是一个独立小脚本：把转折点 CSV

@@ -433,6 +433,11 @@ def _usable_trend_context(
     return UsableTrendContext(highs=highs, lows=lows, state_duration=state_duration)
 
 
+#: 纯增量公开别名（state-now 快照 builder 复用；与 ``_usable_trend_context`` 同一对象，
+#: 不改变任何既有函数/常量/序列化输出，见 artifacts/state-now-view/02-design/tech-design.md §3.4）
+build_usable_trend_context = _usable_trend_context
+
+
 def _default_daily_turning_points_dir(data_dir: str | Path) -> Path:
     """日线折点默认目录：``<data_dir>/../turning_points``。
 
@@ -1403,6 +1408,7 @@ __all__ = [
     "GenerationResult",
     "build_outcome_rows",
     "build_record",
+    "build_usable_trend_context",
     "generate_dataset",
     "pair_open_close_events",
     "render_state",

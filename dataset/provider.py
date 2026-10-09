@@ -168,11 +168,14 @@ class TianQinProvider(DataProvider):
         request_length = (
             data_length + 1 if data_length < SERIAL_MAX_DATA_LENGTH else data_length
         )
-        raw = self._api.get_kline_serial(
-            symbol=symbol,
-            duration_seconds=duration_seconds,
-            data_length=request_length,
-        )
+        try:
+            raw = self._api.get_kline_serial(
+                symbol=symbol,
+                duration_seconds=duration_seconds,
+                data_length=request_length,
+            )
+        except Exception as exc:
+            raise DatasetError(f"获取天勤K线序列失败: {exc}") from exc
         self._wait_serial_ready(raw, wait_timeout_seconds)
         df = clean_serial_klines(
             raw,
@@ -205,6 +208,23 @@ class TianQinProvider(DataProvider):
             start=str(df["timestamp"].iloc[0]),
             end=str(df["timestamp"].iloc[-1]),
         )
+
+    def wait_until(self, deadline_unix: float) -> None:
+        """阻塞至 ``deadline_unix``（绝对 unix 秒）或数据更新提前唤醒（watch 边界等待）。
+
+        语义：委托 ``self._api.wait_update(deadline=deadline_unix)``——既完成睡眠，
+        又 pump 天勤事件循环使序列数据更新（tech-design §3.2）。未连接 →
+        :class:`ProviderNotConnectedError`；连接中断等异常包装为
+        :class:`DatasetError`（同 :meth:`_wait_serial_ready` 风格）；
+        ``KeyboardInterrupt`` 为 BaseException，不被 ``except Exception`` 吞掉，
+        向上传播。既有方法签名零改动（additive）。
+        """
+        if self._api is None:
+            raise ProviderNotConnectedError("调用 wait_until 前必须先 connect()")
+        try:
+            self._api.wait_update(deadline=deadline_unix)
+        except Exception as exc:
+            raise DatasetError(f"等待天勤数据更新时连接中断: {exc}") from exc
 
     def _ohlcv_dir(self) -> Path:
         """OHLCV 落盘子目录（``<output_dir>/ohlcv``）。"""

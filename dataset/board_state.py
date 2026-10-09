@@ -33,7 +33,7 @@ import bisect
 import datetime as dt
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Collection, Mapping
 
 import pandas as pd
 
@@ -61,10 +61,19 @@ STATE_COLUMNS = (
 )
 
 
-def attribute_windows(minute_df: pd.DataFrame) -> tuple[dict[dt.date, list[int]], int]:
+def attribute_windows(
+    minute_df: pd.DataFrame,
+    *,
+    trading_days: Collection[dt.date] | None = None,
+) -> tuple[dict[dt.date, list[int]], int]:
     """把 1 分钟 K 线按夜盘归属规则分窗。
 
     :param minute_df: 标准 OHLCV（``timestamp`` tz-aware，升序）
+    :param trading_days: 显式交易日全集（可选；**纯增量参数**，缺省 ``None`` = 由
+        帧内日盘根日历日推导，行为与既有调用完全一致）。夜盘根归属 = 集合中
+        严格大于其日历日的最近交易日。在线夜盘快照场景（``dataset/live_state``）
+        决策交易日的日盘根尚未产生、帧内推导必然缺失归属键，由调用方传入
+        完整全集（日线日期 ∪ 帧内日盘日历日 ∪ 尾段夜盘隐含次日）。
     :return: (交易日 → 按时间升序的行索引列表, 未入窗 K 线数)
         未入窗 = time-of-day 在 ``[15:00, 21:00)`` 的 K 线（DCE 本数据不存在；
         若出现则说明数据含未知时段，调用方应显式告警不静默）。
@@ -73,7 +82,9 @@ def attribute_windows(minute_df: pd.DataFrame) -> tuple[dict[dt.date, list[int]]
     dates: list[dt.date] = list(ts.dt.date)
     tods: list[dt.time] = [t.time() for t in ts]
 
-    trading_days = sorted({d for d, tod in zip(dates, tods) if tod < DAY_END})
+    if trading_days is None:
+        trading_days = {d for d, tod in zip(dates, tods) if tod < DAY_END}
+    trading_days = sorted(set(trading_days))
 
     def _next_trading_day(d: dt.date) -> dt.date | None:
         i = bisect.bisect_right(trading_days, d)
